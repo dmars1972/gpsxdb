@@ -1,0 +1,104 @@
+cmake_minimum_required(VERSION 3.20)
+project(osm_import CXX)
+
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+find_package(Protobuf REQUIRED)
+find_package(ZLIB REQUIRED)
+find_package(PkgConfig REQUIRED)
+
+pkg_check_modules(PQXX REQUIRED libpqxx)
+pkg_check_modules(PROJ REQUIRED proj>=6)
+
+# libpq is pqxx's underlying C library; must be linked explicitly
+# when pqxx was built as a static library
+find_library(PQ_LIB pq REQUIRED)
+find_library(LZ4_LIB lz4 REQUIRED)
+find_library(EXPAT_LIB expat REQUIRED)
+find_path(EXPAT_INCLUDE expat.h)
+find_path(LZ4_INCLUDE lz4frame.h)
+find_path(PQ_INCLUDE libpq-fe.h PATH_SUFFIXES postgresql)
+
+# ---- Main executable ----
+add_executable(osm_import
+    src/main.cpp
+    src/OSMReader.cpp
+    src/OSMMMap.cpp
+    src/NavDB.cpp
+    src/OSCReader.cpp
+    src/DeltaApplier.cpp
+    src/Replicator.cpp
+    src/AirportsLoader.cpp
+    proto/fileformat.proto
+    proto/osmformat.proto
+)
+
+# Generate protobuf sources directly into the target
+set(PROTO_OUT ${CMAKE_BINARY_DIR}/proto_gen)
+file(MAKE_DIRECTORY ${PROTO_OUT})
+
+protobuf_generate(
+    TARGET osm_import
+    LANGUAGE cpp
+    IMPORT_DIRS ${CMAKE_SOURCE_DIR}/proto
+    PROTOC_OUT_DIR ${PROTO_OUT}
+)
+
+target_include_directories(osm_import PRIVATE
+    include
+    ${PROTO_OUT}
+    ${Protobuf_INCLUDE_DIRS}
+    ${PQXX_INCLUDE_DIRS}
+    ${PROJ_INCLUDE_DIRS}
+    ${PQ_INCLUDE}
+    ${LZ4_INCLUDE}
+    ${EXPAT_INCLUDE}
+)
+
+target_link_libraries(osm_import PRIVATE
+    ${Protobuf_LIBRARIES}
+    ZLIB::ZLIB
+    ${PQXX_LIBRARIES}
+    ${PQ_LIB}
+    ${LZ4_LIB}
+    ${EXPAT_LIB}
+    ${PROJ_LIBRARIES}
+)
+
+target_compile_options(osm_import PRIVATE
+    -O2 -g -Wall -Wextra -Wno-psabi
+    ${PQXX_CFLAGS_OTHER}
+    ${PROJ_CFLAGS_OTHER}
+)
+
+# Optional: jemalloc for better allocator perf under many threads
+find_library(JEMALLOC_LIB jemalloc)
+if(JEMALLOC_LIB)
+    target_link_libraries(osm_import PRIVATE ${JEMALLOC_LIB})
+    message(STATUS "Linking with jemalloc: ${JEMALLOC_LIB}")
+endif()
+
+# ---- airports_load ----
+
+add_executable(airports_load
+    src/airports_load.cpp
+    src/AirportsLoader.cpp
+)
+
+target_include_directories(airports_load PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${PQXX_INCLUDE_DIRS}
+    ${PROJ_INCLUDE_DIRS}
+)
+
+target_link_libraries(airports_load PRIVATE
+    ${PQXX_LIBRARIES}
+    ${PQ_LIB}
+    ${PROJ_LIBRARIES}
+)
+
+target_compile_definitions(airports_load PRIVATE ${PQXX_CFLAGS_OTHER})
+
+target_compile_options(airports_load PRIVATE -O2 -Wall -Wextra -Wno-psabi)
+target_compile_features(airports_load PRIVATE cxx_std_20)

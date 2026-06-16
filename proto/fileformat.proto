@@ -1,0 +1,16 @@
+syntax = "proto2";
+package OSMPBF;
+
+message Blob {
+  optional bytes raw = 1;
+  optional int32 raw_size = 2;
+  optional bytes zlib_data = 3;
+  optional bytes lzma_data = 4;
+  optional bytes bzip2_data = 5;
+}
+
+message BlobHeader {
+  required string type = 1;
+  optional bytes indexdata = 2;
+  required int32 datasize = 3;
+}

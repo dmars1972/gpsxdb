@@ -1,0 +1,32 @@
+# Build
+build/
+build_debug/
+cmake_install.cmake
+CMakeCache.txt
+CMakeFiles/
+
+# Generated protobuf sources
+proto_gen/
+
+# Node store and shard files (large binary data)
+*.dat
+*.dat.bmp
+*.dat.offset
+*.dat.relations_offset
+nodes_shard*
+
+# Log files
+*.log
+nohup.out
+
+# Downloaded OSM/airport data
+*.osm.pbf
+*.osc
+*.osc.gz
+/tmp/ourairports_*
+
+# Editor artifacts
+.vscode/
+.idea/
+*.swp
+*~
