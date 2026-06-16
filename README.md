@@ -97,14 +97,14 @@ Produces two binaries:
 
 ```bash
 # Create database and enable PostGIS
-createdb nav
-psql -d nav -c "CREATE EXTENSION postgis;"
+createdb <your_db>
+psql -d <your_db> -c "CREATE EXTENSION postgis;"
 
 # Create OSM schema
-psql -h localhost -U daniel -d nav -f create.sql
+psql -h localhost -U daniel -d <your_db> -f create.sql
 
 # Create OurAirports schema (imported automatically at end of import)
-psql -h localhost -U daniel -d nav -f create_airports.sql
+psql -h localhost -U daniel -d <your_db> -f create_airports.sql
 ```
 
 ### PostgreSQL tuning (recommended for import)
@@ -138,7 +138,7 @@ osmium fileinfo -e planet-latest.osm.pbf | grep "Max ID"
 
 ./build/osm_import \
   -i planet-latest.osm.pbf \
-  -s localhost -d nav -u daniel \
+  -s <your_db_server> -d <your_db> -u <your_user_id> \
   -t 3 -w 12 \
   -n 20000000000 \
   -f nodes.dat \
@@ -169,22 +169,22 @@ If an import is interrupted, resume at any phase without reprocessing earlier on
 
 ```bash
 # Resume from merge phase (nodes already written to shards)
-./build/osm_import -i planet.osm.pbf -s localhost -d nav -u daniel \
+./build/osm_import -i planet.osm.pbf -s <your_db_server> -d <your_db> -u <your_user_id> \
   -n 20000000000 -f nodes.dat -R merge
 
 # Resume from ways (nodes.dat already fully merged)
-./build/osm_import -i planet.osm.pbf -s localhost -d nav -u daniel \
+./build/osm_import -i planet.osm.pbf -s <your_db_server> -d <your_db> -u <your_user_id> \
   -n 20000000000 -f nodes.dat -R ways
 
 # Resume from relations (ways already in DB)
-./build/osm_import -i planet.osm.pbf -s localhost -d nav -u daniel \
+./build/osm_import -i planet.osm.pbf -s <your_db_server> -d <your_db> -u <your_user_id> \
   -n 20000000000 -f nodes.dat -R relations
 
 # Re-run spatial indexing only
-./build/osm_import -s localhost -d nav -u daniel -R indexing
+./build/osm_import -s <your_db_server> -d <your_db> -u <your_user_id> -R indexing
 
 # Re-run airports loading only
-./build/osm_import -s localhost -d nav -u daniel -R airports
+./build/osm_import -s <your_db_server> -d <your_db> -u <your_user_id> -R airports
 ```
 
 Resume phases: `nodes` | `merge` | `ways` | `reindex` | `relations` | `indexing` | `airports`
@@ -198,7 +198,7 @@ On the first successful import, two checkpoint files are written alongside `node
 Apply a single OSC change file:
 ```bash
 ./build/osm_import -m delta -o changes.osc.gz \
-  -s localhost -d nav -u daniel \
+  -s <your_db_server> -d <your_db> -u <your_user_id> \
   -f nodes.dat -n 20000000000
 ```
 
@@ -207,12 +207,12 @@ Apply a single OSC change file:
 Continuously apply replication diffs from planet.openstreetmap.org:
 ```bash
 ./build/osm_import -m poll -r minute \
-  -s localhost -d nav -u daniel \
+  -s <your_db_server> -d <your_db> -u <your_user_id> \
   -f nodes.dat -n 20000000000
 
 # Start from a specific sequence number
 ./build/osm_import -m poll -r minute -Q 5123456 \
-  -s localhost -d nav -u daniel \
+  -s <your_db_server> -d <your_db> -u <your_user_id> \
   -f nodes.dat -n 20000000000
 ```
 
@@ -222,12 +222,47 @@ Replication granularities: `minute` | `hour` | `day`
 
 ```bash
 # Run create_airports.sql first if not already done
-psql -h localhost -U daniel -d nav -f create_airports.sql
+psql -h localhost -U daniel -d <your_db> -f create_airports.sql
 
-./build/airports_load -s localhost -d nav -u daniel
+./build/airports_load -s <your_db_server> -d <your_db> -u <your_user_id>
 ```
 
 ---
+
+
+## Status line
+
+During import, a status line is printed to stdout once per second:
+
+```
+0:45:12 60.2%  N:2.1B A:0 W:0 R:0 Q:847 M:42.3% | 487.2K/s  [Nodes]
+```
+
+| Field | Description |
+|---|---|
+| `0:45:12` | Total elapsed time since process start (H:MM:SS) |
+| `60.2%` | PBF file read progress (bytes read / file size) |
+| `N:2.1B` | Total nodes processed (running total, never resets) |
+| `A:137.4M` | Total areas processed (running total, never resets) |
+| `W:85.5M` | Total ways processed (running total, never resets) |
+| `R:122.9K` | Total relations processed (running total, never resets) |
+| `Q:847` | Way queue depth (entries waiting to be processed by way threads) |
+| `M:42.3%` | Merge progress — only shown during the Merging phase |
+| `487.2K/s` | Throughput for the **current phase only** — computed from the count accrued since the phase began, so it reflects current speed rather than being diluted by time spent in earlier phases |
+| `[Nodes]` | Current phase |
+
+### Phases
+
+| Phase | Description |
+|---|---|
+| `[Nodes]` | Reading nodes from PBF, projecting to Mercator, writing to shard files and `my_nodes` |
+| `[Merging]` | Decompressing and merging per-thread shard files into the flat `nodes.dat` mmap |
+| `[Ways]` | Reading ways/areas from PBF, looking up node coordinates from mmap, writing to `my_ways`/`my_areas` |
+| `[Reindexing]` | Rebuilding primary key indexes on way/area/road/relation tables |
+| `[Relations]` | Processing relation members, merging geometries, writing to `my_relations`/`my_roads` |
+| `[Spatial Indexing]` | Building GiST spatial indexes on all geometry columns |
+| `[Loading Airports]` | Downloading and loading OurAirports data |
+| `[Done]` | Import complete |
 
 ## Architecture
 

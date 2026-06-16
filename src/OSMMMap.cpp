@@ -56,6 +56,31 @@ static void* openAndMap(const std::string& path, size_t sz, int& fd_out,
     return m;
 }
 
+// Grow `path` to at least `sz` bytes via ftruncate, preserving existing
+// content (the file is extended with a sparse hole). No-op if the file is
+// already >= sz. Used when resuming with a larger -n than the original run —
+// the merged file and its bitmap must be large enough for the new max_id.
+static void growFileIfNeeded(const std::string& path, size_t sz) {
+    int fd = open(path.c_str(), O_RDWR);
+    if (fd < 0)
+        throw std::runtime_error("OSMMMap: cannot open " + path + " for growth check");
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        close(fd);
+        throw std::runtime_error("OSMMMap: fstat failed for " + path);
+    }
+    if (static_cast<size_t>(st.st_size) < sz) {
+        if (ftruncate(fd, static_cast<off_t>(sz)) != 0) {
+            close(fd);
+            throw std::runtime_error(std::string("OSMMMap: ftruncate failed for ")
+                                     + path + ": " + std::strerror(errno));
+        }
+        std::cerr << "[OSMMMap] grew " << path << " from "
+                  << st.st_size << " to " << sz << " bytes\n";
+    }
+    close(fd);
+}
+
 static void createBlank(const std::string& path, size_t sz) {
     int fd = open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
     if (fd < 0)
@@ -137,6 +162,15 @@ OSMMMap::OSMMMap(const std::string& base_path, int64_t max_id,
     // Open merged flat file. No madvise() at construction time — see
     // setRandomAccessHint() for why this is applied later instead.
     size_t data_sz = (static_cast<size_t>(max_id) + 1) * REC_SIZE;
+
+    // On resume, -n may be larger than the value used to create the file
+    // originally. Grow the merged file and bitmap to fit, preserving
+    // existing data (the extension is a sparse hole).
+    if (!open_shards_for_write) {
+        growFileIfNeeded(base_path, data_sz);
+        growFileIfNeeded(base_path + ".bmp", bm_sz);
+    }
+
     merged_map_    = openAndMap(base_path, data_sz, merged_fd_, -1);
     merged_size_   = data_sz;
     merged_bm_map_ = openAndMap(base_path + ".bmp", bm_sz, merged_bm_fd_);
@@ -289,6 +323,12 @@ void OSMMMap::merge() {
     merge_total_.store(bm_total > 0 ? bm_total : (max_id_ + 1), std::memory_order_relaxed);
     merge_progress_.store(0, std::memory_order_relaxed);
 
+    // Periodically msync the merged mmap during merge so dirty pages don't
+    // accumulate unbounded across potentially billions of writes — same
+    // rationale as the periodic fsync added to the node-phase shard writer.
+    constexpr int64_t MERGE_SYNC_EVERY_N_RECORDS = 16'000'000; // ~256MB of records
+    int64_t records_since_sync = 0;
+
     // Lambda to safely write a record to the merged file
     auto writeToMerged = [&](int64_t id, double lon_m, double lat_m) {
         if (id < 0) {
@@ -305,6 +345,12 @@ void OSMMMap::merge() {
         dst[0] = lon_m;
         dst[1] = lat_m;
         bitmapSet(merged_bm_map_, merged_bm_size_, id);
+
+        if (++records_since_sync >= MERGE_SYNC_EVERY_N_RECORDS) {
+            msync(merged_map_, merged_size_, MS_ASYNC);
+            msync(merged_bm_map_, merged_bm_size_, MS_ASYNC);
+            records_since_sync = 0;
+        }
     };
 
     for (int i = 0; i < static_cast<int>(shards_.size()); ++i) {
@@ -395,8 +441,10 @@ void OSMMMap::merge() {
 
     LZ4F_freeDecompressionContext(dctx);
 
-    msync(merged_map_,    merged_size_,    MS_ASYNC);
-    msync(merged_bm_map_, merged_bm_size_, MS_ASYNC);
+    // Final sync is synchronous (MS_SYNC) since the ways phase immediately
+    // begins reading from merged_map_ right after this returns.
+    msync(merged_map_,    merged_size_,    MS_SYNC);
+    msync(merged_bm_map_, merged_bm_size_, MS_SYNC);
 }
 
 std::optional<std::pair<double,double>> OSMMMap::select(int64_t id) const {

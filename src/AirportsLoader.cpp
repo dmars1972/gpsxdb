@@ -11,19 +11,36 @@
 #include <cstdlib>
 #include <cstring>
 #include <iomanip>
+#include <stdexcept>
 
-// ---- Mercator projection ----
+// ---- Mercator projection (thread-local PROJ context, RAII cleanup) ----
+// Mirrors OSMReader.cpp's ProjContext pattern. The earlier version of this
+// function used bare thread_local PJ_CONTEXT*/PJ* pointers that were never
+// freed via proj_destroy()/proj_context_destroy() — PROJ's internal static
+// teardown at process exit could then conflict with the leaked thread-local
+// state, producing "double free or corruption" on exit. RAII fixes this.
 
-static std::pair<double,double> toMercatorAP(double lon, double lat) {
-    thread_local PJ_CONTEXT* ctx = nullptr;
-    thread_local PJ*         pj  = nullptr;
-    if (!ctx) {
+struct ProjContextAP {
+    PJ_CONTEXT* ctx;
+    PJ* pj;
+    ProjContextAP() {
         ctx = proj_context_create();
         pj  = proj_create_crs_to_crs(ctx, "EPSG:4326", "EPSG:3857", nullptr);
+        if (!pj) throw std::runtime_error("PROJ: failed to create CRS transform");
+        pj = proj_normalize_for_visualization(ctx, pj);
     }
-    PJ_COORD c = proj_coord(lat, lon, 0, 0);
-    PJ_COORD r = proj_trans(pj, PJ_FWD, c);
-    return {r.xy.x, r.xy.y};
+    ~ProjContextAP() {
+        proj_destroy(pj);
+        proj_context_destroy(ctx);
+    }
+};
+
+static thread_local ProjContextAP tl_proj_ap;
+
+static std::pair<double,double> toMercatorAP(double lon, double lat) {
+    PJ_COORD in  = proj_coord(lon, lat, 0, 0);
+    PJ_COORD out = proj_trans(tl_proj_ap.pj, PJ_FWD, in);
+    return {out.xy.x, out.xy.y};
 }
 
 // ---- WKB point ----

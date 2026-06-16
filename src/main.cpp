@@ -102,6 +102,11 @@ struct Status {
     std::atomic<int64_t> total_areas{0};
     std::atomic<int64_t> total_ways{0};
     std::atomic<int64_t> total_relations{0};
+    // Phase start time and counter snapshot — used to compute a per-phase
+    // rate without resetting the displayed running totals (nodes/areas/
+    // ways/relations always show cumulative counts).
+    std::atomic<int64_t> phase_start_us{0};     // microseconds since epoch
+    std::atomic<int64_t> phase_count_at_start{0}; // nodes+areas+ways+relations at phase start
 };
 
 // ---- WKB helpers ----
@@ -487,8 +492,16 @@ void wayThread(int tid,
                         // enableIndexes() disabled — primary keys maintained inline
                         // status.phase.store(static_cast<int>(Phase::Reindexing)...)
                         // db.enableIndexes();
-                        status.ways.store(0, std::memory_order_relaxed);
-                        status.areas.store(0, std::memory_order_relaxed);
+                        status.phase_count_at_start.store(
+                            status.nodes.load(std::memory_order_relaxed) +
+                            status.areas.load(std::memory_order_relaxed) +
+                            status.ways.load(std::memory_order_relaxed) +
+                            status.relations.load(std::memory_order_relaxed),
+                            std::memory_order_relaxed);
+                        status.phase_start_us.store(
+                            std::chrono::duration_cast<std::chrono::microseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch()).count(),
+                            std::memory_order_relaxed);
                         status.phase.store(static_cast<int>(Phase::Relations), std::memory_order_relaxed);
                     });
                     way_phase_done = true;
@@ -545,7 +558,19 @@ void statusThread(const Status& s, std::atomic<bool>& done,
         auto now      = std::chrono::steady_clock::now();
         double elapsed = std::chrono::duration<double>(now - start).count();
         int64_t total  = s.nodes + s.areas + s.ways + s.relations;
-        double rps     = elapsed > 0 ? total / elapsed : 0;
+        // Rate is computed from only the count accrued since this phase
+        // began, using a snapshot of the cumulative total taken at the
+        // phase transition — this keeps N/A/W/R as running totals for
+        // display while making the displayed rate phase-local.
+        int64_t phase_start = s.phase_start_us.load(std::memory_order_relaxed);
+        int64_t phase_count = total - s.phase_count_at_start.load(std::memory_order_relaxed);
+        double phase_elapsed = phase_start > 0
+            ? std::chrono::duration<double>(
+                std::chrono::microseconds(
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        now.time_since_epoch()).count() - phase_start)).count()
+            : elapsed;
+        double rps = phase_elapsed > 0 ? phase_count / phase_elapsed : 0;
         // Format elapsed as H:MM:SS
         int64_t secs = static_cast<int64_t>(elapsed);
         int h = secs / 3600, m = (secs % 3600) / 60, sec = secs % 60;
@@ -607,7 +632,8 @@ static int runDelta(const Args& args) {
         replicator.poll(args.poll_interval);
     }
 
-    return 0;
+    std::cout.flush();
+    _exit(0); // see comment near other _exit(0) calls in main()
 }
 
 // ---- main ----
@@ -647,7 +673,14 @@ int main(int argc, char** argv) {
         auto elapsed = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - start).count();
         std::cout << "\nResumed run done in " << elapsed << "s\n";
-        return 0;
+        std::cout.flush();
+        // _exit() rather than return: skips static/global destructor
+        // teardown across PROJ/protobuf/pqxx, which has been observed to
+        // cause "double free or corruption" crashes after all real work has
+        // already completed successfully. Since nothing meaningful needs
+        // cleanup at this point (all data is committed to PostgreSQL), this
+        // is safe.
+        _exit(0);
     }
 
     // Resuming at merge/ways/relations: nodes.dat and shard files already
@@ -684,7 +717,16 @@ int main(int argc, char** argv) {
             osmmap.merge();
             osmmap.setRandomAccessHint();
             merge_done.store(true, std::memory_order_release);
-            status.nodes.store(0, std::memory_order_relaxed);
+            status.phase_count_at_start.store(
+                status.nodes.load(std::memory_order_relaxed) +
+                status.areas.load(std::memory_order_relaxed) +
+                status.ways.load(std::memory_order_relaxed) +
+                status.relations.load(std::memory_order_relaxed),
+                std::memory_order_relaxed);
+            status.phase_start_us.store(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count(),
+                std::memory_order_relaxed);
             status.phase.store(static_cast<int>(Phase::Ways), std::memory_order_relaxed);
             Log::get().write(-1, "INFO", "merge complete");
         }
@@ -880,5 +922,9 @@ int main(int argc, char** argv) {
               << "Ways: "  << hr(status.total_ways)  << ", "
               << "Relations: " << hr(status.total_relations) << " | "
               << hr(static_cast<int64_t>(total / elapsed)) << "/s\n";
-    return 0;
+    std::cout.flush();
+    // _exit() rather than return: see comment in the -R indexing/airports
+    // resume branch above — skips static teardown that has been observed
+    // to crash with "double free or corruption" after all work completes.
+    _exit(0);
 }
