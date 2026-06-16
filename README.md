@@ -120,7 +120,10 @@ synchronous_commit = off
 autovacuum = off
 ```
 
-Re-enable autovacuum after import:
+The importer runs `VACUUM ANALYZE` on all tables automatically as its final
+step (with `autovacuum` disabled during import, statistics and dead-tuple
+cleanup only happen when explicitly requested). Re-enable autovacuum once
+the import is complete:
 ```sql
 ALTER SYSTEM SET autovacuum = on;
 SELECT pg_reload_conf();
@@ -185,9 +188,12 @@ If an import is interrupted, resume at any phase without reprocessing earlier on
 
 # Re-run airports loading only
 ./build/osm_import -s <your_db_server> -d <your_db> -u <your_user_id> -R airports
+
+# Re-run VACUUM ANALYZE only
+./build/osm_import -s <your_db_server> -d <your_db> -u <your_user_id> -R vacuum
 ```
 
-Resume phases: `nodes` | `merge` | `ways` | `reindex` | `relations` | `indexing` | `airports`
+Resume phases: `nodes` | `merge` | `ways` | `reindex` | `relations` | `indexing` | `airports` | `vacuum`
 
 On the first successful import, two checkpoint files are written alongside `nodes.dat`:
 - `nodes.dat.offset` — byte offset of first non-node blob in the PBF (skips node section on resume)
@@ -262,6 +268,7 @@ During import, a status line is printed to stdout once per second:
 | `[Relations]` | Processing relation members, merging geometries, writing to `my_relations`/`my_roads` |
 | `[Spatial Indexing]` | Building GiST spatial indexes on all geometry columns |
 | `[Loading Airports]` | Downloading and loading OurAirports data |
+| `[Vacuuming]` | Running `VACUUM ANALYZE` on all tables |
 | `[Done]` | Import complete |
 
 ## Architecture

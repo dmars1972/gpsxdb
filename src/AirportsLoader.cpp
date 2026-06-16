@@ -105,7 +105,7 @@ static bool downloadAP(const std::string& url, const std::string& dest) {
 
 // ---- Table loaders ----
 
-static void loadCountries(pqxx::connection& conn, const std::string& path) {
+static void loadCountries(pqxx::connection& conn, const std::string& path, bool verbose) {
     std::ifstream f(path); std::string line; std::getline(f, line);
     pqxx::work txn(conn);
     auto s = pqxx::stream_to::table(txn, {"ap_countries"},
@@ -118,10 +118,10 @@ static void loadCountries(pqxx::connection& conn, const std::string& path) {
         ++n;
     }
     s.complete(); txn.commit();
-    std::cout << "  countries: " << n << "\n";
+    if (verbose) std::cout << "  countries: " << n << "\n";
 }
 
-static void loadRegions(pqxx::connection& conn, const std::string& path) {
+static void loadRegions(pqxx::connection& conn, const std::string& path, bool verbose) {
     std::ifstream f(path); std::string line; std::getline(f, line);
     pqxx::work txn(conn);
     auto s = pqxx::stream_to::table(txn, {"ap_regions"},
@@ -136,7 +136,7 @@ static void loadRegions(pqxx::connection& conn, const std::string& path) {
         ++n;
     }
     s.complete(); txn.commit();
-    std::cout << "  regions: " << n << "\n";
+    if (verbose) std::cout << "  regions: " << n << "\n";
 }
 
 static const std::vector<std::pair<int,std::string>> AIRPORT_TAG_COLS = {
@@ -145,7 +145,7 @@ static const std::vector<std::pair<int,std::string>> AIRPORT_TAG_COLS = {
     {18, "keywords"},
 };
 
-static void loadAirports(pqxx::connection& conn, const std::string& path) {
+static void loadAirports(pqxx::connection& conn, const std::string& path, bool verbose) {
     // Two passes: first load airports, then tags (pqxx allows only one active stream)
     struct AirportRow {
         int id; std::optional<std::string> ident, type, name, continent,
@@ -208,7 +208,7 @@ static void loadAirports(pqxx::connection& conn, const std::string& path) {
     std::cout << "  airports: " << airports.size() << "\n";
 }
 
-static void loadFrequencies(pqxx::connection& conn, const std::string& path) {
+static void loadFrequencies(pqxx::connection& conn, const std::string& path, bool verbose) {
     std::ifstream f(path); std::string line; std::getline(f, line);
     pqxx::work txn(conn);
     auto s = pqxx::stream_to::table(txn, {"ap_frequencies"},
@@ -223,10 +223,10 @@ static void loadFrequencies(pqxx::connection& conn, const std::string& path) {
         ++n;
     }
     s.complete(); txn.commit();
-    std::cout << "  frequencies: " << n << "\n";
+    if (verbose) std::cout << "  frequencies: " << n << "\n";
 }
 
-static void loadRunways(pqxx::connection& conn, const std::string& path) {
+static void loadRunways(pqxx::connection& conn, const std::string& path, bool verbose) {
     std::ifstream f(path); std::string line; std::getline(f, line);
     pqxx::work txn(conn);
     auto s = pqxx::stream_to::table(txn, {"ap_runways"},
@@ -263,7 +263,7 @@ static void loadRunways(pqxx::connection& conn, const std::string& path) {
         ++n;
     }
     s.complete(); txn.commit();
-    std::cout << "  runways: " << n << "\n";
+    if (verbose) std::cout << "  runways: " << n << "\n";
 }
 
 static const std::vector<std::pair<int,std::string>> NAVAID_TAG_COLS = {
@@ -272,7 +272,7 @@ static const std::vector<std::pair<int,std::string>> NAVAID_TAG_COLS = {
     {16, "magnetic_variation_deg"},
 };
 
-static void loadNavaids(pqxx::connection& conn, const std::string& path) {
+static void loadNavaids(pqxx::connection& conn, const std::string& path, bool verbose) {
     std::ifstream f(path); std::string line; std::getline(f, line);
     struct NavaidRow {
         int id;
@@ -348,7 +348,8 @@ static void loadNavaids(pqxx::connection& conn, const std::string& path) {
 // ---- Public entry point ----
 
 void loadAirportsData(const std::string& server, const std::string& user,
-                      const std::string& database, const std::string& password) {
+                      const std::string& database, const std::string& password,
+                      bool verbose) {
     const std::string base = "https://davidmegginson.github.io/ourairports-data/";
     const std::string tmp  = "/tmp/ourairports_";
 
@@ -362,13 +363,13 @@ void loadAirportsData(const std::string& server, const std::string& user,
         {"navaids",     base + "navaids.csv",             tmp + "navaids.csv"},
     };
 
-    std::cout << "Downloading OurAirports data...\n";
+    if (verbose) std::cout << "Downloading OurAirports data...\n";
     for (auto& f : files) {
-        std::cout << "  " << f.name << "... "; std::cout.flush();
+        if (verbose) { std::cout << "  " << f.name << "... "; std::cout.flush(); }
         if (!downloadAP(f.url, f.dest)) {
             std::cerr << "FAILED — skipping airports load\n"; return;
         }
-        std::cout << "OK\n";
+        if (verbose) std::cout << "OK\n";
     }
 
     std::string connstr = "host=" + server + " dbname=" + database +
@@ -378,12 +379,12 @@ void loadAirportsData(const std::string& server, const std::string& user,
     pqxx::connection conn(connstr);
     { pqxx::work txn(conn); txn.exec("SET synchronous_commit = off"); txn.commit(); }
 
-    std::cout << "Loading airports data...\n";
-    loadCountries  (conn, files[0].dest);
-    loadRegions    (conn, files[1].dest);
-    loadAirports   (conn, files[2].dest);
-    loadFrequencies(conn, files[3].dest);
-    loadRunways    (conn, files[4].dest);
-    loadNavaids    (conn, files[5].dest);
-    std::cout << "Airports data loaded.\n";
+    if (verbose) std::cout << "Loading airports data...\n";
+    loadCountries  (conn, files[0].dest, verbose);
+    loadRegions    (conn, files[1].dest, verbose);
+    loadAirports   (conn, files[2].dest, verbose);
+    loadFrequencies(conn, files[3].dest, verbose);
+    loadRunways    (conn, files[4].dest, verbose);
+    loadNavaids    (conn, files[5].dest, verbose);
+    if (verbose) std::cout << "Airports data loaded.\n";
 }

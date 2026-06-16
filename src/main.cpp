@@ -73,7 +73,13 @@ private:
 
 // ---- Status ----
 
-enum class Phase { Nodes, Merging, Ways, Reindexing, Indexing, Relations, AirportsLoading, Done };
+enum class Phase { Nodes, Merging, Ways, Reindexing, Indexing, Relations, AirportsLoading, Vacuuming, Done };
+
+// Current time in microseconds since epoch — matches phase_start_us units
+static int64_t nowUs() {
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 
 static const char* phaseName(Phase p) {
     switch (p) {
@@ -84,12 +90,50 @@ static const char* phaseName(Phase p) {
         case Phase::Indexing:    return "Spatial Indexing";
         case Phase::Relations:  return "Relations";
         case Phase::AirportsLoading: return "Loading Airports";
+        case Phase::Vacuuming:  return "Vacuuming";
         case Phase::Done:       return "Done";
     }
     return "";
 }
 
+// Records timing/count for one completed phase, for the final summary report.
+struct PhaseStats {
+    Phase phase;
+    double elapsed_sec;
+    int64_t count; // entities processed during this phase
+};
+
 struct Status {
+    std::mutex phase_log_mu;
+    std::vector<PhaseStats> phase_log;
+
+    void recordPhase(Phase p, double elapsed_sec, int64_t count) {
+        std::lock_guard<std::mutex> lk(phase_log_mu);
+        phase_log.push_back({p, elapsed_sec, count});
+    }
+
+    // Records stats for the phase that just ended, then advances to the
+    // next phase with a fresh start time and count baseline. Centralizes
+    // what was previously duplicated at every phase transition site.
+    void advancePhase(Phase finishing, Phase next) {
+        int64_t total = nodes.load(std::memory_order_relaxed)
+                      + areas.load(std::memory_order_relaxed)
+                      + ways.load(std::memory_order_relaxed)
+                      + relations.load(std::memory_order_relaxed);
+        int64_t prev_start_us = phase_start_us.load(std::memory_order_relaxed);
+        int64_t prev_count    = phase_count_at_start.load(std::memory_order_relaxed);
+        int64_t now           = nowUs();
+
+        if (prev_start_us > 0) {
+            double elapsed = (now - prev_start_us) / 1'000'000.0;
+            recordPhase(finishing, elapsed, total - prev_count);
+        }
+
+        phase_count_at_start.store(total, std::memory_order_relaxed);
+        phase_start_us.store(now, std::memory_order_relaxed);
+        phase.store(static_cast<int>(next), std::memory_order_relaxed);
+    }
+
     // Current phase counters — reset at each phase transition for display
     std::atomic<int64_t> nodes{0};
     std::atomic<int64_t> areas{0};
@@ -275,11 +319,20 @@ static Args parseArgs(int argc, char** argv) {
             else if (ph == "relations")  a.resume_phase = Phase::Relations;
             else if (ph == "indexing")   a.resume_phase = Phase::Indexing;
             else if (ph == "airports")   a.resume_phase = Phase::AirportsLoading;
+            else if (ph == "vacuum")     a.resume_phase = Phase::Vacuuming;
             else { std::cerr << "Unknown resume phase: " << ph << "\n"; std::cerr.flush(); _exit(1); }
         }
         else if (arg == "--help" || arg == "-h") {
             std::cout <<
                 "Usage: osm_import -s <host> -d <db> -u <user> [options]\n"
+                "  Common (all modes):\n"
+                "    -s server          PostgreSQL host (required)\n"
+                "    -d database        Database name (required)\n"
+                "    -u user            Database user (required)\n"
+                "    -m mode            import|delta|poll (default import)\n"
+                "    -l log_file        (default osm_import.log)\n"
+                "    -v                 Verbose logging\n"
+                "    -h                 Show this help and exit\n"
                 "  Import mode (default):\n"
                 "    -i <file.osm.pbf>  Input PBF file\n"
                 "    -t node_threads    (default 4)\n"
@@ -287,8 +340,9 @@ static Args parseArgs(int argc, char** argv) {
                 "    -q queue_size      (default 10000)\n"
                 "    -f nodes_file      (default nodes.dat)\n"
                 "    -n max_node_id     (default 20000000000)\n"
+                "    -S shard_dir       Directory for shard files (default .)\n"
                 "    -R phase           Resume at phase: nodes|merge|ways|reindex|\n"
-                "                       relations|indexing|airports (default nodes)\n"
+                "                       relations|indexing|airports|vacuum (default nodes)\n"
                 "                       Prerequisites for the chosen phase must\n"
                 "                       already be complete (e.g. -R ways requires\n"
                 "                       nodes.dat to already contain merged data and\n"
@@ -302,10 +356,7 @@ static Args parseArgs(int argc, char** argv) {
                 "    -Q sequence        Starting sequence (default: from DB)\n"
                 "    -p poll_interval   Seconds between checks (default 60)\n"
                 "    -f nodes_file      Existing nodes.dat from initial import\n"
-                "    -n max_node_id     Must match initial import\n"
-                "  Common:\n"
-                "    -l log_file        (default osm_import.log)\n"
-                "    -v                 Verbose logging\n";
+                "    -n max_node_id     Must match initial import\n";
             std::cout.flush();
             _exit(0);
         } else {
@@ -382,6 +433,24 @@ static std::string hr(int64_t n) {
     if (n >= 1'000) return std::to_string(n / 1'000) + "." +
         std::to_string((n % 1'000) / 100) + "K";
     return std::to_string(n);
+}
+
+// Format a duration in seconds as H:MM:SS (or just seconds if under a minute)
+static std::string formatDuration(double seconds) {
+    if (seconds < 60.0) {
+        std::ostringstream ss;
+        ss << std::fixed << std::setprecision(1) << seconds << "s";
+        return ss.str();
+    }
+    int64_t total_sec = static_cast<int64_t>(seconds);
+    int64_t h = total_sec / 3600;
+    int64_t m = (total_sec % 3600) / 60;
+    int64_t s = total_sec % 60;
+    std::ostringstream ss;
+    if (h > 0) ss << h << ":" << std::setw(2) << std::setfill('0') << m
+                  << ":" << std::setw(2) << std::setfill('0') << s;
+    else       ss << m << ":" << std::setw(2) << std::setfill('0') << s;
+    return ss.str();
 }
 
 // ---- Node-phase thread ----
@@ -490,19 +559,8 @@ void wayThread(int tid,
                     static std::once_flag indexes_enabled;
                     std::call_once(indexes_enabled, [&db, &status]{
                         // enableIndexes() disabled — primary keys maintained inline
-                        // status.phase.store(static_cast<int>(Phase::Reindexing)...)
                         // db.enableIndexes();
-                        status.phase_count_at_start.store(
-                            status.nodes.load(std::memory_order_relaxed) +
-                            status.areas.load(std::memory_order_relaxed) +
-                            status.ways.load(std::memory_order_relaxed) +
-                            status.relations.load(std::memory_order_relaxed),
-                            std::memory_order_relaxed);
-                        status.phase_start_us.store(
-                            std::chrono::duration_cast<std::chrono::microseconds>(
-                                std::chrono::steady_clock::now().time_since_epoch()).count(),
-                            std::memory_order_relaxed);
-                        status.phase.store(static_cast<int>(Phase::Relations), std::memory_order_relaxed);
+                        status.advancePhase(Phase::Ways, Phase::Relations);
                     });
                     way_phase_done = true;
                 }
@@ -664,17 +722,26 @@ int main(int argc, char** argv) {
     auto start = std::chrono::steady_clock::now();
     std::mutex db_flush_mu_early;
 
-    // -R indexing / -R airports: no PBF processing needed at all
-    if (args.resume_phase == Phase::Indexing || args.resume_phase == Phase::AirportsLoading) {
+    // -R indexing / -R airports / -R vacuum: no PBF processing needed at all
+    if (args.resume_phase == Phase::Indexing || args.resume_phase == Phase::AirportsLoading
+        || args.resume_phase == Phase::Vacuuming) {
         if (args.resume_phase == Phase::Indexing) {
             LOGI(-1, "resume: creating GiST spatial indexes");
             NavDB db(0, args.server, args.user, args.database, db_flush_mu_early);
             db.createGistIndexes();
             LOGI(-1, "GiST indexes done");
         }
-        LOGI(-1, "resume: loading airports data");
-        loadAirportsData(args.server, args.user, args.database);
-        LOGI(-1, "airports data loaded");
+        if (args.resume_phase == Phase::Indexing || args.resume_phase == Phase::AirportsLoading) {
+            LOGI(-1, "resume: loading airports data");
+            loadAirportsData(args.server, args.user, args.database, "", false);
+            LOGI(-1, "airports data loaded");
+        }
+        LOGI(-1, "resume: running VACUUM ANALYZE on all tables");
+        {
+            NavDB db(0, args.server, args.user, args.database, db_flush_mu_early);
+            db.vacuumAnalyze();
+        }
+        LOGI(-1, "VACUUM ANALYZE complete");
 
         auto elapsed = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - start).count();
@@ -713,27 +780,18 @@ int main(int argc, char** argv) {
     BlockingQueue<OSMEntry> way_q(args.queue_size);
 
     Status              status;
+    status.phase_start_us.store(nowUs(), std::memory_order_relaxed);
     std::atomic<bool>   nodes_done{false};
     std::atomic<bool>   merge_done{false};
     std::barrier<std::function<void()>> node_barrier(
         args.node_threads,
         [&osmmap, &merge_done, &status]() noexcept {
             Log::get().write(-1, "INFO", "merge starting");
-            status.phase.store(static_cast<int>(Phase::Merging), std::memory_order_relaxed);
+            status.advancePhase(Phase::Nodes, Phase::Merging);
             osmmap.merge();
             osmmap.setRandomAccessHint();
             merge_done.store(true, std::memory_order_release);
-            status.phase_count_at_start.store(
-                status.nodes.load(std::memory_order_relaxed) +
-                status.areas.load(std::memory_order_relaxed) +
-                status.ways.load(std::memory_order_relaxed) +
-                status.relations.load(std::memory_order_relaxed),
-                std::memory_order_relaxed);
-            status.phase_start_us.store(
-                std::chrono::duration_cast<std::chrono::microseconds>(
-                    std::chrono::steady_clock::now().time_since_epoch()).count(),
-                std::memory_order_relaxed);
-            status.phase.store(static_cast<int>(Phase::Ways), std::memory_order_relaxed);
+            status.advancePhase(Phase::Merging, Phase::Ways);
             Log::get().write(-1, "INFO", "merge complete");
         }
     );
@@ -778,7 +836,10 @@ int main(int argc, char** argv) {
         if (skip_merge) {
             osmmap.setRandomAccessHint();
             merge_done.store(true, std::memory_order_release);
-            status.phase.store(static_cast<int>(Phase::Ways), std::memory_order_relaxed);
+            // Nodes/Merging were already completed in a prior run, so there's
+            // nothing to record for them here — just start the Ways phase
+            // clock fresh.
+            status.advancePhase(Phase::Ways, Phase::Ways);
         }
     }
 
@@ -901,18 +962,29 @@ int main(int argc, char** argv) {
     for (auto& w : way_workers) w.join();
     LOGI(-1, "all threads done");
 
-    status.phase.store(static_cast<int>(Phase::Indexing), std::memory_order_relaxed);
+    // Relations phase ends here (way threads just joined)
+    status.advancePhase(Phase::Relations, Phase::Indexing);
     LOGI(-1, "creating GiST spatial indexes");
     {
         NavDB db(0, args.server, args.user, args.database, db_flush_mu);
         db.createGistIndexes();
     }
     LOGI(-1, "GiST indexes done");
-    status.phase.store(static_cast<int>(Phase::AirportsLoading), std::memory_order_relaxed);
+
+    status.advancePhase(Phase::Indexing, Phase::AirportsLoading);
     LOGI(-1, "loading airports data");
-    loadAirportsData(args.server, args.user, args.database);
+    loadAirportsData(args.server, args.user, args.database, "", false);
     LOGI(-1, "airports data loaded");
-    status.phase.store(static_cast<int>(Phase::Done), std::memory_order_relaxed);
+
+    status.advancePhase(Phase::AirportsLoading, Phase::Vacuuming);
+    LOGI(-1, "running VACUUM ANALYZE on all tables");
+    {
+        NavDB db(0, args.server, args.user, args.database, db_flush_mu);
+        db.vacuumAnalyze();
+    }
+    LOGI(-1, "VACUUM ANALYZE complete");
+
+    status.advancePhase(Phase::Vacuuming, Phase::Done);
     status_done.store(true, std::memory_order_relaxed);
     t_status.join();
 
@@ -921,6 +993,30 @@ int main(int argc, char** argv) {
     int64_t total = status.total_nodes + status.total_areas + status.total_ways + status.total_relations;
 
     LOGI(-1, "done elapsed=", elapsed, "s total=", total);
+
+    // Per-phase breakdown table
+    std::cout << "\n--- Phase summary ---\n";
+    {
+        std::lock_guard<std::mutex> lk(status.phase_log_mu);
+        std::cout << std::left  << std::setw(18) << "Phase"
+                  << std::right << std::setw(12) << "Time"
+                  << std::right << std::setw(14) << "Count"
+                  << std::right << std::setw(14) << "Rate" << "\n";
+        for (auto& p : status.phase_log) {
+            std::cout << std::left  << std::setw(18) << phaseName(p.phase)
+                       << std::right << std::setw(12) << formatDuration(p.elapsed_sec);
+            if (p.count > 0) {
+                double rate = p.elapsed_sec > 0 ? p.count / p.elapsed_sec : 0;
+                std::cout << std::right << std::setw(14) << hr(p.count)
+                           << std::right << std::setw(11) << hr(static_cast<int64_t>(rate)) << "/s";
+            } else {
+                std::cout << std::right << std::setw(14) << "-"
+                           << std::right << std::setw(14) << "-";
+            }
+            std::cout << "\n";
+        }
+    }
+    std::cout << "----------------------\n";
 
     std::cout << "\nDone in " << elapsed << "s | "
               << "Nodes: " << hr(status.total_nodes) << ", "

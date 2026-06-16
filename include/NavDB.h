@@ -91,6 +91,12 @@ public:
     int64_t getReplicationSequence();
     void    setReplicationSequence(int64_t seq);
 
+    // VACUUM ANALYZE all OSM + airports tables. Call after import completes
+    // and before re-enabling autovacuum (which is typically disabled during
+    // bulk import for speed). VACUUM cannot run inside a transaction block,
+    // so this uses nontransaction.
+    void vacuumAnalyze();
+
 private:
     struct NodeRecord { int64_t id; std::string name, geog; double lon_m, lat_m; };
     struct GeomRecord { int64_t id; std::string name, geog; };

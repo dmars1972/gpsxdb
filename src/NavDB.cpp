@@ -477,3 +477,25 @@ void NavDB::setReplicationSequence(int64_t seq) {
         std::cerr << "[NavDB] setReplicationSequence error: " << e.what() << "\n"; throw;
     }
 }
+
+void NavDB::vacuumAnalyze() {
+    static const char* tables[] = {
+        "my_nodes", "my_ways", "my_areas", "my_roads", "my_relations",
+        "my_node_tags", "my_way_tags", "my_area_tags", "my_road_tags",
+        "my_relation_tags",
+        "ap_airports", "ap_runways", "ap_navaids", "ap_frequencies",
+        "ap_tags", "ap_countries", "ap_regions",
+    };
+    // VACUUM cannot run inside a transaction block — pqxx::nontransaction
+    // issues commands without wrapping them in BEGIN/COMMIT.
+    for (const char* t : tables) {
+        try {
+            pqxx::nontransaction txn(*conn_);
+            LOGI(thread_id_, "VACUUM ANALYZE ", t);
+            txn.exec("VACUUM ANALYZE " + std::string(t));
+        } catch (const std::exception& e) {
+            std::cerr << "[NavDB] vacuumAnalyze(" << t << ") error: " << e.what() << "\n";
+            // Continue with remaining tables rather than aborting entirely
+        }
+    }
+}
