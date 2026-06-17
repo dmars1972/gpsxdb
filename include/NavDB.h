@@ -65,10 +65,7 @@ public:
     void finalize_tags(const std::string& table);
 
     // ---- Queries ----
-    // Batched lookup — one round trip for many IDs instead of one per ID.
-    // Returns a map of id -> geog (WKB hex). IDs with no match (or null
-    // geog) are simply absent from the map.
-    std::unordered_map<int64_t, std::string> getWays(const std::vector<int64_t>& ids);
+    std::string getWay(int64_t id);
 
     // ---- Delta / update methods ----
     void updateNode(int64_t id, const std::string& name,
@@ -96,6 +93,14 @@ public:
     // bulk import for speed). VACUUM cannot run inside a transaction block,
     // so this uses nontransaction.
     void vacuumAnalyze();
+
+    // Truncates the tables that the given resume phase will (re)populate.
+    // Re-reading from -R ways/relations/airports starts from the beginning
+    // of that phase's PBF section / data source every time (there is no
+    // granular per-row resume), so without this, any rows already committed
+    // before a crash would cause duplicate-key violations on resume.
+    // phase must be one of: "ways", "relations", "airports".
+    void truncateForResume(const std::string& phase);
 
 private:
     struct NodeRecord { int64_t id; std::string name, geog; double lon_m, lat_m; };

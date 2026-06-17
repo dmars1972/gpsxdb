@@ -298,27 +298,18 @@ void NavDB::createGistIndexes() {
 
 // ---- query ----
 
-std::unordered_map<int64_t, std::string> NavDB::getWays(const std::vector<int64_t>& ids) {
-    std::unordered_map<int64_t, std::string> out;
-    if (ids.empty()) return out;
+std::string NavDB::getWay(int64_t id) {
     try {
         pqxx::work txn(*conn_);
-        // ANY($1) against an array param replaces N round trips with one.
-        // A member id may legitimately appear in either my_ways or
-        // my_areas (but not both in practice).
         auto res = txn.exec(
-            "SELECT id, geog FROM my_ways  WHERE id = ANY($1) "
-            "UNION ALL "
-            "SELECT id, geog FROM my_areas WHERE id = ANY($1)",
-            pqxx::params{ids});
-        for (const auto& row : res) {
-            if (row[1].is_null()) continue;
-            out.emplace(row[0].as<int64_t>(), row[1].as<std::string>());
-        }
+            "SELECT geog FROM my_ways WHERE id = $1 UNION ALL SELECT geog FROM my_areas WHERE id = $1",
+            pqxx::params{id});
+        if (res.empty() || res[0][0].is_null()) return "";
+        return res[0][0].as<std::string>();
     } catch (const std::exception& e) {
-        std::cerr << "[NavDB] getWays error: " << e.what() << "\n";
+        std::cerr << "[NavDB] getWay error: " << e.what() << "\n";
+        return "";
     }
-    return out;
 }
 
 // ---- delta / update methods ----
@@ -497,5 +488,37 @@ void NavDB::vacuumAnalyze() {
             std::cerr << "[NavDB] vacuumAnalyze(" << t << ") error: " << e.what() << "\n";
             // Continue with remaining tables rather than aborting entirely
         }
+    }
+}
+
+void NavDB::truncateForResume(const std::string& phase) {
+    std::vector<std::string> tables;
+    if (phase == "ways") {
+        tables = {"my_ways", "my_areas", "my_way_tags", "my_area_tags"};
+    } else if (phase == "relations") {
+        tables = {"my_relations", "my_roads", "my_relation_tags", "my_road_tags"};
+    } else if (phase == "airports") {
+        tables = {"ap_countries", "ap_regions", "ap_airports", "ap_tags",
+                  "ap_frequencies", "ap_runways", "ap_navaids"};
+    } else {
+        std::cerr << "[NavDB] truncateForResume: unknown phase '" << phase << "'\n";
+        return;
+    }
+
+    try {
+        pqxx::work txn(*conn_);
+        std::string sql = "TRUNCATE " ;
+        for (size_t i = 0; i < tables.size(); ++i) {
+            if (i > 0) sql += ", ";
+            sql += tables[i];
+        }
+        LOGI(thread_id_, "truncating tables for resume (phase=", phase, "): ", sql);
+        txn.exec(sql);
+        txn.commit();
+    } catch (const std::exception& e) {
+        std::cerr << "[NavDB] truncateForResume(" << phase << ") error: " << e.what() << "\n";
+        throw; // resuming into a non-empty, partially-populated table set is
+               // unsafe — better to abort than silently hit duplicate-key
+               // errors mid-run
     }
 }

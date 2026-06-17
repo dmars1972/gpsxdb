@@ -565,19 +565,13 @@ void wayThread(int tid,
                     way_phase_done = true;
                 }
 
-                // Collect member geometries from both ways and areas via a
-                // single batched query (one round trip per relation instead
-                // of one per member) — this was the dominant cost in the
-                // relations phase for relations with many members.
+                // Collect member geometries from both ways and areas.
                 // mergeWayGeoms filters out polygons internally so both
                 // rel_geog and road_geog will only contain linestrings.
-                auto way_geoms_by_id = db.getWays(item.way_members);
                 std::vector<std::string> geoms;
-                geoms.reserve(item.way_members.size());
                 for (int64_t wid : item.way_members) {
-                    auto it = way_geoms_by_id.find(wid);
-                    if (it != way_geoms_by_id.end() && !it->second.empty())
-                        geoms.push_back(it->second);
+                    std::string g = db.getWay(wid);
+                    if (!g.empty()) geoms.push_back(std::move(g));
                 }
                 std::string rel_geog  = geoms.empty() ? "" : mergeWayGeoms(geoms);
                 std::string road_geog = rel_geog;
@@ -733,6 +727,10 @@ int main(int argc, char** argv) {
         }
         if (args.resume_phase == Phase::Indexing || args.resume_phase == Phase::AirportsLoading) {
             LOGI(-1, "resume: loading airports data");
+            {
+                NavDB db(0, args.server, args.user, args.database, db_flush_mu_early);
+                db.truncateForResume("airports");
+            }
             loadAirportsData(args.server, args.user, args.database, "", false);
             LOGI(-1, "airports data loaded");
         }
@@ -799,6 +797,19 @@ int main(int argc, char** argv) {
     std::mutex          db_flush_mu;
     std::atomic<bool>   status_done{false};
 
+    // On resume, the target phase's tables must be empty — otherwise the
+    // upcoming COPY operations could collide with rows already committed by
+    // a previous attempt that crashed partway through, causing duplicate-key
+    // errors. truncateForResume() is idempotent (TRUNCATE on empty tables is
+    // a harmless no-op), so this is always safe to run.
+    if (args.resume_phase == Phase::Ways) {
+        NavDB resume_db(0, args.server, args.user, args.database, db_flush_mu);
+        resume_db.truncateForResume("ways");
+    } else if (args.resume_phase == Phase::Relations) {
+        NavDB resume_db(0, args.server, args.user, args.database, db_flush_mu);
+        resume_db.truncateForResume("relations");
+    }
+
     LOGI(-1, "launching ", args.way_threads, " way threads");
     std::vector<std::thread> way_workers;
     way_workers.reserve(args.way_threads);
@@ -837,9 +848,11 @@ int main(int argc, char** argv) {
             osmmap.setRandomAccessHint();
             merge_done.store(true, std::memory_order_release);
             // Nodes/Merging were already completed in a prior run, so there's
-            // nothing to record for them here — just start the Ways phase
-            // clock fresh.
-            status.advancePhase(Phase::Ways, Phase::Ways);
+            // nothing to record for them here — just start the clock fresh
+            // for whichever phase we're actually resuming into.
+            Phase target = (args.resume_phase == Phase::Relations)
+                ? Phase::Relations : Phase::Ways;
+            status.advancePhase(target, target);
         }
     }
 
