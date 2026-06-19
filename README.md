@@ -343,7 +343,62 @@ with conservative thread settings (`-t 1 -w 6`) required for stability:
 On a proper desktop/server with PCIe 3.0/4.0 NVMe, significantly higher throughput
 is expected — see [Hardware notes](#hardware-notes) for guidance on scaling up.
 
-### Tuning recommendations
+#
+## Tuning thread counts
+
+The status line's `Q:` field (way queue depth) is the primary feedback
+mechanism for tuning `-t` (node threads) and `-w` (way threads). The
+goal is to keep the queue neither constantly empty nor constantly full.
+
+### Node phase — tuning `-t`
+
+During the **Nodes** phase, the producer (single-threaded PBF parser) feeds
+node entries into per-thread queues consumed by `-t` node threads. Each node
+thread does Mercator projection, mmap writes, and COPY buffering.
+
+| Queue depth | What it means | Action |
+|---|---|---|
+| Consistently 0 | Producer is the bottleneck — node threads are faster than the PBF parser can feed them. Adding more node threads won't help. | Reduce `-t` to free up resources, or leave as-is |
+| Consistently at max (10000) | Node threads are the bottleneck — they can't keep up with the producer. | Increase `-t` if the system can handle the extra I/O load |
+| Fluctuates 0–max | Roughly balanced — this is ideal | Leave as-is |
+
+On an RPi5, `-t 1` is recommended. With a single node thread, `Q:` will
+typically sit at 0 (producer-bound), meaning the PBF parser is the ceiling
+— adding threads won't improve throughput but will increase I/O pressure and
+risk system instability. On a desktop/server, try `-t 3` or higher and watch
+whether `Q:` rises.
+
+### Ways/Relations phase — tuning `-w`
+
+During the **Ways** and **Relations** phases, the producer feeds way/relation
+entries into a single shared queue consumed by `-w` way threads. Each way
+thread does random node-coordinate lookups from `nodes.dat` (mmap), geometry
+building, and PostgreSQL COPY.
+
+| Queue depth | What it means | Action |
+|---|---|---|
+| Consistently 0 | Way threads are faster than the producer can feed them. More threads won't help and will only increase I/O/DB pressure. | Reduce `-w` |
+| Consistently at max (10000) | Way threads are the bottleneck — they can't process fast enough. | Increase `-w` if the system is stable |
+| Fluctuates 0–max | Balanced — ideal | Leave as-is |
+
+On an RPi5, `-w 6` has been found to be a reasonable balance between
+throughput and system stability. Higher values (`-w 12`) increase random I/O
+concurrency and can trigger kernel-level instability on this platform even
+though the queue appears to have room. On desktop hardware with a fast NVMe,
+`-w 12` or higher should be stable and beneficial.
+
+### General rule of thumb
+
+- **Q: always 0** → you have more threads than the bottleneck can feed;
+  reduce thread count or accept that you're at the throughput ceiling
+- **Q: always at max** → threads are the bottleneck; increase thread count
+  if the system is stable under the load
+- **System instability (lockups/crashes)** → reduce thread count regardless
+  of queue depth; the I/O pressure from concurrent threads, not just
+  throughput, is what triggers hardware/driver instability on constrained
+  platforms like the RPi5
+
+## Tuning recommendations
 
 - Place `nodes.dat` on your fastest storage (NVMe preferred)
 - Use `-S <dir>` to place shard files on a separate drive from `nodes.dat` if available
