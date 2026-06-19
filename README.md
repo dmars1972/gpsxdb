@@ -101,10 +101,10 @@ createdb <your_db>
 psql -d <your_db> -c "CREATE EXTENSION postgis;"
 
 # Create OSM schema
-psql -h localhost -U daniel -d <your_db> -f create.sql
+psql -h localhost -U <your_user_id> -d <your_db> -f create.sql
 
 # Create OurAirports schema (imported automatically at end of import)
-psql -h localhost -U daniel -d <your_db> -f create_airports.sql
+psql -h localhost -U <your_user_id> -d <your_db> -f create_airports.sql
 ```
 
 ### PostgreSQL tuning (recommended for import)
@@ -231,7 +231,7 @@ Replication granularities: `minute` | `hour` | `day`
 
 ```bash
 # Run create_airports.sql first if not already done
-psql -h localhost -U daniel -d <your_db> -f create_airports.sql
+psql -h localhost -U <your_user_id> -d <your_db> -f create_airports.sql
 
 ./build/airports_load -s <your_db_server> -d <your_db> -u <your_user_id>
 ```
@@ -332,18 +332,23 @@ For a full planet import, `nodes.dat` is sized at `max_node_id × 16 bytes` (a s
 
 ## Performance
 
-Tested on Raspberry Pi 5 (16GB RAM, dual NVMe via PCIe 2.0) running Ubuntu 26.04:
+Tested on Raspberry Pi 5 (16GB RAM, dual NVMe via PCIe 2.0) running Ubuntu 26.04,
+with conservative thread settings (`-t 1 -w 6`) required for stability:
 
-- **Node phase**: ~500-800K nodes/sec (varies with thread count and chunk size)
+- **Node phase**: ~500K nodes/sec
 - **Way phase**: throughput primarily I/O-bound on node coordinate lookups from `nodes.dat`
+- **Full planet import**: ~20 hours end-to-end
 - **Full North America import**: ~3-4 hours end-to-end
+
+On a proper desktop/server with PCIe 3.0/4.0 NVMe, significantly higher throughput
+is expected — see [Hardware notes](#hardware-notes) for guidance on scaling up.
 
 ### Tuning recommendations
 
-- Use `-t 3 -w 12` on a modern multi-core machine
 - Place `nodes.dat` on your fastest storage (NVMe preferred)
 - Use `-S <dir>` to place shard files on a separate drive from `nodes.dat` if available
 - PostgreSQL should be on a separate drive from `nodes.dat` if possible
+- On desktop hardware, try `-t 3 -w 12` and scale from there
 
 ### Known issue: kernel lockups on Raspberry Pi with kernel 7.0.0-1011-raspi
 
@@ -352,6 +357,7 @@ A kernel regression in `7.0.0-1011-raspi` (Ubuntu 26.04) causes full system lock
 - `CHUNK_SIZE` reduced from 16MB to 4MB to limit write burst size
 - Periodic `fsync`/`msync` every 64 chunks to bound dirty page accumulation
 - `MADV_RANDOM` hint on the merged node file is applied **after** merge completes rather than at construction time (applying it early on a large sparse mapping triggers the lockup)
+- Default thread counts (`-t 1 -w 6`) are tuned conservatively for RPi5 stability
 
 If you experience lockups during the node phase on other platforms, try reducing `CHUNK_SIZE` further in `OSMMMap.cpp`.
 
