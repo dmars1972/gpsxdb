@@ -205,7 +205,7 @@ static void loadAirports(pqxx::connection& conn, const std::string& path, bool v
             ts.write_values(t.ident, t.entity_type, t.key, t.val);
         ts.complete(); txn.commit();
     }
-    std::cout << "  airports: " << airports.size() << "\n";
+    if (verbose) std::cout << "  airports: " << airports.size() << "\n";
 }
 
 static void loadFrequencies(pqxx::connection& conn, const std::string& path, bool verbose) {
@@ -342,7 +342,7 @@ static void loadNavaids(pqxx::connection& conn, const std::string& path, bool ve
             ts.write_values(t.ident, t.entity_type, t.key, t.val);
         ts.complete(); txn.commit();
     }
-    std::cout << "  navaids: " << navaids.size() << "\n";
+    if (verbose) std::cout << "  navaids: " << navaids.size() << "\n";
 }
 
 // ---- Public entry point ----
