@@ -1,4 +1,4 @@
 rm -rf build
 
 cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build  -j4
+cmake --build build  -j12

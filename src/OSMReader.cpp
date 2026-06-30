@@ -36,10 +36,13 @@ static void writeUint32(std::vector<uint8_t>& buf, uint32_t v) {
     buf.push_back((v >> 24) & 0xFF);
 }
 
+// Defined in main.cpp — set at startup from -M flag
+
 std::string pointWKB(double lon, double lat) {
     std::vector<uint8_t> buf;
     buf.push_back(0x01);
-    writeUint32(buf, 1);
+    writeUint32(buf, 0x20000001); // WKB POINT with SRID flag
+    writeUint32(buf, static_cast<uint32_t>(g_srid));
     writeDouble(buf, lon);
     writeDouble(buf, lat);
     return toHex(buf);

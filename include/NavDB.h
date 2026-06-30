@@ -72,6 +72,13 @@ public:
     // ring assembly during relation processing.
     std::vector<std::pair<double,double>> getWayCoords(int64_t id);
 
+    // Batched version of getWayCoords — fetches coordinate sequences for
+    // multiple way IDs in a single round trip. Returns a map of
+    // id -> coordinate sequence. More efficient than calling getWayCoords()
+    // per member for relations with many members.
+    std::unordered_map<int64_t, std::vector<std::pair<double,double>>>
+        getWayCoordsMap(const std::vector<int64_t>& ids);
+
     // ---- Delta / update methods ----
     void updateNode(int64_t id, const std::string& name,
                     double lon_m, double lat_m,
@@ -97,6 +104,11 @@ public:
     // Equivalent to running create.sql + create_airports.sql.
     // Called when -I is passed on the command line.
     void initializeSchema();
+
+    // Enable/disable autovacuum system-wide. Called at the start and end
+    // of an import run — autovacuum should be off during bulk loading for
+    // performance, and re-enabled afterward for ongoing maintenance.
+    void setAutovacuum(bool enabled);
 
     // VACUUM ANALYZE all OSM + airports tables. Call after import completes
     // and before re-enabling autovacuum (which is typically disabled during

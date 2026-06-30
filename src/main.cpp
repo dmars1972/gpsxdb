@@ -156,6 +156,10 @@ struct Status {
 
 // ---- WKB helpers ----
 
+// Process-level SRID — set at startup from -M flag.
+// 3857 = Web Mercator (default), 4326 = WGS84
+int g_srid = 3857;
+
 static std::string buildWayGeom(const std::vector<std::pair<double,double>>& coords,
                                 bool& is_closed) {
     if (coords.size() < 2) return "";
@@ -180,8 +184,14 @@ static std::string buildWayGeom(const std::vector<std::pair<double,double>>& coo
 
     std::vector<uint8_t> buf;
     buf.push_back(0x01);
-    if (is_closed) { wu32(buf, 3); wu32(buf, 1); }
-    else             wu32(buf, 2);
+    if (is_closed) {
+        wu32(buf, 0x20000003); // WKB polygon with SRID flag
+        wu32(buf, static_cast<uint32_t>(g_srid));
+        wu32(buf, 1);          // 1 ring
+    } else {
+        wu32(buf, 0x20000002); // WKB linestring with SRID flag
+        wu32(buf, static_cast<uint32_t>(g_srid));
+    }
     wu32(buf, static_cast<uint32_t>(coords.size()));
     for (auto& [x, y] : coords) { wd(buf, x); wd(buf, y); }
     return toHex(buf);
@@ -233,7 +243,8 @@ static std::string mergeWayGeoms(const std::vector<std::string>& wkb_hexes) {
 
     std::vector<uint8_t> buf;
     buf.push_back(0x01);
-    wu32(buf, 5);
+    wu32(buf, 0x20000005); // MultiLineString with SRID flag
+    wu32(buf, static_cast<uint32_t>(g_srid));
     wu32(buf, static_cast<uint32_t>(parts.size()));
     for (auto& p : parts) buf.insert(buf.end(), p.begin(), p.end());
     return toHex(buf);
@@ -254,6 +265,7 @@ struct Args {
     int64_t     max_node_id    = 20'000'000'000LL;
     bool        verbose        = false;
     bool        init_schema    = false;
+    bool        use_mercator   = true;  // false = store as WGS84 (EPSG:4326)
     int         queue_size     = 10000;
     int         node_threads   = 1;  // RPi5-safe default; see README for tuning
     int         way_threads    = 6;  // RPi5-safe default; see README for tuning
@@ -302,6 +314,7 @@ static Args parseArgs(int argc, char** argv) {
         else if ((arg == "--way-threads"  || arg == "-w") && i+1 < argc) a.way_threads  = safeInt(argv[++i], "--way-threads");
         else if  (arg == "--verbose"      || arg == "-v")                a.verbose      = true;
         else if  (arg == "--init"         || arg == "-I")                a.init_schema  = true;
+        else if  (arg == "--wgs84"        || arg == "-L")                a.use_mercator = false;
         else if ((arg == "--mode"         || arg == "-m") && i+1 < argc) {
             std::string m = argv[++i];
             if      (m == "import") a.mode = Mode::Import;
@@ -336,6 +349,8 @@ static Args parseArgs(int argc, char** argv) {
                 "    -l log_file        (default osm_import.log)\n"
                 "    -v                 Verbose logging\n"
                 "    -I                 Initialize (drop+recreate) all tables before import\n"
+                "    -L                 Store coordinates as WGS84 lon/lat (EPSG:4326) instead of\n"
+                "                       Web Mercator (EPSG:3857). Default is Mercator.\n"
                 "    -h                 Show this help and exit\n"
                 "  Import mode (default):\n"
                 "    -i <file.osm.pbf>  Input PBF file\n"
@@ -544,11 +559,16 @@ void nodeThread(int tid,
         }
 
         auto& item = std::get<NodeEntry>(entry);
-        // Compute projection here in the node thread (parallelizes proj_trans)
-        auto [mx, my] = toMercator(item.lon, item.lat);
-        item.lon_m = mx;
-        item.lat_m = my;
-        item.geog_wkb_hex = pointWKB(item.lon, item.lat);
+        // Project to Mercator (or keep as WGS84 if -M flag was given)
+        if (args.use_mercator) {
+            auto [mx, my] = toMercator(item.lon, item.lat);
+            item.lon_m = mx;
+            item.lat_m = my;
+        } else {
+            item.lon_m = item.lon;
+            item.lat_m = item.lat;
+        }
+        item.geog_wkb_hex = pointWKB(item.lon_m, item.lat_m);
         osmmap.insert(tid, item.id, item.lon_m, item.lat_m);
         db.insertNode(item.id, item.name, item.lon_m, item.lat_m,
                       item.tags, item.geog_wkb_hex);
@@ -658,7 +678,7 @@ static void writeWkbPolygon(std::vector<uint8_t>& buf,
     };
     buf.push_back(1);           // little-endian
     wu32(0x20000003);           // WKB type: POLYGON with SRID
-    wu32(3857);                 // SRID: Web Mercator
+    wu32(static_cast<uint32_t>(g_srid));
     wu32(1 + inners.size());    // ring count
     writeWkbRing(buf, outer);
     for (auto& inner : inners) writeWkbRing(buf, inner);
@@ -675,15 +695,24 @@ static std::string toHex(const std::vector<uint8_t>& buf) {
 static std::string buildMultipolygon(
         const RelationEntry& item, NavDB& db) {
 
+    // Collect all member IDs for a single batched coordinate lookup —
+    // one round trip for the whole relation instead of one per member.
+    std::vector<int64_t> all_ids;
+    all_ids.reserve(item.way_members.size());
+    for (auto& m : item.way_members)
+        all_ids.push_back(m.id);
+
+    auto coords_map = db.getWayCoordsMap(all_ids);
+
     // Separate outer and inner member segments
     std::vector<Segment> outers, inners;
     for (auto& m : item.way_members) {
-        auto coords = db.getWayCoords(m.id);
-        if (coords.empty()) continue;
+        auto it = coords_map.find(m.id);
+        if (it == coords_map.end() || it->second.empty()) continue;
         if (m.role == "inner")
-            inners.push_back(std::move(coords));
+            inners.push_back(it->second);
         else // "outer" or "" (default is outer)
-            outers.push_back(std::move(coords));
+            outers.push_back(it->second);
     }
 
     if (outers.empty()) return "";
@@ -711,7 +740,7 @@ static std::string buildMultipolygon(
         // (simplified: use bounding-box containment check)
         buf.push_back(1);       // little-endian
         wu32(0x20000006);       // WKB type: MULTIPOLYGON with SRID
-        wu32(3857);             // SRID
+        wu32(static_cast<uint32_t>(g_srid));
         wu32(static_cast<uint32_t>(outer_rings.size()));
 
         for (auto& outer : outer_rings) {
@@ -968,6 +997,9 @@ int main(int argc, char** argv) {
     if (args.mode != Mode::Import)
         return runDelta(args);
 
+    // Set global SRID for all WKB geometry builders
+    g_srid = args.use_mercator ? 3857 : 4326;
+
     // -I: drop and recreate all tables before starting the import
     if (args.init_schema) {
         std::cout << "Initializing schema...\n";
@@ -975,6 +1007,15 @@ int main(int argc, char** argv) {
         NavDB db(0, args.server, args.user, args.database, mu);
         db.initializeSchema();
         std::cout << "Schema initialized.\n";
+    }
+
+    // Disable autovacuum for the duration of the import — bulk loading
+    // with autovacuum running wastes I/O on tables that will be
+    // vacuumed explicitly at the end anyway.
+    {
+        std::mutex mu;
+        NavDB db(0, args.server, args.user, args.database, mu);
+        db.setAutovacuum(false);
     }
 
     LOGI(-1, "starting infile=", args.infile,
@@ -1011,6 +1052,10 @@ int main(int argc, char** argv) {
             db.vacuumAnalyze();
         }
         LOGI(-1, "VACUUM ANALYZE complete");
+        {
+            NavDB db(0, args.server, args.user, args.database, db_flush_mu_early);
+            db.setAutovacuum(true);
+        }
 
         auto elapsed = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - start).count();
@@ -1267,6 +1312,10 @@ int main(int argc, char** argv) {
         db.vacuumAnalyze();
     }
     LOGI(-1, "VACUUM ANALYZE complete");
+    {
+        NavDB db(0, args.server, args.user, args.database, db_flush_mu);
+        db.setAutovacuum(true);
+    }
 
     status.advancePhase(Phase::Vacuuming, Phase::Done);
     status_done.store(true, std::memory_order_relaxed);

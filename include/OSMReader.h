@@ -3,6 +3,12 @@
 #include <vector>
 #include <unordered_map>
 #include <memory>
+
+// Process-level SRID — set at startup from -L flag.
+// 3857 = Web Mercator (default), 4326 = WGS84 lon/lat.
+// Defined in main.cpp, declared here so all TUs can reference it
+// without scattering 'extern int g_srid' everywhere.
+extern int g_srid;
 #include <fstream>
 #include <variant>
 #include <cstdint>

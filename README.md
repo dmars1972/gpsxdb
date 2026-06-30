@@ -50,7 +50,7 @@ Designed for full-planet and regional imports with a custom Mercator schema, par
 | `regions` | Region reference data |
 | `tags` | Unified key/value tag table for airports and navaids |
 
-All geometry columns use PostGIS `geometry` type in EPSG:3857 (Web Mercator), consistent with the OSM tables.
+All geometry columns use PostGIS `geometry` type. The default SRID is EPSG:3857 (Web Mercator). Pass `-L` at import time to store as EPSG:4326 (WGS84) instead.
 
 ---
 
@@ -117,17 +117,10 @@ wal_buffers = 16MB
 work_mem = 64MB
 max_wal_size = 1GB
 synchronous_commit = off
-autovacuum = off
 ```
 
-The importer runs `VACUUM ANALYZE` on all tables automatically as its final
-step (with `autovacuum` disabled during import, statistics and dead-tuple
-cleanup only happen when explicitly requested). Re-enable autovacuum once
-the import is complete:
-```sql
-ALTER SYSTEM SET autovacuum = on;
-SELECT pg_reload_conf();
-```
+The importer automatically disables `autovacuum` at startup and re-enables
+it after `VACUUM ANALYZE` completes — you do not need to manage this manually.
 
 ---
 
@@ -174,6 +167,7 @@ higher throughput — see [Hardware notes](#hardware-notes) below.
 | `-l <file>` | Log file | `osm_import.log` |
 | `-v` | Verbose logging | off |
 | `-I` | Initialize schema (drop + recreate all tables) before import | off |
+| `-L` | Store coordinates as WGS84 lon/lat (EPSG:4326) instead of Web Mercator (EPSG:3857) | off (Mercator is default) |
 | `-R <phase>` | Resume at phase (see below) | `nodes` |
 
 ### Resume support

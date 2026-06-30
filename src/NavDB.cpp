@@ -532,6 +532,18 @@ void NavDB::setReplicationSequence(int64_t seq) {
     }
 }
 
+void NavDB::setAutovacuum(bool enabled) {
+    try {
+        pqxx::nontransaction txn(*conn_);
+        txn.exec(std::string("ALTER SYSTEM SET autovacuum = ")
+                 + (enabled ? "on" : "off"));
+        txn.exec("SELECT pg_reload_conf()");
+        LOGI(thread_id_, "autovacuum set to ", enabled ? "on" : "off");
+    } catch (const std::exception& e) {
+        std::cerr << "[NavDB] setAutovacuum error: " << e.what() << "\n";
+    }
+}
+
 void NavDB::vacuumAnalyze() {
     static const char* tables[] = {
         "nodes", "ways", "areas", "roads", "relations",
@@ -763,7 +775,6 @@ std::vector<std::pair<double,double>> NavDB::getWayCoords(int64_t id) {
     std::vector<std::pair<double,double>> coords;
     try {
         pqxx::work txn(*conn_);
-        // Dump points from ways OR areas, returning X/Y in Mercator
         auto res = txn.exec(
             "SELECT ST_X(p.geom), ST_Y(p.geom) "
             "FROM ("
@@ -781,4 +792,33 @@ std::vector<std::pair<double,double>> NavDB::getWayCoords(int64_t id) {
         std::cerr << "[NavDB] getWayCoords(" << id << ") error: " << e.what() << "\n";
     }
     return coords;
+}
+
+std::unordered_map<int64_t, std::vector<std::pair<double,double>>>
+NavDB::getWayCoordsMap(const std::vector<int64_t>& ids) {
+    std::unordered_map<int64_t, std::vector<std::pair<double,double>>> out;
+    if (ids.empty()) return out;
+    try {
+        pqxx::work txn(*conn_);
+        // Single round trip: dump all points for all requested IDs from
+        // both ways and areas, ordered so points for each ID arrive together.
+        // ST_DumpPoints preserves vertex order within each geometry.
+        auto res = txn.exec(
+            "SELECT id, ST_X(p.geom), ST_Y(p.geom) "
+            "FROM ("
+            "  SELECT id, (ST_DumpPoints(geog)).geom FROM ways  WHERE id = ANY($1) "
+            "  UNION ALL "
+            "  SELECT id, (ST_DumpPoints(geog)).geom FROM areas WHERE id = ANY($1)"
+            ") p "
+            "ORDER BY id",
+            pqxx::params{ids});
+        for (const auto& row : res) {
+            if (row[1].is_null() || row[2].is_null()) continue;
+            out[row[0].as<int64_t>()].emplace_back(
+                row[1].as<double>(), row[2].as<double>());
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "[NavDB] getWayCoordsMap error: " << e.what() << "\n";
+    }
+    return out;
 }

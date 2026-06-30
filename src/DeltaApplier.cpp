@@ -1,4 +1,5 @@
 #include "DeltaApplier.h"
+
 #include "OSMReader.h"
 
 #include <cstring>
@@ -39,11 +40,13 @@ static std::string buildLineWKB(const std::vector<std::pair<double,double>>& pts
     std::vector<uint8_t> b;
     b.push_back(1); // little endian
     if (closed && pts.size() >= 4) {
-        writeLE32(b, 3); // Polygon
+        writeLE32(b, 0x20000003); // Polygon with SRID
+        writeLE32(b, static_cast<uint32_t>(g_srid));
         writeLE32(b, 1); // 1 ring
         writeLE32(b, static_cast<uint32_t>(pts.size()));
     } else {
-        writeLE32(b, 2); // LineString
+        writeLE32(b, 0x20000002); // LineString with SRID
+        writeLE32(b, static_cast<uint32_t>(g_srid));
         writeLE32(b, static_cast<uint32_t>(pts.size()));
     }
     for (auto& [x, y] : pts) { writeDouble(b, x); writeDouble(b, y); }
@@ -81,7 +84,8 @@ static std::string mergeLinestrings(const std::vector<std::string>& hexes) {
 
     std::vector<uint8_t> b;
     b.push_back(1);
-    writeLE32(b, 5); // MultiLineString
+    writeLE32(b, 0x20000005); // MultiLineString with SRID
+    writeLE32(b, static_cast<uint32_t>(g_srid));
     writeLE32(b, static_cast<uint32_t>(parts.size()));
     for (auto& p : parts)
         b.insert(b.end(), p.begin(), p.end());
