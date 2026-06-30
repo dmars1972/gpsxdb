@@ -233,8 +233,11 @@ void OSMReader::parsePrimitiveBlock(const std::vector<uint8_t>& data,
             int64_t cur_memid = 0;
             for (int i = 0; i < r.memids_size(); ++i) {
                 cur_memid += r.memids(i);
-                if (r.types(i) == OSMPBF::Relation::WAY)
-                    rel.way_members.push_back(cur_memid);
+                if (r.types(i) == OSMPBF::Relation::WAY) {
+                    std::string role = (r.roles_sid(i) < strtable.size())
+                        ? strtable[r.roles_sid(i)] : "";
+                    rel.way_members.push_back({cur_memid, std::move(role)});
+                }
             }
             out.emplace_back(std::move(rel));
         }

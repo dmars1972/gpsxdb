@@ -1,27 +1,26 @@
 -- ============================================================
 -- Drop existing tables
 -- ============================================================
-DROP TABLE IF EXISTS public.ap_tags;
-DROP TABLE IF EXISTS public.ap_runway_ends;
-DROP TABLE IF EXISTS public.ap_runways;
-DROP TABLE IF EXISTS public.ap_frequencies;
-DROP TABLE IF EXISTS public.ap_navaids;
-DROP TABLE IF EXISTS public.ap_airports;
-DROP TABLE IF EXISTS public.ap_regions;
-DROP TABLE IF EXISTS public.ap_countries;
+DROP TABLE IF EXISTS public.tags;
+DROP TABLE IF EXISTS public.runways;
+DROP TABLE IF EXISTS public.frequencies;
+DROP TABLE IF EXISTS public.navaids;
+DROP TABLE IF EXISTS public.airports;
+DROP TABLE IF EXISTS public.regions;
+DROP TABLE IF EXISTS public.countries;
 
 -- ============================================================
 -- Reference tables
 -- ============================================================
 
-CREATE TABLE public.ap_countries (
+CREATE TABLE public.countries (
     id          integer PRIMARY KEY,
     code        varchar(2)   NOT NULL,
     name        varchar(256),
     continent   varchar(2)
 );
 
-CREATE TABLE public.ap_regions (
+CREATE TABLE public.regions (
     id          integer PRIMARY KEY,
     code        varchar(16)  NOT NULL,
     local_code  varchar(16),
@@ -34,7 +33,7 @@ CREATE TABLE public.ap_regions (
 -- Airports
 -- ============================================================
 
-CREATE TABLE public.ap_airports (
+CREATE TABLE public.airports (
     id                  integer PRIMARY KEY,
     ident               varchar(16)  NOT NULL,
     type                varchar(32),
@@ -55,9 +54,9 @@ CREATE TABLE public.ap_airports (
 );
 
 -- Unified tag table for all airport-related entities
--- airport_ident links back to ap_airports.ident
+-- airport_ident links back to airports.ident
 -- entity_type distinguishes the source table
-CREATE TABLE public.ap_tags (
+CREATE TABLE public.tags (
     airport_ident   varchar(16)  NOT NULL,
     entity_type     varchar(16)  NOT NULL,  -- 'airport','frequency','runway','navaid'
     key_name        varchar(256) NOT NULL,
@@ -68,7 +67,7 @@ CREATE TABLE public.ap_tags (
 -- Frequencies  (child of airport)
 -- ============================================================
 
-CREATE TABLE public.ap_frequencies (
+CREATE TABLE public.frequencies (
     id              integer PRIMARY KEY,
     airport_ref     integer NOT NULL,
     airport_ident   varchar(16),
@@ -81,7 +80,7 @@ CREATE TABLE public.ap_frequencies (
 -- Runways  (child of airport)
 -- ============================================================
 
-CREATE TABLE public.ap_runways (
+CREATE TABLE public.runways (
     id              integer PRIMARY KEY,
     airport_ref     integer NOT NULL,
     airport_ident   varchar(16),
@@ -112,7 +111,7 @@ CREATE TABLE public.ap_runways (
 -- Navaids
 -- ============================================================
 
-CREATE TABLE public.ap_navaids (
+CREATE TABLE public.navaids (
     id                      integer PRIMARY KEY,
     ident                   varchar(16),
     name                    varchar(256),
@@ -141,36 +140,36 @@ CREATE TABLE public.ap_navaids (
 -- ============================================================
 
 -- Airports
-CREATE INDEX ap_airports_geog_idx    ON public.ap_airports  USING GIST (geog);
-CREATE INDEX ap_airports_ident_idx   ON public.ap_airports  (ident);
-CREATE INDEX ap_airports_icao_idx    ON public.ap_airports  (icao_code);
-CREATE INDEX ap_airports_iata_idx    ON public.ap_airports  (iata_code);
-CREATE INDEX ap_airports_country_idx ON public.ap_airports  (iso_country);
-CREATE INDEX ap_airports_region_idx  ON public.ap_airports  (iso_region);
-CREATE INDEX ap_airports_type_idx    ON public.ap_airports  (type);
+CREATE INDEX airports_geog_idx    ON public.airports  USING GIST (geog);
+CREATE INDEX airports_ident_idx   ON public.airports  (ident);
+CREATE INDEX airports_icao_idx    ON public.airports  (icao_code);
+CREATE INDEX airports_iata_idx    ON public.airports  (iata_code);
+CREATE INDEX airports_country_idx ON public.airports  (iso_country);
+CREATE INDEX airports_region_idx  ON public.airports  (iso_region);
+CREATE INDEX airports_type_idx    ON public.airports  (type);
 
 
 
 -- Frequencies
-CREATE INDEX ap_freq_airport_idx     ON public.ap_frequencies (airport_ref);
-CREATE INDEX ap_freq_ident_idx       ON public.ap_frequencies (airport_ident);
+CREATE INDEX freq_airport_idx     ON public.frequencies (airport_ref);
+CREATE INDEX freq_ident_idx       ON public.frequencies (airport_ident);
 
 -- Runways
-CREATE INDEX ap_runways_airport_idx  ON public.ap_runways (airport_ref);
-CREATE INDEX ap_runways_le_geog_idx  ON public.ap_runways USING GIST (le_geog);
-CREATE INDEX ap_runways_he_geog_idx  ON public.ap_runways USING GIST (he_geog);
+CREATE INDEX runways_airport_idx  ON public.runways (airport_ref);
+CREATE INDEX runways_le_geog_idx  ON public.runways USING GIST (le_geog);
+CREATE INDEX runways_he_geog_idx  ON public.runways USING GIST (he_geog);
 
 -- Navaids
-CREATE INDEX ap_navaids_geog_idx     ON public.ap_navaids  USING GIST (geog);
-CREATE INDEX ap_navaids_ident_idx    ON public.ap_navaids  (ident);
-CREATE INDEX ap_navaids_type_idx     ON public.ap_navaids  (type);
-CREATE INDEX ap_navaids_country_idx  ON public.ap_navaids  (iso_country);
-CREATE INDEX ap_navaids_airport_idx  ON public.ap_navaids  (associated_airport);
+CREATE INDEX navaids_geog_idx     ON public.navaids  USING GIST (geog);
+CREATE INDEX navaids_ident_idx    ON public.navaids  (ident);
+CREATE INDEX navaids_type_idx     ON public.navaids  (type);
+CREATE INDEX navaids_country_idx  ON public.navaids  (iso_country);
+CREATE INDEX navaids_airport_idx  ON public.navaids  (associated_airport);
 
 -- Unified tags
-CREATE INDEX ap_tags_ident_idx       ON public.ap_tags (airport_ident);
-CREATE INDEX ap_tags_type_idx        ON public.ap_tags (airport_ident, entity_type);
+CREATE INDEX tags_ident_idx       ON public.tags (airport_ident);
+CREATE INDEX tags_type_idx        ON public.tags (airport_ident, entity_type);
 
 -- Regions / Countries
-CREATE INDEX ap_regions_country_idx  ON public.ap_regions  (iso_country);
-CREATE INDEX ap_regions_code_idx     ON public.ap_regions  (code);
+CREATE INDEX regions_country_idx  ON public.regions  (iso_country);
+CREATE INDEX regions_code_idx     ON public.regions  (code);

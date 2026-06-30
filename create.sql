@@ -1,83 +1,87 @@
 -- ============================================================
 -- Drop existing tables
 -- ============================================================
-DROP TABLE IF EXISTS public.my_nodes;
-DROP TABLE IF EXISTS public.my_ways;
-DROP TABLE IF EXISTS public.my_areas;
-DROP TABLE IF EXISTS public.my_roads;
-DROP TABLE IF EXISTS public.my_relations;
-DROP TABLE IF EXISTS public.my_node_tags;
-DROP TABLE IF EXISTS public.my_way_tags;
-DROP TABLE IF EXISTS public.my_area_tags;
-DROP TABLE IF EXISTS public.my_road_tags;
-DROP TABLE IF EXISTS public.my_relation_tags;
+DROP TABLE IF EXISTS public.nodes;
+DROP TABLE IF EXISTS public.ways;
+DROP TABLE IF EXISTS public.areas;
+DROP TABLE IF EXISTS public.roads;
+DROP TABLE IF EXISTS public.relations;
+DROP TABLE IF EXISTS public.node_tags;
+DROP TABLE IF EXISTS public.way_tags;
+DROP TABLE IF EXISTS public.area_tags;
+DROP TABLE IF EXISTS public.road_tags;
+DROP TABLE IF EXISTS public.relation_tags;
 
 -- ============================================================
 -- Create tables
 -- ============================================================
 
-CREATE TABLE public.my_nodes (
+CREATE TABLE public.nodes (
     id          bigint NOT NULL,
     name        varchar(256),
     longitude_m double precision,
     latitude_m  double precision,
     geog        public.geometry,
-    CONSTRAINT my_nodes_pkey PRIMARY KEY (id)
+    CONSTRAINT nodes_pkey PRIMARY KEY (id)
 );
 
-CREATE TABLE public.my_ways (
+CREATE TABLE public.ways (
     id   bigint NOT NULL,
     name varchar(256),
     geog public.geometry,
-    CONSTRAINT my_ways_pkey PRIMARY KEY (id)
+    CONSTRAINT ways_pkey PRIMARY KEY (id)
 );
 
-CREATE TABLE public.my_areas (
+CREATE TABLE public.areas (
+    -- Positive IDs: closed-way areas (id = OSM way id)
+    -- Negative IDs: multipolygon/boundary relation areas (id = -OSM relation id)
+    -- This convention avoids primary key collisions since OSM way IDs and
+    -- relation IDs are separate namespaces that can share the same integers.
     id   bigint NOT NULL,
     name varchar(256),
     geog public.geometry,
-    CONSTRAINT my_areas_pkey PRIMARY KEY (id)
+    CONSTRAINT areas_pkey PRIMARY KEY (id)
 );
 
-CREATE TABLE public.my_roads (
+CREATE TABLE public.roads (
     id   bigint NOT NULL,
     name varchar(256),
     geog public.geometry,
-    CONSTRAINT my_roads_pkey PRIMARY KEY (id)
+    CONSTRAINT roads_pkey PRIMARY KEY (id)
 );
 
-CREATE TABLE public.my_relations (
+CREATE TABLE public.relations (
     id   bigint NOT NULL,
     name varchar(256),
     geog public.geometry,
-    CONSTRAINT my_relations_pkey PRIMARY KEY (id)
+    CONSTRAINT relations_pkey PRIMARY KEY (id)
 );
 
-CREATE TABLE public.my_node_tags (
+CREATE TABLE public.node_tags (
     id        bigint NOT NULL,
     key_name  varchar(256),
     key_value varchar(256)
 );
 
-CREATE TABLE public.my_way_tags (
+CREATE TABLE public.way_tags (
     id        bigint NOT NULL,
     key_name  varchar(256),
     key_value varchar(256)
 );
 
-CREATE TABLE public.my_area_tags (
+CREATE TABLE public.area_tags (
     id        bigint NOT NULL,
     key_name  varchar(256),
     key_value varchar(256)
 );
 
-CREATE TABLE public.my_road_tags (
+CREATE TABLE public.road_tags (
     id        bigint NOT NULL,
     key_name  varchar(256),
     key_value varchar(256)
 );
 
-CREATE TABLE public.my_relation_tags (
+CREATE TABLE public.relation_tags (
     id        bigint NOT NULL,
     key_name  varchar(256),
     key_value varchar(256)
@@ -88,18 +92,18 @@ CREATE TABLE public.my_relation_tags (
 -- ============================================================
 
 -- Tag lookup indexes
-CREATE INDEX node_tags_idx     ON public.my_node_tags     (id);
-CREATE INDEX way_tags_idx      ON public.my_way_tags      (id);
-CREATE INDEX area_tags_idx     ON public.my_area_tags     (id);
-CREATE INDEX road_tags_idx     ON public.my_road_tags     (id);
-CREATE INDEX relation_tags_idx ON public.my_relation_tags (id);
+CREATE INDEX node_tags_idx     ON public.node_tags     (id);
+CREATE INDEX way_tags_idx      ON public.way_tags      (id);
+CREATE INDEX area_tags_idx     ON public.area_tags     (id);
+CREATE INDEX road_tags_idx     ON public.road_tags     (id);
+CREATE INDEX relation_tags_idx ON public.relation_tags (id);
 
 -- GiST spatial indexes (built by importer after all data is loaded)
--- CREATE INDEX my_nodes_geog_idx     ON public.my_nodes     USING GIST (geog);
--- CREATE INDEX my_ways_geog_idx      ON public.my_ways      USING GIST (geog);
--- CREATE INDEX my_areas_geog_idx     ON public.my_areas     USING GIST (geog);
--- CREATE INDEX my_roads_geog_idx     ON public.my_roads     USING GIST (geog);
--- CREATE INDEX my_relations_geog_idx ON public.my_relations USING GIST (geog);
+-- CREATE INDEX nodes_geog_idx     ON public.nodes     USING GIST (geog);
+-- CREATE INDEX ways_geog_idx      ON public.ways      USING GIST (geog);
+-- CREATE INDEX areas_geog_idx     ON public.areas     USING GIST (geog);
+-- CREATE INDEX roads_geog_idx     ON public.roads     USING GIST (geog);
+-- CREATE INDEX relations_geog_idx ON public.relations USING GIST (geog);
 
 -- Replication state (tracks last applied OSM sequence number)
 DROP TABLE IF EXISTS public.osm_replication_state;

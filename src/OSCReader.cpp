@@ -102,7 +102,9 @@ static void XMLCALL startElement(void* ud, const XML_Char* name,
         const char* type = getAttr("type");
         if (type && strcmp(type, "way") == 0) {
             int64_t ref = getInt64("ref");
-            if (ref) s->relation.way_members.push_back(ref);
+            const char* role_attr = getAttr("role");
+            std::string role = role_attr ? role_attr : "";
+            if (ref) s->relation.way_members.push_back({ref, std::move(role)});
         }
         return;
     }

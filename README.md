@@ -26,29 +26,29 @@ Designed for full-planet and regional imports with a custom Mercator schema, par
 
 | Table | Description |
 |---|---|
-| `my_nodes` | Point geometries with Mercator coordinates |
-| `my_ways` | Linear geometries (roads, paths, rivers, etc.) |
-| `my_areas` | Polygon geometries (closed ways) |
-| `my_roads` | Route relations tagged `route=road` or `highway=*` |
-| `my_relations` | Relation geometries (MultiLineString, nullable) |
-| `my_node_tags` | Key/value tags for nodes |
-| `my_way_tags` | Key/value tags for ways |
-| `my_area_tags` | Key/value tags for areas |
-| `my_road_tags` | Key/value tags for roads |
-| `my_relation_tags` | Key/value tags for relations |
+| `nodes` | Point geometries with Mercator coordinates |
+| `ways` | Linear geometries (roads, paths, rivers, etc.) |
+| `areas` | Polygon geometries — closed ways (positive IDs) and multipolygon/boundary relations (negative IDs = `-relation_id`). The negative ID convention disambiguates the two since OSM way and relation IDs are separate namespaces that can share the same integers. |
+| `roads` | Route relations tagged `route=road` or `highway=*` |
+| `relations` | Relation geometries (MultiLineString, nullable) |
+| `node_tags` | Key/value tags for nodes |
+| `way_tags` | Key/value tags for ways |
+| `area_tags` | Key/value tags for areas |
+| `road_tags` | Key/value tags for roads |
+| `relation_tags` | Key/value tags for relations |
 | `osm_replication_state` | Tracks last applied replication sequence number |
 
 ### OurAirports tables
 
 | Table | Description |
 |---|---|
-| `ap_airports` | Airports with Mercator point geometry |
-| `ap_frequencies` | Radio frequencies per airport |
-| `ap_runways` | Runway endpoints with Mercator geometry |
-| `ap_navaids` | Navigation aids with Mercator geometry |
-| `ap_countries` | Country reference data |
-| `ap_regions` | Region reference data |
-| `ap_tags` | Unified key/value tag table for airports and navaids |
+| `airports` | Airports with Mercator point geometry |
+| `frequencies` | Radio frequencies per airport |
+| `runways` | Runway endpoints with Mercator geometry |
+| `navaids` | Navigation aids with Mercator geometry |
+| `countries` | Country reference data |
+| `regions` | Region reference data |
+| `tags` | Unified key/value tag table for airports and navaids |
 
 All geometry columns use PostGIS `geometry` type in EPSG:3857 (Web Mercator), consistent with the OSM tables.
 
@@ -142,10 +142,16 @@ osmium fileinfo -e planet-latest.osm.pbf | grep "Max ID"
 ./build/osm_import \
   -i planet-latest.osm.pbf \
   -s <your_db_server> -d <your_db> -u <your_user_id> \
+  -I \
   -n 20000000000 \
   -f nodes.dat \
   -v -l osm.log
 ```
+
+`-I` drops and recreates all tables before the import begins — equivalent
+to running `create.sql` and `create_airports.sql` manually. Safe to use on
+a fresh database or when reimporting from scratch. **Do not use `-I` with
+`-R` resume flags** — it will wipe data from phases already completed.
 
 The defaults (`-t 1 -w 6`) are tuned conservatively for low-power hardware
 such as a Raspberry Pi. On a proper desktop/server, increase both for much
@@ -167,6 +173,7 @@ higher throughput — see [Hardware notes](#hardware-notes) below.
 | `-S <dir>` | Shard file directory | `.` |
 | `-l <file>` | Log file | `osm_import.log` |
 | `-v` | Verbose logging | off |
+| `-I` | Initialize schema (drop + recreate all tables) before import | off |
 | `-R <phase>` | Resume at phase (see below) | `nodes` |
 
 ### Resume support
@@ -264,11 +271,11 @@ During import, a status line is printed to stdout once per second:
 
 | Phase | Description |
 |---|---|
-| `[Nodes]` | Reading nodes from PBF, projecting to Mercator, writing to shard files and `my_nodes` |
+| `[Nodes]` | Reading nodes from PBF, projecting to Mercator, writing to shard files and `nodes` |
 | `[Merging]` | Decompressing and merging per-thread shard files into the flat `nodes.dat` mmap |
-| `[Ways]` | Reading ways/areas from PBF, looking up node coordinates from mmap, writing to `my_ways`/`my_areas` |
+| `[Ways]` | Reading ways/areas from PBF, looking up node coordinates from mmap, writing to `ways`/`areas` |
 | `[Reindexing]` | Rebuilding primary key indexes on way/area/road/relation tables |
-| `[Relations]` | Processing relation members, merging geometries, writing to `my_relations`/`my_roads` |
+| `[Relations]` | Processing relation members, merging geometries, writing to `relations`/`roads` |
 | `[Spatial Indexing]` | Building GiST spatial indexes on all geometry columns |
 | `[Loading Airports]` | Downloading and loading OurAirports data |
 | `[Vacuuming]` | Running `VACUUM ANALYZE` on all tables |
@@ -291,7 +298,7 @@ OSMReader (producer, single thread)
    │    nodeThread × N
    │    toMercator() + pointWKB()   ← parallelized across N threads
    │    OSMMMap::insert()           ← writes to per-thread LZ4 shard files
-   │    NavDB::insertNode()         ← bulk COPY to my_nodes
+   │    NavDB::insertNode()         ← bulk COPY to nodes
    │         │
    │    node_barrier
    │    OSMMMap::merge()            ← decompress + merge shards into flat mmap
@@ -303,13 +310,13 @@ OSMReader (producer, single thread)
         wayThread × M
         OSMMMap::select()        ← O(1) random coord lookup via mmap
         buildWayGeom()
-        NavDB::insertWay/Area()  ← bulk COPY to my_ways / my_areas
+        NavDB::insertWay/Area()  ← bulk COPY to ways / areas
              │
         way_barrier
              │
              ▼
         RelationEntry processing
-        NavDB::getWay()          ← SELECT geog FROM my_ways UNION ALL my_areas
+        NavDB::getWay()          ← SELECT geog FROM ways UNION ALL areas
         mergeWayGeoms()          ← filters to LineString/MultiLineString only
         NavDB::insertRelation()
              │

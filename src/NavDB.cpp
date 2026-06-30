@@ -142,7 +142,7 @@ void NavDB::finalize_tags_locked(const std::string& table) {
         pqxx::work txn(*conn_);
         auto stream = pqxx::stream_to::table(
             txn,
-            {"my_" + table + "_tags"},
+            {"" + table + "_tags"},
             {"id", "key_name", "key_value"}
         );
         for (const auto& r : buf)
@@ -166,7 +166,7 @@ void NavDB::flushNodes() {
         pqxx::work txn(*conn_);
         auto stream = pqxx::stream_to::table(
             txn,
-            {"my_nodes"},
+            {"nodes"},
             {"id", "name", "longitude_m", "latitude_m", "geog"}
         );
         for (const auto& r : node_buf_)
@@ -183,6 +183,60 @@ void NavDB::flushNodes() {
 
 // Helper: COPY buffer into temp table, then INSERT ... ON CONFLICT DO NOTHING
 // into the real table, then clear temp table — all in one transaction.
+// Attempt to COPY a subset of records into real_table.
+// Returns the number of rows successfully written.
+// On failure, parses the offending line number from the error message,
+// removes that row, and retries. Repeats until the batch succeeds or
+// no more line numbers can be parsed.
+template<typename Record, typename WriteFn>
+static int tryCopyBatch(pqxx::connection& conn,
+                        const std::string& real_table,
+                        std::vector<Record>& buf,
+                        WriteFn write_row) {
+    int skipped = 0;
+    while (!buf.empty()) {
+        try {
+            pqxx::work txn(conn);
+            auto stream = pqxx::stream_to::table(
+                txn, {real_table}, {"id", "name", "geog"});
+            for (const auto& r : buf)
+                write_row(stream, r);
+            stream.complete();
+            txn.commit();
+            return static_cast<int>(buf.size()); // all remaining rows written
+        } catch (const std::exception& e) {
+            // The line number is only available via PostgreSQL's error text
+            // (there's no structured field in pqxx for COPY row errors).
+            // PostgreSQL always formats this as "COPY tablename, line N[,...]"
+            // so we anchor on ", line " to be more specific than just "line ".
+            std::string msg = e.what();
+            size_t pos = msg.find(", line ");
+            if (pos == std::string::npos) {
+                // Can't identify the bad row — give up on this batch
+                std::cerr << "[NavDB] tryCopyBatch(" << real_table
+                          << ") unrecoverable error (no line number): "
+                          << msg << "\n";
+                break;
+            }
+            // COPY line numbers are 1-based; skip ", line " (7 chars)
+            int line = std::stoi(msg.substr(pos + 7));
+            int idx  = line - 1;
+            if (idx < 0 || idx >= static_cast<int>(buf.size())) {
+                std::cerr << "[NavDB] tryCopyBatch(" << real_table
+                          << ") bad line number " << line
+                          << " (buf size=" << buf.size() << "): " << msg << "\n";
+                break;
+            }
+            std::cerr << "[NavDB] skipping bad row in " << real_table
+                      << " at line " << line
+                      << " id=" << buf[idx].id << ": " << msg << "\n";
+            buf.erase(buf.begin() + idx);
+            ++skipped;
+        }
+    }
+    return static_cast<int>(buf.size()); // rows remaining after giving up
+}
+
 void NavDB::flushViaTemp(const std::string& /*tmp_table*/,
                          const std::string& real_table,
                          const std::string& tag_table,
@@ -191,9 +245,6 @@ void NavDB::flushViaTemp(const std::string& /*tmp_table*/,
     LOGI(thread_id_, "flushViaTemp real=", real_table, " count=", buf.size());
     try {
         pqxx::work txn(*conn_);
-        // COPY directly into the real table — no temp table, no ON CONFLICT.
-        // Primary key constraints must be dropped before import and recreated
-        // after (see create.sql). This is ~10x faster than the temp+INSERT approach.
         auto stream = pqxx::stream_to::table(
             txn, {real_table}, {"id", "name", "geog"});
         for (const auto& r : buf)
@@ -201,17 +252,23 @@ void NavDB::flushViaTemp(const std::string& /*tmp_table*/,
         stream.complete();
         txn.commit();
     } catch (const std::exception& e) {
-        std::cerr << "[NavDB] flushViaTemp(" << real_table << ") error: "
-                  << e.what() << "\n";
-        throw;
+        std::cerr << "[NavDB] flushViaTemp(" << real_table << ") initial error: "
+                  << e.what() << "\n"
+                  << "[NavDB] retrying with bad rows removed...\n";
+        auto write_geom = [](auto& stream, const NavDB::GeomRecord& r) {
+            stream.write_values(r.id, r.name, r.geog);
+        };
+        int written = tryCopyBatch(*conn_, real_table, buf, write_geom);
+        std::cerr << "[NavDB] recovered: wrote " << written << " of "
+                  << buf.size() + written << " rows to " << real_table << "\n";
     }
     finalize_tags(tag_table);
     buf.clear();
 }
 
-void NavDB::flushWays()  { flushViaTemp("tmp_ways",  "my_ways",  "way",  way_buf_);  }
-void NavDB::flushAreas() { flushViaTemp("tmp_areas", "my_areas", "area", area_buf_); }
-void NavDB::flushRoads() { flushViaTemp("tmp_roads", "my_roads", "road", road_buf_); }
+void NavDB::flushWays()  { flushViaTemp("tmp_ways",  "ways",  "way",  way_buf_);  }
+void NavDB::flushAreas() { flushViaTemp("tmp_areas", "areas", "area", area_buf_); }
+void NavDB::flushRoads() { flushViaTemp("tmp_roads", "roads", "road", road_buf_); }
 
 void NavDB::flushRelations() {
     if (relation_buf_.empty()) return;
@@ -219,14 +276,20 @@ void NavDB::flushRelations() {
     try {
         pqxx::work txn(*conn_);
         auto stream = pqxx::stream_to::table(
-            txn, {"my_relations"}, {"id", "name", "geog"});
+            txn, {"relations"}, {"id", "name", "geog"});
         for (const auto& r : relation_buf_)
             stream.write_values(r.id, r.name, r.geog);
         stream.complete();
         txn.commit();
     } catch (const std::exception& e) {
-        std::cerr << "[NavDB] flushRelations error: " << e.what() << "\n";
-        throw;
+        std::cerr << "[NavDB] flushRelations initial error: " << e.what() << "\n"
+                  << "[NavDB] retrying with bad rows removed...\n";
+        auto write_rel = [](auto& stream, const NavDB::RelationRecord& r) {
+            stream.write_values(r.id, r.name, r.geog);
+        };
+        int written = tryCopyBatch(*conn_, "relations", relation_buf_, write_rel);
+        std::cerr << "[NavDB] recovered: wrote " << written << " of "
+                  << relation_buf_.size() + written << " rows to relations\n";
     }
     finalize_tags("relation");
     relation_buf_.clear();
@@ -236,25 +299,25 @@ void NavDB::flushRelations() {
 
 // These should only be called by one thread (thread 0) at the phase boundary.
 static const char* DISABLE_INDEXES = R"SQL(
-    ALTER TABLE my_ways      DROP CONSTRAINT IF EXISTS my_ways_pkey;
-    ALTER TABLE my_areas     DROP CONSTRAINT IF EXISTS my_areas_pkey;
-    ALTER TABLE my_roads     DROP CONSTRAINT IF EXISTS my_roads_pkey;
-    ALTER TABLE my_relations DROP CONSTRAINT IF EXISTS my_relations_pkey;
+    ALTER TABLE ways      DROP CONSTRAINT IF EXISTS ways_pkey;
+    ALTER TABLE areas     DROP CONSTRAINT IF EXISTS areas_pkey;
+    ALTER TABLE roads     DROP CONSTRAINT IF EXISTS roads_pkey;
+    ALTER TABLE relations DROP CONSTRAINT IF EXISTS relations_pkey;
 )SQL";
 
 static const char* ENABLE_INDEXES = R"SQL(
-    ALTER TABLE my_ways      ADD PRIMARY KEY (id);
-    ALTER TABLE my_areas     ADD PRIMARY KEY (id);
-    ALTER TABLE my_roads     ADD PRIMARY KEY (id);
-    ALTER TABLE my_relations ADD PRIMARY KEY (id);
+    ALTER TABLE ways      ADD PRIMARY KEY (id);
+    ALTER TABLE areas     ADD PRIMARY KEY (id);
+    ALTER TABLE roads     ADD PRIMARY KEY (id);
+    ALTER TABLE relations ADD PRIMARY KEY (id);
 )SQL";
 
 static const char* CREATE_GIST_INDEXES = R"SQL(
-    CREATE INDEX IF NOT EXISTS my_nodes_geog_idx     ON public.my_nodes     USING GIST (geog);
-    CREATE INDEX IF NOT EXISTS my_ways_geog_idx      ON public.my_ways      USING GIST (geog);
-    CREATE INDEX IF NOT EXISTS my_areas_geog_idx     ON public.my_areas     USING GIST (geog);
-    CREATE INDEX IF NOT EXISTS my_roads_geog_idx     ON public.my_roads     USING GIST (geog);
-    CREATE INDEX IF NOT EXISTS my_relations_geog_idx ON public.my_relations USING GIST (geog);
+    CREATE INDEX IF NOT EXISTS nodes_geog_idx     ON public.nodes     USING GIST (geog);
+    CREATE INDEX IF NOT EXISTS ways_geog_idx      ON public.ways      USING GIST (geog);
+    CREATE INDEX IF NOT EXISTS areas_geog_idx     ON public.areas     USING GIST (geog);
+    CREATE INDEX IF NOT EXISTS roads_geog_idx     ON public.roads     USING GIST (geog);
+    CREATE INDEX IF NOT EXISTS relations_geog_idx ON public.relations USING GIST (geog);
 )SQL";
 
 void NavDB::disableIndexes() {
@@ -302,7 +365,7 @@ std::string NavDB::getWay(int64_t id) {
     try {
         pqxx::work txn(*conn_);
         auto res = txn.exec(
-            "SELECT geog FROM my_ways WHERE id = $1 UNION ALL SELECT geog FROM my_areas WHERE id = $1",
+            "SELECT geog FROM ways WHERE id = $1 UNION ALL SELECT geog FROM areas WHERE id = $1",
             pqxx::params{id});
         if (res.empty() || res[0][0].is_null()) return "";
         return res[0][0].as<std::string>();
@@ -320,7 +383,7 @@ void NavDB::updateNode(int64_t id, const std::string& name,
     try {
         pqxx::work txn(*conn_);
         txn.exec(
-            "UPDATE my_nodes SET name=$2, longitude_m=$3, latitude_m=$4, geog=$5 WHERE id=$1",
+            "UPDATE nodes SET name=$2, longitude_m=$3, latitude_m=$4, geog=$5 WHERE id=$1",
             pqxx::params{id, name, lon_m, lat_m, geog});
         txn.commit();
     } catch (const std::exception& e) {
@@ -331,7 +394,7 @@ void NavDB::updateNode(int64_t id, const std::string& name,
         pqxx::work txn(*conn_);
         // Get existing tags
         auto rows = txn.exec(
-            "SELECT key_name, key_value FROM my_node_tags WHERE id=$1",
+            "SELECT key_name, key_value FROM node_tags WHERE id=$1",
             pqxx::params{id});
         std::unordered_map<std::string,std::string> existing;
         for (const auto& r : rows) existing[r[0].c_str()] = r[1].c_str();
@@ -339,15 +402,15 @@ void NavDB::updateNode(int64_t id, const std::string& name,
         for (auto& [k, v] : tags) {
             auto it = existing.find(k);
             if (it == existing.end())
-                txn.exec("INSERT INTO my_node_tags(id,key_name,key_value) VALUES($1,$2,$3)",
+                txn.exec("INSERT INTO node_tags(id,key_name,key_value) VALUES($1,$2,$3)",
                          pqxx::params{id, k, v});
             else if (it->second != v)
-                txn.exec("UPDATE my_node_tags SET key_value=$3 WHERE id=$1 AND key_name=$2",
+                txn.exec("UPDATE node_tags SET key_value=$3 WHERE id=$1 AND key_name=$2",
                          pqxx::params{id, k, v});
             existing.erase(k);
         }
         for (auto& [k, _] : existing)
-            txn.exec("DELETE FROM my_node_tags WHERE id=$1 AND key_name=$2", pqxx::params{id, k});
+            txn.exec("DELETE FROM node_tags WHERE id=$1 AND key_name=$2", pqxx::params{id, k});
         txn.commit();
     } catch (const std::exception& e) {
         std::cerr << "[NavDB] updateNode tags error: " << e.what() << "\n"; throw;
@@ -382,8 +445,8 @@ void NavDB::updateWay(int64_t id, const std::string& name,
                       const Tags& tags, const std::string& geog) {
     try {
         pqxx::work txn(*conn_);
-        txn.exec("UPDATE my_ways SET name=$2, geog=$3 WHERE id=$1", pqxx::params{id, name, geog});
-        diffTags(txn, id, "my_way_tags", tags);
+        txn.exec("UPDATE ways SET name=$2, geog=$3 WHERE id=$1", pqxx::params{id, name, geog});
+        diffTags(txn, id, "way_tags", tags);
         txn.commit();
     } catch (const std::exception& e) {
         std::cerr << "[NavDB] updateWay error: " << e.what() << "\n"; throw;
@@ -394,8 +457,8 @@ void NavDB::updateArea(int64_t id, const std::string& name,
                        const Tags& tags, const std::string& geog) {
     try {
         pqxx::work txn(*conn_);
-        txn.exec("UPDATE my_areas SET name=$2, geog=$3 WHERE id=$1", pqxx::params{id, name, geog});
-        diffTags(txn, id, "my_area_tags", tags);
+        txn.exec("UPDATE areas SET name=$2, geog=$3 WHERE id=$1", pqxx::params{id, name, geog});
+        diffTags(txn, id, "area_tags", tags);
         txn.commit();
     } catch (const std::exception& e) {
         std::cerr << "[NavDB] updateArea error: " << e.what() << "\n"; throw;
@@ -407,8 +470,8 @@ void NavDB::updateRelation(int64_t id, const std::string& name,
     try {
         pqxx::work txn(*conn_);
         std::optional<std::string> g = geog.empty() ? std::nullopt : std::make_optional(geog);
-        txn.exec("UPDATE my_relations SET name=$2, geog=$3 WHERE id=$1", pqxx::params{id, name, g});
-        diffTags(txn, id, "my_relation_tags", tags);
+        txn.exec("UPDATE relations SET name=$2, geog=$3 WHERE id=$1", pqxx::params{id, name, g});
+        diffTags(txn, id, "relation_tags", tags);
         txn.commit();
     } catch (const std::exception& e) {
         std::cerr << "[NavDB] updateRelation error: " << e.what() << "\n"; throw;
@@ -417,18 +480,18 @@ void NavDB::updateRelation(int64_t id, const std::string& name,
 
 void NavDB::deleteEntity(int64_t id, const std::string& type) {
     static const std::unordered_map<std::string,std::string> tag_tables = {
-        {"node",     "my_node_tags"},
-        {"way",      "my_way_tags"},
-        {"area",     "my_area_tags"},
-        {"road",     "my_road_tags"},
-        {"relation", "my_relation_tags"},
+        {"node",     "node_tags"},
+        {"way",      "way_tags"},
+        {"area",     "area_tags"},
+        {"road",     "road_tags"},
+        {"relation", "relation_tags"},
     };
     static const std::unordered_map<std::string,std::string> main_tables = {
-        {"node",     "my_nodes"},
-        {"way",      "my_ways"},
-        {"area",     "my_areas"},
-        {"road",     "my_roads"},
-        {"relation", "my_relations"},
+        {"node",     "nodes"},
+        {"way",      "ways"},
+        {"area",     "areas"},
+        {"road",     "roads"},
+        {"relation", "relations"},
     };
     try {
         pqxx::work txn(*conn_);
@@ -471,11 +534,11 @@ void NavDB::setReplicationSequence(int64_t seq) {
 
 void NavDB::vacuumAnalyze() {
     static const char* tables[] = {
-        "my_nodes", "my_ways", "my_areas", "my_roads", "my_relations",
-        "my_node_tags", "my_way_tags", "my_area_tags", "my_road_tags",
-        "my_relation_tags",
-        "ap_airports", "ap_runways", "ap_navaids", "ap_frequencies",
-        "ap_tags", "ap_countries", "ap_regions",
+        "nodes", "ways", "areas", "roads", "relations",
+        "node_tags", "way_tags", "area_tags", "road_tags",
+        "relation_tags",
+        "airports", "runways", "navaids", "frequencies",
+        "tags", "countries", "regions",
     };
     // VACUUM cannot run inside a transaction block — pqxx::nontransaction
     // issues commands without wrapping them in BEGIN/COMMIT.
@@ -494,12 +557,12 @@ void NavDB::vacuumAnalyze() {
 void NavDB::truncateForResume(const std::string& phase) {
     std::vector<std::string> tables;
     if (phase == "ways") {
-        tables = {"my_ways", "my_areas", "my_way_tags", "my_area_tags"};
+        tables = {"ways", "areas", "way_tags", "area_tags"};
     } else if (phase == "relations") {
-        tables = {"my_relations", "my_roads", "my_relation_tags", "my_road_tags"};
+        tables = {"relations", "roads", "relation_tags", "road_tags"};
     } else if (phase == "airports") {
-        tables = {"ap_countries", "ap_regions", "ap_airports", "ap_tags",
-                  "ap_frequencies", "ap_runways", "ap_navaids"};
+        tables = {"countries", "regions", "airports", "tags",
+                  "frequencies", "runways", "navaids"};
     } else {
         std::cerr << "[NavDB] truncateForResume: unknown phase '" << phase << "'\n";
         return;
@@ -521,4 +584,201 @@ void NavDB::truncateForResume(const std::string& phase) {
                // unsafe — better to abort than silently hit duplicate-key
                // errors mid-run
     }
+}
+
+void NavDB::initializeSchema() {
+    // DDL mirrors create.sql + create_airports.sql exactly.
+    // Using nontransaction since DDL (CREATE/DROP) cannot always run inside
+    // a transaction block in PostgreSQL (e.g. some index types).
+    static const char* statements[] = {
+        // ---- OSM tables ----
+        "DROP TABLE IF EXISTS public.node_tags",
+        "DROP TABLE IF EXISTS public.way_tags",
+        "DROP TABLE IF EXISTS public.area_tags",
+        "DROP TABLE IF EXISTS public.road_tags",
+        "DROP TABLE IF EXISTS public.relation_tags",
+        "DROP TABLE IF EXISTS public.nodes",
+        "DROP TABLE IF EXISTS public.ways",
+        "DROP TABLE IF EXISTS public.areas",
+        "DROP TABLE IF EXISTS public.roads",
+        "DROP TABLE IF EXISTS public.relations",
+        "DROP TABLE IF EXISTS public.osm_replication_state",
+
+        "CREATE TABLE public.nodes ("
+        "  id          bigint NOT NULL,"
+        "  name        varchar(256),"
+        "  longitude_m double precision,"
+        "  latitude_m  double precision,"
+        "  geog        public.geometry,"
+        "  CONSTRAINT nodes_pkey PRIMARY KEY (id))",
+
+        "CREATE TABLE public.ways ("
+        "  id   bigint NOT NULL,"
+        "  name varchar(256),"
+        "  geog public.geometry,"
+        "  CONSTRAINT ways_pkey PRIMARY KEY (id))",
+
+        "CREATE TABLE public.areas ("
+        "  id   bigint NOT NULL,"  // positive=way, negative=relation (-id)
+        "  name varchar(256),"
+        "  geog public.geometry,"
+        "  CONSTRAINT areas_pkey PRIMARY KEY (id))",
+
+        "CREATE TABLE public.roads ("
+        "  id   bigint NOT NULL,"
+        "  name varchar(256),"
+        "  geog public.geometry,"
+        "  CONSTRAINT roads_pkey PRIMARY KEY (id))",
+
+        "CREATE TABLE public.relations ("
+        "  id   bigint NOT NULL,"
+        "  name varchar(256),"
+        "  geog public.geometry,"
+        "  CONSTRAINT relations_pkey PRIMARY KEY (id))",
+
+        "CREATE TABLE public.node_tags ("
+        "  id bigint NOT NULL, key_name varchar(256), key_value varchar(256))",
+
+        "CREATE TABLE public.way_tags ("
+        "  id bigint NOT NULL, key_name varchar(256), key_value varchar(256))",
+
+        "CREATE TABLE public.area_tags ("
+        "  id bigint NOT NULL, key_name varchar(256), key_value varchar(256))",
+
+        "CREATE TABLE public.road_tags ("
+        "  id bigint NOT NULL, key_name varchar(256), key_value varchar(256))",
+
+        "CREATE TABLE public.relation_tags ("
+        "  id bigint NOT NULL, key_name varchar(256), key_value varchar(256))",
+
+        "CREATE TABLE public.osm_replication_state ("
+        "  id integer PRIMARY KEY DEFAULT 1 CHECK (id = 1),"
+        "  sequence bigint NOT NULL)",
+
+        "CREATE INDEX node_tags_idx     ON public.node_tags     (id)",
+        "CREATE INDEX way_tags_idx      ON public.way_tags      (id)",
+        "CREATE INDEX area_tags_idx     ON public.area_tags     (id)",
+        "CREATE INDEX road_tags_idx     ON public.road_tags     (id)",
+        "CREATE INDEX relation_tags_idx ON public.relation_tags (id)",
+
+        // ---- OurAirports tables ----
+        "DROP TABLE IF EXISTS public.tags",
+        "DROP TABLE IF EXISTS public.runways",
+        "DROP TABLE IF EXISTS public.frequencies",
+        "DROP TABLE IF EXISTS public.navaids",
+        "DROP TABLE IF EXISTS public.airports",
+        "DROP TABLE IF EXISTS public.regions",
+        "DROP TABLE IF EXISTS public.countries",
+
+        "CREATE TABLE public.countries ("
+        "  id integer PRIMARY KEY, code varchar(2) NOT NULL,"
+        "  name varchar(256), continent varchar(2))",
+
+        "CREATE TABLE public.regions ("
+        "  id integer PRIMARY KEY, code varchar(16) NOT NULL,"
+        "  local_code varchar(16), name varchar(256),"
+        "  continent varchar(2), iso_country varchar(2))",
+
+        "CREATE TABLE public.airports ("
+        "  id integer PRIMARY KEY, ident varchar(16) NOT NULL,"
+        "  type varchar(32), name varchar(256),"
+        "  latitude_m double precision, longitude_m double precision,"
+        "  elevation_ft integer, continent varchar(2),"
+        "  iso_country varchar(2), iso_region varchar(16),"
+        "  municipality varchar(256), scheduled_service boolean,"
+        "  icao_code varchar(8), iata_code varchar(8),"
+        "  gps_code varchar(8), local_code varchar(16),"
+        "  geog public.geometry)",
+
+        "CREATE TABLE public.tags ("
+        "  airport_ident varchar(16) NOT NULL, entity_type varchar(16) NOT NULL,"
+        "  key_name varchar(256) NOT NULL, key_value varchar(256))",
+
+        "CREATE TABLE public.frequencies ("
+        "  id integer PRIMARY KEY, airport_ref integer NOT NULL,"
+        "  airport_ident varchar(16), type varchar(16),"
+        "  description varchar(256), frequency_mhz double precision)",
+
+        "CREATE TABLE public.runways ("
+        "  id integer PRIMARY KEY, airport_ref integer NOT NULL,"
+        "  airport_ident varchar(16), length_ft integer, width_ft integer,"
+        "  surface varchar(64), lighted boolean, closed boolean,"
+        "  le_ident varchar(8), le_latitude_m double precision,"
+        "  le_longitude_m double precision, le_elevation_ft integer,"
+        "  le_heading_degT double precision, le_displaced_threshold_ft integer,"
+        "  le_geog public.geometry,"
+        "  he_ident varchar(8), he_latitude_m double precision,"
+        "  he_longitude_m double precision, he_elevation_ft integer,"
+        "  he_heading_degT double precision, he_displaced_threshold_ft integer,"
+        "  he_geog public.geometry)",
+
+        "CREATE TABLE public.navaids ("
+        "  id integer PRIMARY KEY, ident varchar(16), name varchar(256),"
+        "  type varchar(16), frequency_khz double precision,"
+        "  latitude_m double precision, longitude_m double precision,"
+        "  elevation_ft integer, iso_country varchar(2),"
+        "  dme_frequency_khz double precision, dme_channel varchar(16),"
+        "  dme_latitude_m double precision, dme_longitude_m double precision,"
+        "  dme_elevation_ft integer, slaved_variation_deg double precision,"
+        "  magnetic_variation_deg double precision, usage_type varchar(16),"
+        "  power varchar(16), associated_airport varchar(16),"
+        "  geog public.geometry)",
+
+        "CREATE INDEX airports_geog_idx    ON public.airports  USING GIST (geog)",
+        "CREATE INDEX airports_ident_idx   ON public.airports  (ident)",
+        "CREATE INDEX airports_icao_idx    ON public.airports  (icao_code)",
+        "CREATE INDEX airports_iata_idx    ON public.airports  (iata_code)",
+        "CREATE INDEX airports_country_idx ON public.airports  (iso_country)",
+        "CREATE INDEX airports_region_idx  ON public.airports  (iso_region)",
+        "CREATE INDEX airports_type_idx    ON public.airports  (type)",
+        "CREATE INDEX freq_airport_idx     ON public.frequencies (airport_ref)",
+        "CREATE INDEX freq_ident_idx       ON public.frequencies (airport_ident)",
+        "CREATE INDEX runways_airport_idx  ON public.runways (airport_ref)",
+        "CREATE INDEX runways_le_geog_idx  ON public.runways USING GIST (le_geog)",
+        "CREATE INDEX runways_he_geog_idx  ON public.runways USING GIST (he_geog)",
+        "CREATE INDEX navaids_geog_idx     ON public.navaids  USING GIST (geog)",
+        "CREATE INDEX navaids_ident_idx    ON public.navaids  (ident)",
+        "CREATE INDEX navaids_type_idx     ON public.navaids  (type)",
+        "CREATE INDEX navaids_country_idx  ON public.navaids  (iso_country)",
+        "CREATE INDEX navaids_airport_idx  ON public.navaids  (associated_airport)",
+        "CREATE INDEX tags_ident_idx       ON public.tags (airport_ident)",
+        "CREATE INDEX tags_type_idx        ON public.tags (airport_ident, entity_type)",
+        "CREATE INDEX regions_country_idx  ON public.regions  (iso_country)",
+        "CREATE INDEX regions_code_idx     ON public.regions  (code)",
+    };
+
+    for (const char* sql : statements) {
+        try {
+            pqxx::nontransaction txn(*conn_);
+            txn.exec(sql);
+        } catch (const std::exception& e) {
+            throw std::runtime_error(
+                std::string("initializeSchema failed on: ") + sql + "\n  " + e.what());
+        }
+    }
+    std::cout << "[NavDB] schema initialized\n";
+}
+
+std::vector<std::pair<double,double>> NavDB::getWayCoords(int64_t id) {
+    std::vector<std::pair<double,double>> coords;
+    try {
+        pqxx::work txn(*conn_);
+        // Dump points from ways OR areas, returning X/Y in Mercator
+        auto res = txn.exec(
+            "SELECT ST_X(p.geom), ST_Y(p.geom) "
+            "FROM ("
+            "  SELECT (ST_DumpPoints(geog)).geom FROM ways  WHERE id=$1 "
+            "  UNION ALL "
+            "  SELECT (ST_DumpPoints(geog)).geom FROM areas WHERE id=$1"
+            ") p",
+            pqxx::params{id});
+        coords.reserve(res.size());
+        for (const auto& row : res) {
+            if (row[0].is_null() || row[1].is_null()) continue;
+            coords.emplace_back(row[0].as<double>(), row[1].as<double>());
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "[NavDB] getWayCoords(" << id << ") error: " << e.what() << "\n";
+    }
+    return coords;
 }

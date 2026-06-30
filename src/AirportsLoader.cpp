@@ -108,7 +108,7 @@ static bool downloadAP(const std::string& url, const std::string& dest) {
 static void loadCountries(pqxx::connection& conn, const std::string& path, bool verbose) {
     std::ifstream f(path); std::string line; std::getline(f, line);
     pqxx::work txn(conn);
-    auto s = pqxx::stream_to::table(txn, {"ap_countries"},
+    auto s = pqxx::stream_to::table(txn, {"countries"},
                  {"id","code","name","continent"});
     int n = 0;
     while (std::getline(f, line)) {
@@ -124,7 +124,7 @@ static void loadCountries(pqxx::connection& conn, const std::string& path, bool 
 static void loadRegions(pqxx::connection& conn, const std::string& path, bool verbose) {
     std::ifstream f(path); std::string line; std::getline(f, line);
     pqxx::work txn(conn);
-    auto s = pqxx::stream_to::table(txn, {"ap_regions"},
+    auto s = pqxx::stream_to::table(txn, {"regions"},
                  {"id","code","local_code","name","continent","iso_country"});
     int n = 0;
     while (std::getline(f, line)) {
@@ -184,7 +184,7 @@ static void loadAirports(pqxx::connection& conn, const std::string& path, bool v
 
     {
         pqxx::work txn(conn);
-        auto s = pqxx::stream_to::table(txn, {"ap_airports"},
+        auto s = pqxx::stream_to::table(txn, {"airports"},
             {"id","ident","type","name",
              "latitude_m","longitude_m","elevation_ft",
              "continent","iso_country","iso_region","municipality",
@@ -199,7 +199,7 @@ static void loadAirports(pqxx::connection& conn, const std::string& path, bool v
     }
     {
         pqxx::work txn(conn);
-        auto ts = pqxx::stream_to::table(txn, {"ap_tags"},
+        auto ts = pqxx::stream_to::table(txn, {"tags"},
             {"airport_ident","entity_type","key_name","key_value"});
         for (auto& t : tags)
             ts.write_values(t.ident, t.entity_type, t.key, t.val);
@@ -211,7 +211,7 @@ static void loadAirports(pqxx::connection& conn, const std::string& path, bool v
 static void loadFrequencies(pqxx::connection& conn, const std::string& path, bool verbose) {
     std::ifstream f(path); std::string line; std::getline(f, line);
     pqxx::work txn(conn);
-    auto s = pqxx::stream_to::table(txn, {"ap_frequencies"},
+    auto s = pqxx::stream_to::table(txn, {"frequencies"},
         {"id","airport_ref","airport_ident","type","description","frequency_mhz"});
     int n = 0;
     while (std::getline(f, line)) {
@@ -229,7 +229,7 @@ static void loadFrequencies(pqxx::connection& conn, const std::string& path, boo
 static void loadRunways(pqxx::connection& conn, const std::string& path, bool verbose) {
     std::ifstream f(path); std::string line; std::getline(f, line);
     pqxx::work txn(conn);
-    auto s = pqxx::stream_to::table(txn, {"ap_runways"},
+    auto s = pqxx::stream_to::table(txn, {"runways"},
         {"id","airport_ref","airport_ident","length_ft","width_ft","surface",
          "lighted","closed",
          "le_ident","le_latitude_m","le_longitude_m","le_elevation_ft",
@@ -318,7 +318,7 @@ static void loadNavaids(pqxx::connection& conn, const std::string& path, bool ve
 
     {
         pqxx::work txn(conn);
-        auto s = pqxx::stream_to::table(txn, {"ap_navaids"},
+        auto s = pqxx::stream_to::table(txn, {"navaids"},
             {"id","ident","name","type","frequency_khz",
              "latitude_m","longitude_m","elevation_ft","iso_country",
              "dme_frequency_khz","dme_channel",
@@ -336,7 +336,7 @@ static void loadNavaids(pqxx::connection& conn, const std::string& path, bool ve
     }
     {
         pqxx::work txn(conn);
-        auto ts = pqxx::stream_to::table(txn, {"ap_tags"},
+        auto ts = pqxx::stream_to::table(txn, {"tags"},
             {"airport_ident","entity_type","key_name","key_value"});
         for (auto& t : tags)
             ts.write_values(t.ident, t.entity_type, t.key, t.val);

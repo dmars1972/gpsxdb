@@ -36,12 +36,17 @@ struct WayEntry {
     std::string geog_wkb_hex;
 };
 
+struct RelationMember {
+    int64_t     id;
+    std::string role; // "outer", "inner", or ""
+};
+
 struct RelationEntry {
     int64_t id;
     std::string name;
     Tags tags;
-    // Only WAY member IDs are kept (matching Python logic)
-    std::vector<int64_t> way_members;
+    // Only WAY members are kept, with their roles for multipolygon assembly
+    std::vector<RelationMember> way_members;
 
     std::string geog_wkb_hex; // filled during processing
 };

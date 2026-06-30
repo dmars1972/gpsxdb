@@ -108,8 +108,8 @@ std::string DeltaApplier::buildWayGeom(const WayEntry& w, bool& is_closed) {
 
 std::string DeltaApplier::buildRelationGeom(const RelationEntry& r) {
     std::vector<std::string> geoms;
-    for (int64_t wid : r.way_members) {
-        std::string g = db_.getWay(wid);
+    for (auto& m : r.way_members) {
+        std::string g = db_.getWay(m.id);
         if (!g.empty()) geoms.push_back(std::move(g));
     }
     return mergeLinestrings(geoms);

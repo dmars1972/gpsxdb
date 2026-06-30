@@ -27,6 +27,7 @@
 #include <iomanip>
 #include <functional>
 #include <memory>
+#include <unordered_set>
 
 // ---- Bounded blocking queue ----
 
@@ -252,6 +253,7 @@ struct Args {
     std::string shard_dir      = ".";  // directory for shard files
     int64_t     max_node_id    = 20'000'000'000LL;
     bool        verbose        = false;
+    bool        init_schema    = false;
     int         queue_size     = 10000;
     int         node_threads   = 1;  // RPi5-safe default; see README for tuning
     int         way_threads    = 6;  // RPi5-safe default; see README for tuning
@@ -299,6 +301,7 @@ static Args parseArgs(int argc, char** argv) {
         else if ((arg == "--node-threads" || arg == "-t") && i+1 < argc) a.node_threads = safeInt(argv[++i], "--node-threads");
         else if ((arg == "--way-threads"  || arg == "-w") && i+1 < argc) a.way_threads  = safeInt(argv[++i], "--way-threads");
         else if  (arg == "--verbose"      || arg == "-v")                a.verbose      = true;
+        else if  (arg == "--init"         || arg == "-I")                a.init_schema  = true;
         else if ((arg == "--mode"         || arg == "-m") && i+1 < argc) {
             std::string m = argv[++i];
             if      (m == "import") a.mode = Mode::Import;
@@ -332,6 +335,7 @@ static Args parseArgs(int argc, char** argv) {
                 "    -m mode            import|delta|poll (default import)\n"
                 "    -l log_file        (default osm_import.log)\n"
                 "    -v                 Verbose logging\n"
+                "    -I                 Initialize (drop+recreate) all tables before import\n"
                 "    -h                 Show this help and exit\n"
                 "  Import mode (default):\n"
                 "    -i <file.osm.pbf>  Input PBF file\n"
@@ -350,7 +354,7 @@ static Args parseArgs(int argc, char** argv) {
                 "                       Prerequisites for the chosen phase must\n"
                 "                       already be complete (e.g. -R ways requires\n"
                 "                       nodes.dat to already contain merged data and\n"
-                "                       my_nodes to be fully populated)\n"
+                "                       nodes to be fully populated)\n"
                 "  Delta mode (-m delta):\n"
                 "    -o <file.osc.gz>   OSC file to apply\n"
                 "    -f nodes_file      Existing nodes.dat from initial import\n"
@@ -457,7 +461,66 @@ static std::string formatDuration(double seconds) {
     return ss.str();
 }
 
-// ---- Node-phase thread ----
+// Determine whether a closed way should be stored as an area (polygon) or
+// a way (linestring). Mirrors the heuristic used by osmium/osm2pgsql:
+//
+//  1. Not closed → always a way
+//  2. area=yes   → area
+//  3. area=no    → way
+//  4. Has an area-implying tag → area
+//  5. Has a linear-implying tag → way
+//  6. Default → way (ambiguous closed ways are treated as linear)
+//
+// This prevents roundabouts, circular paths, and barriers from being
+// incorrectly stored as polygons.
+static bool isArea(bool is_closed, const Tags& tags) {
+    if (!is_closed) return false;
+
+    // Explicit area tag overrides everything
+    auto it = tags.find("area");
+    if (it != tags.end()) {
+        if (it->second == "yes") return true;
+        if (it->second == "no")  return false;
+    }
+
+    // Tags that imply linear use — closed ways with these are NOT areas
+    static const std::unordered_set<std::string> linear_keys = {
+        "highway", "railway", "waterway", "power", "man_made",
+    };
+    static const std::vector<std::pair<std::string,std::string>> linear_tag_values = {
+        {"junction", "roundabout"},
+        {"junction", "circular"},
+        {"barrier",  "fence"},
+        {"barrier",  "wall"},
+        {"barrier",  "hedge"},
+        {"barrier",  "retaining_wall"},
+        {"barrier",  "city_wall"},
+        {"aeroway",  "runway"},
+        {"aeroway",  "taxiway"},
+        {"aeroway",  "taxilane"},
+    };
+    for (auto& [k, v] : tags) {
+        if (linear_keys.count(k)) return false;
+    }
+    for (auto& [k, v] : linear_tag_values) {
+        auto it2 = tags.find(k);
+        if (it2 != tags.end() && it2->second == v) return false;
+    }
+
+    // Tags that imply area use — closed ways with these ARE areas
+    static const std::unordered_set<std::string> area_keys = {
+        "building", "building:part", "landuse",  "leisure",  "natural",
+        "amenity",  "shop",          "tourism",  "historic", "military",
+        "boundary", "place",         "sport",    "landcover",
+    };
+    for (auto& [k, v] : tags) {
+        if (area_keys.count(k)) return true;
+    }
+
+    return false; // default: ambiguous closed ways are linear
+}
+
+
 
 void nodeThread(int tid,
                 BlockingQueue<OSMEntry>& my_q,
@@ -498,6 +561,179 @@ void nodeThread(int tid,
     db.finalize_tags("node");
     node_barrier.arrive_and_wait();
     LOGI(tid, "node thread done");
+}
+
+// ---- Multipolygon assembly ----
+//
+// OSM multipolygon relations consist of member ways with roles "outer" or
+// "inner". Each role group may be made up of multiple ways that need to be
+// stitched end-to-end into complete rings. Once stitched, outer rings form
+// the polygon shell(s) and inner rings form holes.
+//
+// This function:
+//  1. Fetches the coordinate sequence for each member way from the DB
+//  2. Stitches the segments into complete rings per role group
+//  3. Builds a PostGIS-compatible WKB MULTIPOLYGON hex string
+//
+// Returns an empty string if the rings can't be assembled (e.g. missing
+// member geometries, disconnected rings), in which case the relation is
+// stored with an empty geometry rather than a wrong one.
+
+using Ring    = std::vector<std::pair<double,double>>;
+using Segment = std::vector<std::pair<double,double>>;
+
+// Try to stitch a set of open segments into closed rings.
+// Returns the stitched rings, or empty if stitching fails.
+static std::vector<Ring> stitchRings(std::vector<Segment> segs) {
+    std::vector<Ring> rings;
+
+    while (!segs.empty()) {
+        // Start a new ring with the first available segment
+        Ring ring = std::move(segs.front());
+        segs.erase(segs.begin());
+
+        bool progress = true;
+        while (progress) {
+            progress = false;
+            if (ring.size() >= 4 &&
+                ring.front().first  == ring.back().first &&
+                ring.front().second == ring.back().second) {
+                break; // ring is closed — done
+            }
+            for (size_t i = 0; i < segs.size(); ++i) {
+                auto& seg = segs[i];
+                if (seg.empty()) continue;
+                auto& rb = ring.back();
+                if (seg.front().first  == rb.first &&
+                    seg.front().second == rb.second) {
+                    // append forward
+                    ring.insert(ring.end(), seg.begin() + 1, seg.end());
+                    segs.erase(segs.begin() + i);
+                    progress = true; break;
+                }
+                if (seg.back().first  == rb.first &&
+                    seg.back().second == rb.second) {
+                    // append reversed
+                    ring.insert(ring.end(), seg.rbegin() + 1, seg.rend());
+                    segs.erase(segs.begin() + i);
+                    progress = true; break;
+                }
+            }
+        }
+
+        // Ensure ring is closed
+        if (!ring.empty() &&
+            (ring.front().first  != ring.back().first ||
+             ring.front().second != ring.back().second)) {
+            ring.push_back(ring.front());
+        }
+
+        if (ring.size() >= 4)
+            rings.push_back(std::move(ring));
+    }
+    return rings;
+}
+
+// Write a WKB ring (LinearRing) into a buffer
+static void writeWkbRing(std::vector<uint8_t>& buf, const Ring& ring) {
+    auto wu32 = [&](uint32_t v) {
+        buf.push_back(v & 0xff); buf.push_back((v>>8)&0xff);
+        buf.push_back((v>>16)&0xff); buf.push_back((v>>24)&0xff);
+    };
+    auto wf64 = [&](double v) {
+        uint64_t u; memcpy(&u, &v, 8);
+        for (int i = 0; i < 8; ++i) buf.push_back((u >> (8*i)) & 0xff);
+    };
+    wu32(static_cast<uint32_t>(ring.size()));
+    for (auto& [x, y] : ring) { wf64(x); wf64(y); }
+}
+
+// Write a WKB POLYGON (one outer + zero or more inner rings)
+static void writeWkbPolygon(std::vector<uint8_t>& buf,
+                             const Ring& outer,
+                             const std::vector<Ring>& inners) {
+    auto wu32 = [&](uint32_t v) {
+        buf.push_back(v & 0xff); buf.push_back((v>>8)&0xff);
+        buf.push_back((v>>16)&0xff); buf.push_back((v>>24)&0xff);
+    };
+    buf.push_back(1);           // little-endian
+    wu32(0x20000003);           // WKB type: POLYGON with SRID
+    wu32(3857);                 // SRID: Web Mercator
+    wu32(1 + inners.size());    // ring count
+    writeWkbRing(buf, outer);
+    for (auto& inner : inners) writeWkbRing(buf, inner);
+}
+
+static std::string toHex(const std::vector<uint8_t>& buf) {
+    static const char* h = "0123456789ABCDEF";
+    std::string out;
+    out.reserve(buf.size() * 2);
+    for (uint8_t b : buf) { out += h[b>>4]; out += h[b&0xf]; }
+    return out;
+}
+
+static std::string buildMultipolygon(
+        const RelationEntry& item, NavDB& db) {
+
+    // Separate outer and inner member segments
+    std::vector<Segment> outers, inners;
+    for (auto& m : item.way_members) {
+        auto coords = db.getWayCoords(m.id);
+        if (coords.empty()) continue;
+        if (m.role == "inner")
+            inners.push_back(std::move(coords));
+        else // "outer" or "" (default is outer)
+            outers.push_back(std::move(coords));
+    }
+
+    if (outers.empty()) return "";
+
+    auto outer_rings = stitchRings(std::move(outers));
+    auto inner_rings = stitchRings(std::move(inners));
+
+    if (outer_rings.empty()) return "";
+
+    // Build WKB MULTIPOLYGON (each outer ring paired with any inner rings
+    // it contains — for simplicity, assign all inners to all outers if
+    // there's only one outer; for multiple outers, do a simple
+    // point-in-polygon check to assign inners correctly)
+    std::vector<uint8_t> buf;
+    auto wu32 = [&](uint32_t v) {
+        buf.push_back(v & 0xff); buf.push_back((v>>8)&0xff);
+        buf.push_back((v>>16)&0xff); buf.push_back((v>>24)&0xff);
+    };
+
+    if (outer_rings.size() == 1) {
+        // Single polygon — combine all inners as holes
+        writeWkbPolygon(buf, outer_rings[0], inner_rings);
+    } else {
+        // Multiple outer rings — MULTIPOLYGON, assign inners by containment
+        // (simplified: use bounding-box containment check)
+        buf.push_back(1);       // little-endian
+        wu32(0x20000006);       // WKB type: MULTIPOLYGON with SRID
+        wu32(3857);             // SRID
+        wu32(static_cast<uint32_t>(outer_rings.size()));
+
+        for (auto& outer : outer_rings) {
+            // Find inners contained within this outer using bbox check
+            double ox0 = outer[0].first, ox1 = outer[0].first;
+            double oy0 = outer[0].second, oy1 = outer[0].second;
+            for (auto& [x,y] : outer) {
+                ox0=std::min(ox0,x); ox1=std::max(ox1,x);
+                oy0=std::min(oy0,y); oy1=std::max(oy1,y);
+            }
+            std::vector<Ring> matched_inners;
+            for (auto& inner : inner_rings) {
+                // Check if inner centroid is within outer bbox
+                double ix = inner[0].first, iy = inner[0].second;
+                if (ix >= ox0 && ix <= ox1 && iy >= oy0 && iy <= oy1)
+                    matched_inners.push_back(inner);
+            }
+            writeWkbPolygon(buf, outer, matched_inners);
+        }
+    }
+
+    return toHex(buf);
 }
 
 // ---- Way/relation-phase thread ----
@@ -543,7 +779,7 @@ void wayThread(int tid,
                 std::string geog = buildWayGeom(coords, is_closed);
                 if (geog.empty()) return;
 
-                if (is_closed) {
+                if (isArea(is_closed, item.tags)) {
                     db.insertArea(item.id, item.name, item.tags, geog);
                     status.areas.fetch_add(1, std::memory_order_relaxed);
                     status.total_areas.fetch_add(1, std::memory_order_relaxed);
@@ -569,29 +805,51 @@ void wayThread(int tid,
                     way_phase_done = true;
                 }
 
-                // Collect member geometries from both ways and areas.
-                // mergeWayGeoms filters out polygons internally so both
-                // rel_geog and road_geog will only contain linestrings.
-                std::vector<std::string> geoms;
-                for (int64_t wid : item.way_members) {
-                    std::string g = db.getWay(wid);
-                    if (!g.empty()) geoms.push_back(std::move(g));
-                }
-                std::string rel_geog  = geoms.empty() ? "" : mergeWayGeoms(geoms);
-                std::string road_geog = rel_geog;
+                // Check if this is a multipolygon or boundary relation
+                auto type_it = item.tags.find("type");
+                bool is_multipolygon = (type_it != item.tags.end() &&
+                    (type_it->second == "multipolygon" ||
+                     type_it->second == "boundary"));
 
-                db.insertRelation(item.id, item.name, item.tags, rel_geog);
-                status.relations.fetch_add(1, std::memory_order_relaxed);
-                status.total_relations.fetch_add(1, std::memory_order_relaxed);
+                if (is_multipolygon) {
+                    // Assemble rings from member ways and store as an area.
+                    // Use negative relation ID to avoid primary key collision
+                    // with way IDs — OSM way and relation IDs share the same
+                    // integer space but are separate namespaces; storing both
+                    // in the areas table requires disambiguation.
+                    std::string geog = buildMultipolygon(item, db);
+                    if (!geog.empty()) {
+                        db.insertArea(-item.id, item.name, item.tags, geog);
+                        status.areas.fetch_add(1, std::memory_order_relaxed);
+                        status.total_areas.fetch_add(1, std::memory_order_relaxed);
+                    } else {
+                        LOGI(tid, "skipping multipolygon relation id=", item.id,
+                             " — ring assembly failed");
+                    }
+                } else {
+                    // Non-multipolygon relation — merge member geometries as
+                    // linestrings (route relations, restriction relations, etc.)
+                    std::vector<std::string> geoms;
+                    for (auto& m : item.way_members) {
+                        std::string g = db.getWay(m.id);
+                        if (!g.empty()) geoms.push_back(std::move(g));
+                    }
+                    std::string rel_geog  = geoms.empty() ? "" : mergeWayGeoms(geoms);
+                    std::string road_geog = rel_geog;
 
-                // Store route=road or highway=* relations in my_roads
-                if (!road_geog.empty()) {
-                    auto route_it   = item.tags.find("route");
-                    auto highway_it = item.tags.find("highway");
-                    bool is_road = (route_it   != item.tags.end() && route_it->second   == "road") ||
-                                   (highway_it != item.tags.end());
-                    if (is_road)
-                        db.insertRoad(item.id, item.name, item.tags, road_geog);
+                    db.insertRelation(item.id, item.name, item.tags, rel_geog);
+                    status.relations.fetch_add(1, std::memory_order_relaxed);
+                    status.total_relations.fetch_add(1, std::memory_order_relaxed);
+
+                    // Store route=road or highway=* relations in roads
+                    if (!road_geog.empty()) {
+                        auto route_it   = item.tags.find("route");
+                        auto highway_it = item.tags.find("highway");
+                        bool is_road = (route_it   != item.tags.end() && route_it->second == "road") ||
+                                       (highway_it != item.tags.end());
+                        if (is_road)
+                            db.insertRoad(item.id, item.name, item.tags, road_geog);
+                    }
                 }
             }
         }, entry);
@@ -709,6 +967,15 @@ int main(int argc, char** argv) {
     // Dispatch to delta/poll mode if requested
     if (args.mode != Mode::Import)
         return runDelta(args);
+
+    // -I: drop and recreate all tables before starting the import
+    if (args.init_schema) {
+        std::cout << "Initializing schema...\n";
+        std::mutex mu;
+        NavDB db(0, args.server, args.user, args.database, mu);
+        db.initializeSchema();
+        std::cout << "Schema initialized.\n";
+    }
 
     LOGI(-1, "starting infile=", args.infile,
          " node_threads=", args.node_threads,

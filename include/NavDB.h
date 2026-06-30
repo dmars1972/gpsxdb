@@ -67,6 +67,11 @@ public:
     // ---- Queries ----
     std::string getWay(int64_t id);
 
+    // Returns the coordinate sequence of a way as a vector of (lon_m, lat_m)
+    // pairs, extracted from the stored WKB geometry. Used for multipolygon
+    // ring assembly during relation processing.
+    std::vector<std::pair<double,double>> getWayCoords(int64_t id);
+
     // ---- Delta / update methods ----
     void updateNode(int64_t id, const std::string& name,
                     double lon_m, double lat_m,
@@ -87,6 +92,11 @@ public:
     // Replication sequence tracking
     int64_t getReplicationSequence();
     void    setReplicationSequence(int64_t seq);
+
+    // Drops and recreates all OSM and OurAirports tables from scratch.
+    // Equivalent to running create.sql + create_airports.sql.
+    // Called when -I is passed on the command line.
+    void initializeSchema();
 
     // VACUUM ANALYZE all OSM + airports tables. Call after import completes
     // and before re-enabling autovacuum (which is typically disabled during

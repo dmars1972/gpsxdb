@@ -1,3 +1,3 @@
-#psql -d nav -h rpi16 -f create.sql
-#psql -d nav -h rpi16 -f create_airports.sql
-./build/osm_import -i planet-260601.osm.pbf -d nav -s rpi16 -u daniel -t 3 -w 6 -n 35000000000 -v -l osm.log -f /nodes/nodes.dat -S /data/nodes  -R relations
+#psql -d nav -h server -f create.sql
+#psql -d nav -h server -f create_airports.sql
+./build/osm_import -I -i /data/planet-latest.osm.pbf -d nav -s server -u daniel -t 6 -w 12 -n 35000000000 -v -l osm.log -f /data/nodes.dat -S /postgres/tmp
