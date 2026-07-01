@@ -31,3 +31,7 @@ nohup.out
 *.swp
 *~
 *.zip
+*.csv
+*.sh
+*.py
+*.sql
