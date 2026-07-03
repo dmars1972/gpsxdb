@@ -16,6 +16,7 @@ pkg_check_modules(PROJ REQUIRED proj>=6)
 find_library(PQ_LIB pq REQUIRED)
 find_library(LZ4_LIB lz4 REQUIRED)
 find_library(EXPAT_LIB expat REQUIRED)
+find_library(CURL_LIB curl REQUIRED)
 find_path(EXPAT_INCLUDE expat.h)
 find_path(LZ4_INCLUDE lz4frame.h)
 find_path(PQ_INCLUDE libpq-fe.h PATH_SUFFIXES postgresql)
@@ -30,6 +31,7 @@ add_executable(osm_import
     src/DeltaApplier.cpp
     src/Replicator.cpp
     src/AirportsLoader.cpp
+    src/FAAObstacleLoader.cpp
     proto/fileformat.proto
     proto/osmformat.proto
 )
@@ -64,6 +66,7 @@ target_link_libraries(osm_import PRIVATE
     ${LZ4_LIB}
     ${EXPAT_LIB}
     ${PROJ_LIBRARIES}
+    ${CURL_LIB}
 )
 
 target_compile_options(osm_import PRIVATE
@@ -102,3 +105,28 @@ target_compile_definitions(airports_load PRIVATE ${PQXX_CFLAGS_OTHER})
 
 target_compile_options(airports_load PRIVATE -O2 -Wall -Wextra -Wno-psabi)
 target_compile_features(airports_load PRIVATE cxx_std_20)
+
+# ---- faa_obstacles_load ----
+
+add_executable(faa_obstacles_load
+    src/faa_obstacles_load.cpp
+    src/FAAObstacleLoader.cpp
+    src/GeoUtils.cpp
+)
+
+target_include_directories(faa_obstacles_load PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${PQXX_INCLUDE_DIRS}
+    ${PROJ_INCLUDE_DIRS}
+    ${PQ_INCLUDE}
+)
+
+target_link_libraries(faa_obstacles_load PRIVATE
+    ${PQXX_LIBRARIES}
+    ${PQ_LIB}
+    ${PROJ_LIBRARIES}
+    ${CURL_LIB}
+)
+
+target_compile_options(faa_obstacles_load PRIVATE -O2 -Wall -Wextra -Wno-psabi)
+target_compile_features(faa_obstacles_load PRIVATE cxx_std_20)

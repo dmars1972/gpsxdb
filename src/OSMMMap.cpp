@@ -462,6 +462,20 @@ void OSMMMap::flush() {
     if (merged_map_) msync(merged_map_, merged_size_, MS_ASYNC);
 }
 
+// Direct write to the merged flat file — used by delta mode where shards
+// are not available. Equivalent to insert() but bypasses shard buffering
+// and writes the coordinate directly into the merged mmap.
+void OSMMMap::update(int64_t id, double lon_m, double lat_m) {
+    if (id < 0) return;
+    size_t offset = static_cast<size_t>(id) * REC_SIZE;
+    if (offset + REC_SIZE > merged_size_) return;
+    double* dst = reinterpret_cast<double*>(
+        static_cast<uint8_t*>(merged_map_) + offset);
+    dst[0] = lon_m;
+    dst[1] = lat_m;
+    bitmapSet(merged_bm_map_, merged_bm_size_, id);
+}
+
 void OSMMMap::remove(int64_t id) {
     if (id < 0) return;
     size_t offset = static_cast<size_t>(id) * REC_SIZE;

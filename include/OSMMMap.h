@@ -58,6 +58,10 @@ public:
     // Zero out a node entry (used by delta deletes)
     void remove(int64_t id);
 
+    // Write node coordinates directly to the merged flat file — used by
+    // delta mode where shards are unavailable. Bypasses shard buffering.
+    void update(int64_t id, double lon_m, double lat_m);
+
     // Call once, after merge() completes and before the ways/relations phase
     // begins, to hint the kernel that subsequent access to the merged node
     // file will be random (disables readahead). See implementation comment

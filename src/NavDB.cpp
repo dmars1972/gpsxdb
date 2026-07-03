@@ -551,6 +551,7 @@ void NavDB::vacuumAnalyze() {
         "relation_tags",
         "airports", "runways", "navaids", "frequencies",
         "tags", "countries", "regions",
+        "faa_obstacles",
     };
     // VACUUM cannot run inside a transaction block — pqxx::nontransaction
     // issues commands without wrapping them in BEGIN/COMMIT.
@@ -757,6 +758,35 @@ void NavDB::initializeSchema() {
         "CREATE INDEX tags_type_idx        ON public.tags (airport_ident, entity_type)",
         "CREATE INDEX regions_country_idx  ON public.regions  (iso_country)",
         "CREATE INDEX regions_code_idx     ON public.regions  (code)",
+
+        // ---- FAA Digital Obstacle File ----
+        "DROP TABLE IF EXISTS public.faa_obstacles",
+        "CREATE TABLE public.faa_obstacles ("
+        "  id              serial PRIMARY KEY,"
+        "  oas_number      varchar(9)  NOT NULL,"
+        "  verified        boolean     NOT NULL,"
+        "  country         varchar(2),"
+        "  state           varchar(2),"
+        "  city            varchar(16),"
+        "  latitude        double precision NOT NULL,"
+        "  longitude       double precision NOT NULL,"
+        "  obstacle_type   varchar(18),"
+        "  quantity        integer,"
+        "  agl_ht          integer,"
+        "  amsl_ht         integer,"
+        "  lighting        varchar(1),"
+        "  horiz_accuracy  varchar(1),"
+        "  vert_accuracy   varchar(1),"
+        "  marking         varchar(1),"
+        "  faa_study_no    varchar(14),"
+        "  action          varchar(1),"
+        "  julian_date     varchar(7),"
+        "  geog            public.geometry)",
+        "CREATE INDEX faa_obstacles_geog_idx  ON public.faa_obstacles USING GIST (geog)",
+        "CREATE INDEX faa_obstacles_type_idx  ON public.faa_obstacles (obstacle_type)",
+        "CREATE INDEX faa_obstacles_state_idx ON public.faa_obstacles (state)",
+        "CREATE INDEX faa_obstacles_amsl_idx  ON public.faa_obstacles (amsl_ht)",
+        "CREATE INDEX faa_obstacles_agl_idx   ON public.faa_obstacles (agl_ht)",
     };
 
     for (const char* sql : statements) {

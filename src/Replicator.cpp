@@ -20,7 +20,7 @@ static void sigintHandler(int) { g_stop.store(true); }
 // ---- helpers ----
 
 static bool downloadFile(const std::string& url, const std::string& dest) {
-    std::string cmd = "curl -sf --retry 3 --retry-delay 5 -o " +
+    std::string cmd = "curl -sfL --retry 3 --retry-delay 5 -o " +
                       dest + " \"" + url + "\" 2>/dev/null";
     return system(cmd.c_str()) == 0;
 }
@@ -74,10 +74,17 @@ int64_t Replicator::remoteSequence() {
     std::ifstream f(tmp);
     std::string line;
     while (std::getline(f, line)) {
+        // Strip carriage return in case of Windows line endings (\r\n)
+        if (!line.empty() && line.back() == '\r') line.pop_back();
         if (line.find("sequenceNumber=") == 0) {
             return std::stoll(line.substr(15));
         }
     }
+    // Log the file contents to help diagnose unexpected formats
+    std::cerr << "[Replicator] state.txt contents:\n";
+    std::ifstream dbg(tmp);
+    std::string dbg_line;
+    while (std::getline(dbg, dbg_line)) std::cerr << "  " << dbg_line << "\n";
     throw std::runtime_error("Could not parse sequenceNumber from state.txt");
 }
 
