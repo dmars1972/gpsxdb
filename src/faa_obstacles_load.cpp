@@ -28,8 +28,8 @@ int main(int argc, char** argv) {
     if (server.empty() || database.empty() || user.empty()) {
         std::cerr << "Error: -s, -d, -u are required\n"; return 1;
     }
-    loadFAAObstacles(server, user, database, password, true);
+    bool ok = loadFAAObstacles(server, user, database, password, true);
     std::cout.flush();
     // _exit skips static destructor teardown that causes double-free with PROJ/pqxx
-    _exit(0);
+    _exit(ok ? 0 : 1);
 }

@@ -532,6 +532,33 @@ void NavDB::setReplicationSequence(int64_t seq) {
     }
 }
 
+int64_t NavDB::getExternalDataTimestamp(const std::string& name) {
+    try {
+        pqxx::work txn(*conn_);
+        auto r = txn.exec(
+            "SELECT last_modified FROM external_data_state WHERE name=$1",
+            pqxx::params{name});
+        txn.commit();
+        if (r.empty()) return -1;
+        return r[0][0].as<int64_t>();
+    } catch (...) {
+        return -1;
+    }
+}
+
+void NavDB::setExternalDataTimestamp(const std::string& name, int64_t epoch_seconds) {
+    try {
+        pqxx::work txn(*conn_);
+        txn.exec(
+            "INSERT INTO external_data_state(name, last_modified) VALUES($1, $2) "
+            "ON CONFLICT (name) DO UPDATE SET last_modified=$2, checked_at=now()",
+            pqxx::params{name, epoch_seconds});
+        txn.commit();
+    } catch (const std::exception& e) {
+        std::cerr << "[NavDB] setExternalDataTimestamp error: " << e.what() << "\n"; throw;
+    }
+}
+
 void NavDB::setAutovacuum(bool enabled) {
     try {
         pqxx::nontransaction txn(*conn_);
@@ -616,6 +643,7 @@ void NavDB::initializeSchema() {
         "DROP TABLE IF EXISTS public.roads",
         "DROP TABLE IF EXISTS public.relations",
         "DROP TABLE IF EXISTS public.osm_replication_state",
+        "DROP TABLE IF EXISTS public.external_data_state",
 
         "CREATE TABLE public.nodes ("
         "  id          bigint NOT NULL,"
@@ -667,6 +695,11 @@ void NavDB::initializeSchema() {
         "CREATE TABLE public.osm_replication_state ("
         "  id integer PRIMARY KEY DEFAULT 1 CHECK (id = 1),"
         "  sequence bigint NOT NULL)",
+
+        "CREATE TABLE public.external_data_state ("
+        "  name          varchar(32) PRIMARY KEY,"
+        "  last_modified bigint NOT NULL,"
+        "  checked_at    timestamptz NOT NULL DEFAULT now())",
 
         "CREATE INDEX node_tags_idx     ON public.node_tags     (id)",
         "CREATE INDEX way_tags_idx      ON public.way_tags      (id)",

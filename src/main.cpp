@@ -979,7 +979,8 @@ static int runDelta(const Args& args) {
         if (args.replication == "hour") gran = ReplicationGranularity::Hour;
         if (args.replication == "day")  gran = ReplicationGranularity::Day;
 
-        Replicator replicator(applier, db, gran);
+        Replicator replicator(applier, db, gran,
+                              args.server, args.user, args.database);
 
         if (args.sequence >= 0)
             replicator.setSequence(args.sequence);

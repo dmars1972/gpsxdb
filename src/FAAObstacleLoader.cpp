@@ -107,7 +107,7 @@ static std::string obstaclePointWKB(double lon, double lat) {
 // OBSTACLE_TYPE, QUANTITY, AGL_HT, AMSL_HT, LIGHTING, HOR_ACC, VER_ACC,
 // MARK_INDICATOR, FAA_STUDY_NO, ACTION, JULIAN_DATE
 
-void loadFAAObstacles(const std::string& server, const std::string& user,
+bool loadFAAObstacles(const std::string& server, const std::string& user,
                       const std::string& database, const std::string& password,
                       bool verbose) {
     const std::string csv_url  = "https://aeronav.faa.gov/Obst_Data/DAILY_DOF_CSV.ZIP";
@@ -119,7 +119,7 @@ void loadFAAObstacles(const std::string& server, const std::string& user,
 
     if (!downloadFile(csv_url, zip_path)) {
         std::cerr << "[FAA DOF] download failed from " << csv_url << "\n";
-        return;
+        return false;
     }
 
     if (verbose) std::cout << "Extracting...\n";
@@ -130,7 +130,7 @@ void loadFAAObstacles(const std::string& server, const std::string& user,
                       " 2>/dev/null";
     if (system(cmd.c_str()) != 0) {
         std::cerr << "[FAA DOF] unzip failed\n";
-        return;
+        return false;
     }
 
     // Find the CSV file (may not be named DOF.CSV exactly)
@@ -150,7 +150,7 @@ void loadFAAObstacles(const std::string& server, const std::string& user,
     std::ifstream f(actual_csv);
     if (!f.is_open()) {
         std::cerr << "[FAA DOF] cannot open CSV file at " << actual_csv << "\n";
-        return;
+        return false;
     }
 
     if (verbose) std::cout << "Loading FAA obstacle data from " << actual_csv << "...\n";
@@ -292,4 +292,5 @@ void loadFAAObstacles(const std::string& server, const std::string& user,
 
     // Cleanup temp files
     system(("rm -rf " + zip_path + " " + csv_dir).c_str());
+    return true;
 }

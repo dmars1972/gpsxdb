@@ -232,6 +232,12 @@ Continuously apply replication diffs from planet.openstreetmap.org:
   -f nodes.dat -n 20000000000
 ```
 
+While polling, osm_import also checks every 6 hours whether the OurAirports
+or FAA obstacle datasets have been refreshed upstream (via HTTP
+`Last-Modified`) and automatically reloads whichever has changed — no
+separate `-R airports`/`-R faa` run needed. The last-seen timestamp for each
+is tracked in the `external_data_state` table.
+
 Replication granularities: `minute` | `hour` | `day`
 
 ### FAA Obstacles standalone loader

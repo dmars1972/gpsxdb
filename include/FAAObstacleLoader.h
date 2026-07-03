@@ -11,7 +11,12 @@
 //
 // verbose: when false, suppresses progress output (used by osm_import;
 //          the standalone faa_obstacles_load tool passes true).
-void loadFAAObstacles(const std::string& server,
+//
+// Returns false if the download/extract failed (nothing is loaded in that
+// case — existing table contents are left untouched). Callers that need to
+// distinguish "genuinely reloaded" from "skipped" (e.g. before recording an
+// upstream-update checkpoint) must check the return value.
+bool loadFAAObstacles(const std::string& server,
                       const std::string& user,
                       const std::string& database,
                       const std::string& password = "",

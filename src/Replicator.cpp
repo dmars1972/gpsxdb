@@ -1,5 +1,7 @@
 #include "Replicator.h"
 #include "NavDB.h"
+#include "AirportsLoader.h"
+#include "FAAObstacleLoader.h"
 
 #include <iostream>
 #include <fstream>
@@ -8,10 +10,12 @@
 #include <stdexcept>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <thread>
 #include <chrono>
 #include <csignal>
 #include <atomic>
+#include <curl/curl.h>
 
 static std::atomic<bool> g_stop{false};
 
@@ -25,11 +29,32 @@ static bool downloadFile(const std::string& url, const std::string& dest) {
     return system(cmd.c_str()) == 0;
 }
 
+// HEAD request for the remote Last-Modified time (Unix epoch seconds).
+// Returns -1 if the server doesn't report one or the request fails.
+static long remoteLastModified(const std::string& url) {
+    CURL* curl = curl_easy_init();
+    if (!curl) return -1;
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
+    curl_easy_setopt(curl, CURLOPT_FILETIME, 1L);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+    CURLcode res = curl_easy_perform(curl);
+    long filetime = -1;
+    if (res == CURLE_OK) curl_easy_getinfo(curl, CURLINFO_FILETIME, &filetime);
+    curl_easy_cleanup(curl);
+    return filetime;
+}
+
 // ---- Replicator ----
 
 Replicator::Replicator(DeltaApplier& applier, NavDB& db,
-                        ReplicationGranularity granularity)
-    : applier_(applier), db_(db), granularity_(granularity) {}
+                        ReplicationGranularity granularity,
+                        std::string server, std::string user,
+                        std::string database, std::string password)
+    : applier_(applier), db_(db), granularity_(granularity),
+      server_(std::move(server)), user_(std::move(user)),
+      database_(std::move(database)), password_(std::move(password)) {}
 
 std::string Replicator::baseUrl() const {
     switch (granularity_) {
@@ -112,16 +137,86 @@ bool Replicator::downloadAndApply(int64_t seq) {
     }
 }
 
+// Sources checked for upstream updates. OurAirports refreshes all of its
+// CSVs together, so checking airports.csv alone is a reliable proxy for
+// "the OurAirports dataset was refreshed".
+namespace {
+struct ExternalSource { const char* name; const char* url; };
+const ExternalSource kExternalSources[] = {
+    {"airports",      "https://davidmegginson.github.io/ourairports-data/airports.csv"},
+    {"faa_obstacles", "https://aeronav.faa.gov/Obst_Data/DAILY_DOF_CSV.ZIP"},
+};
+}
+
+// CDNs serving these static files (GitHub Pages/Fastly for OurAirports, at
+// least) don't report a perfectly stable Last-Modified across requests —
+// observed jitter of ~1 second between consecutive HEAD requests with no
+// real content change. Both datasets only actually refresh roughly once a
+// day, so a tolerance well under that comfortably absorbs CDN jitter without
+// missing real updates.
+constexpr int64_t kUpdateToleranceSeconds = 300;
+
+void Replicator::checkExternalData() {
+    for (const auto& src : kExternalSources) {
+        long remote_mtime = remoteLastModified(src.url);
+        if (remote_mtime < 0) {
+            std::cerr << "[Replicator] could not check " << src.name
+                      << " for updates (no Last-Modified from server)\n";
+            continue;
+        }
+
+        int64_t known_mtime = db_.getExternalDataTimestamp(src.name);
+        if (known_mtime >= 0 &&
+            std::abs(remote_mtime - known_mtime) <= kUpdateToleranceSeconds)
+            continue;
+
+        std::cout << "[Replicator] " << src.name
+                  << " data has been updated upstream, reloading...\n";
+        try {
+            bool ok = (std::string(src.name) == "airports")
+                ? loadAirportsData(server_, user_, database_, password_, false)
+                : loadFAAObstacles(server_, user_, database_, password_, false);
+            if (ok) {
+                db_.setExternalDataTimestamp(src.name, remote_mtime);
+                std::cout << "[Replicator] " << src.name << " reload complete\n";
+            } else {
+                std::cerr << "[Replicator] " << src.name
+                          << " reload skipped (download failed), will retry next check\n";
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "[Replicator] " << src.name
+                      << " reload failed: " << e.what() << "\n";
+        }
+    }
+}
+
 void Replicator::poll(int interval_seconds) {
     signal(SIGINT, sigintHandler);
     signal(SIGTERM, sigintHandler);
 
-    std::cout << "Starting replication polling (interval=" 
+    std::cout << "Starting replication polling (interval="
               << interval_seconds << "s)\n";
     std::cout << "Press Ctrl+C to stop\n";
 
+    // Independent of OSM replication cadence, occasionally check whether
+    // OurAirports / FAA obstacle data has been refreshed upstream. Checked
+    // inline (not just between catch-up passes) so a long initial catch-up
+    // doesn't delay this by hours.
+    constexpr auto kExternalCheckInterval = std::chrono::hours(6);
+    auto last_external_check = std::chrono::steady_clock::now() - kExternalCheckInterval;
+
+    auto maybeCheckExternalData = [&] {
+        auto now = std::chrono::steady_clock::now();
+        if (now - last_external_check >= kExternalCheckInterval) {
+            checkExternalData();
+            last_external_check = now;
+        }
+    };
+
     while (!g_stop.load()) {
         try {
+            maybeCheckExternalData();
+
             int64_t local  = getSequence();
             int64_t remote = remoteSequence();
 
@@ -145,6 +240,7 @@ void Replicator::poll(int interval_seconds) {
                     g_stop.store(true);
                     break;
                 }
+                maybeCheckExternalData();
             }
 
         } catch (const std::exception& e) {

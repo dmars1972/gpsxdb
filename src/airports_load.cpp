@@ -27,8 +27,8 @@ int main(int argc, char** argv) {
         std::cerr << "Error: -s, -d, -u are required\n"; return 1;
     }
 
-    loadAirportsData(server, user, database, password);
+    bool ok = loadAirportsData(server, user, database, password);
     std::cout.flush();
     // _exit skips static destructor teardown that causes double-free with PROJ/pqxx
-    _exit(0);
+    _exit(ok ? 0 : 1);
 }
