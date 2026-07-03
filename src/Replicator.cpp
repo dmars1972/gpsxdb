@@ -114,6 +114,7 @@ bool Replicator::downloadAndApply(int64_t seq) {
 
 void Replicator::poll(int interval_seconds) {
     signal(SIGINT, sigintHandler);
+    signal(SIGTERM, sigintHandler);
 
     std::cout << "Starting replication polling (interval=" 
               << interval_seconds << "s)\n";
