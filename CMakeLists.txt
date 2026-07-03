@@ -130,3 +130,26 @@ target_link_libraries(faa_obstacles_load PRIVATE
 
 target_compile_options(faa_obstacles_load PRIVATE -O2 -Wall -Wextra -Wno-psabi)
 target_compile_features(faa_obstacles_load PRIVATE cxx_std_20)
+
+# ---- terrain_load ----
+# Shells out to raster2pgsql (part of the postgis package, already a
+# dependency) for GeoTIFF loading/reprojection — no GDAL linkage needed here.
+
+add_executable(terrain_load
+    src/terrain_load.cpp
+    src/TerrainLoader.cpp
+)
+
+target_include_directories(terrain_load PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${PQXX_INCLUDE_DIRS}
+)
+
+target_link_libraries(terrain_load PRIVATE
+    ${PQXX_LIBRARIES}
+    ${PQ_LIB}
+    ${CURL_LIB}
+)
+
+target_compile_options(terrain_load PRIVATE -O2 -Wall -Wextra -Wno-psabi)
+target_compile_features(terrain_load PRIVATE cxx_std_20)

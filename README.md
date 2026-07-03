@@ -58,6 +58,15 @@ Designed for full-planet and regional imports with a custom Mercator schema, par
 
 All geometry columns use PostGIS `geometry` type. The default SRID is EPSG:3857 (Web Mercator). Pass `-L` at import time to store as EPSG:4326 (WGS84) instead.
 
+### Terrain tables
+
+| Table | Description |
+|---|---|
+| `terrain` | USGS 3DEP elevation data as PostGIS `raster` tiles (US-only). Query point elevation via `ST_Value(rast, point)`. |
+| `terrain_tiles` | Tracks which 1-degree tiles have been loaded, for idempotent/incremental loading. |
+
+Loaded separately via the standalone `terrain_load` tool — see below.
+
 ---
 
 ## Dependencies
@@ -256,6 +265,34 @@ Replication granularities: `minute` | `hour` | `day`
 psql -h localhost -U <your_user_id> -d <your_db> -f create_airports.sql
 
 ./build/airports_load -s <your_db_server> -d <your_db> -u <your_user_id>
+```
+
+### Terrain elevation loader
+
+Loads USGS 3DEP 1 arc-second (~30m) elevation tiles into a PostGIS raster
+table (`terrain`), queryable via `ST_Value(rast, point)`. US-only coverage
+(3DEP doesn't cover outside the US/territories). Requires the `postgis`
+package (for `raster2pgsql`, already a listed dependency) and the
+`postgis_raster` extension (created automatically by `-I`, or run
+`CREATE EXTENSION postgis_raster;` manually otherwise).
+
+Takes an explicit bounding box rather than defaulting to full-CONUS —
+coverage area × resolution drives storage size directly (a few thousand
+tiles, 100+ GB, for the whole lower 48). Already-loaded tiles are tracked
+in `terrain_tiles` and skipped on re-run, so calling this again with an
+overlapping or expanded bbox only fetches what's new.
+
+```bash
+./build/terrain_load -s <your_db_server> -d <your_db> -u <your_user_id> \
+  --bbox <min_lon>,<min_lat>,<max_lon>,<max_lat>
+
+# Example: Colorado
+./build/terrain_load -s <your_db_server> -d <your_db> -u <your_user_id> \
+  --bbox -109,37,-102,41
+
+# Use WGS84 coordinates instead of Mercator
+./build/terrain_load -s <your_db_server> -d <your_db> -u <your_user_id> \
+  --bbox -109,37,-102,41 -4
 ```
 
 ---
