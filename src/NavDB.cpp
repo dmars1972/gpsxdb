@@ -10,11 +10,55 @@
 
 // ---- helpers ----
 
-static bool allAlphaNum(const std::string& s) {
-    if (s.empty()) return false;
-    for (unsigned char c : s)
-        if (!std::isalnum(c)) return false;
-    return true;
+// Drops invalid UTF-8 byte sequences and embedded NUL bytes (both of which
+// PostgreSQL's COPY protocol rejects with "invalid byte sequence for
+// encoding \"UTF8\"", aborting the whole stream). Keeps well-formed
+// multi-byte characters intact rather than rejecting the entire tag.
+static std::string sanitizeUtf8(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    size_t i = 0;
+    while (i < s.size()) {
+        unsigned char c = s[i];
+        int len;
+        if      ((c & 0x80) == 0x00) len = 1;
+        else if ((c & 0xE0) == 0xC0) len = 2;
+        else if ((c & 0xF0) == 0xE0) len = 3;
+        else if ((c & 0xF8) == 0xF0) len = 4;
+        else { ++i; continue; } // invalid leading byte
+
+        if (c == 0x00) { ++i; continue; } // NUL not allowed in postgres text
+
+        if (i + len > s.size()) { ++i; continue; } // truncated sequence
+
+        bool valid = true;
+        for (int j = 1; j < len; ++j) {
+            unsigned char cc = s[i + j];
+            if ((cc & 0xC0) != 0x80) { valid = false; break; }
+        }
+        if (!valid) { ++i; continue; }
+
+        out.append(s, i, len);
+        i += len;
+    }
+    return out;
+}
+
+// Sanitizes and truncates to at most 256 codepoints (matching the
+// varchar(256) tag columns), cutting on a UTF-8 boundary so the result
+// stays valid.
+static std::string sanitizeTag(const std::string& s) {
+    std::string clean = sanitizeUtf8(s);
+    size_t count = 0, i = 0;
+    while (i < clean.size() && count < 256) {
+        unsigned char c = clean[i];
+        int len = (c & 0x80) == 0x00 ? 1 :
+                  (c & 0xE0) == 0xC0 ? 2 :
+                  (c & 0xF0) == 0xE0 ? 3 : 4;
+        i += len;
+        ++count;
+    }
+    return clean.substr(0, i);
 }
 
 // ---- NavDB ----
@@ -56,22 +100,25 @@ NavDB::~NavDB() {
 
 void NavDB::addTags(int64_t id, const Tags& tags) {
     for (const auto& [k, v] : tags) {
-        if (!allAlphaNum(k) || !allAlphaNum(v)) continue;
-        tag_buf_.push_back({id, k, v});
+        std::string ck = sanitizeTag(k), cv = sanitizeTag(v);
+        if (ck.empty() || cv.empty()) continue;
+        tag_buf_.push_back({id, std::move(ck), std::move(cv)});
     }
 }
 
 void NavDB::addWayTags(int64_t id, const Tags& tags) {
     for (const auto& [k, v] : tags) {
-        if (!allAlphaNum(k) || !allAlphaNum(v)) continue;
-        way_tag_buf_.push_back({id, k, v});
+        std::string ck = sanitizeTag(k), cv = sanitizeTag(v);
+        if (ck.empty() || cv.empty()) continue;
+        way_tag_buf_.push_back({id, std::move(ck), std::move(cv)});
     }
 }
 
 void NavDB::addAreaTags(int64_t id, const Tags& tags) {
     for (const auto& [k, v] : tags) {
-        if (!allAlphaNum(k) || !allAlphaNum(v)) continue;
-        area_tag_buf_.push_back({id, k, v});
+        std::string ck = sanitizeTag(k), cv = sanitizeTag(v);
+        if (ck.empty() || cv.empty()) continue;
+        area_tag_buf_.push_back({id, std::move(ck), std::move(cv)});
     }
 }
 
