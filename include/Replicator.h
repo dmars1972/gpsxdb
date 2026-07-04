@@ -10,8 +10,12 @@ enum class ReplicationGranularity { Minute, Hour, Day };
 
 class Replicator {
 public:
+    // server/user/database/password are only needed to reload OurAirports /
+    // FAA obstacle data when checkExternalData() detects an upstream update.
     Replicator(DeltaApplier& applier, NavDB& db,
-               ReplicationGranularity granularity);
+               ReplicationGranularity granularity,
+               std::string server, std::string user,
+               std::string database, std::string password = "");
 
     // Apply a single local .osc/.osc.gz file
     void applyFile(const std::string& path);
@@ -28,9 +32,16 @@ private:
     DeltaApplier&          applier_;
     NavDB&                 db_;
     ReplicationGranularity granularity_;
+    std::string            server_, user_, database_, password_;
 
     std::string baseUrl() const;
     std::string sequenceToPath(int64_t seq) const;
     bool        downloadAndApply(int64_t seq);
     int64_t     remoteSequence();
+
+    // Checks whether the OurAirports / FAA obstacle datasets have been
+    // refreshed upstream (via HTTP Last-Modified) and reloads whichever
+    // has changed. Called periodically from poll(), independent of OSM
+    // replication cadence.
+    void checkExternalData();
 };

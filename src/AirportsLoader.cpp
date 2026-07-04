@@ -347,7 +347,7 @@ static void loadNavaids(pqxx::connection& conn, const std::string& path, bool ve
 
 // ---- Public entry point ----
 
-void loadAirportsData(const std::string& server, const std::string& user,
+bool loadAirportsData(const std::string& server, const std::string& user,
                       const std::string& database, const std::string& password,
                       bool verbose) {
     const std::string base = "https://davidmegginson.github.io/ourairports-data/";
@@ -367,7 +367,7 @@ void loadAirportsData(const std::string& server, const std::string& user,
     for (auto& f : files) {
         if (verbose) { std::cout << "  " << f.name << "... "; std::cout.flush(); }
         if (!downloadAP(f.url, f.dest)) {
-            std::cerr << "FAILED — skipping airports load\n"; return;
+            std::cerr << "FAILED — skipping airports load\n"; return false;
         }
         if (verbose) std::cout << "OK\n";
     }
@@ -379,6 +379,15 @@ void loadAirportsData(const std::string& server, const std::string& user,
     pqxx::connection conn(connstr);
     { pqxx::work txn(conn); txn.exec("SET synchronous_commit = off"); txn.commit(); }
 
+    // Truncate before reload so this is safe to call more than once against
+    // a live database (e.g. periodic upstream-update checks in poll mode),
+    // not just once against freshly-created empty tables.
+    {
+        pqxx::work txn(conn);
+        txn.exec("TRUNCATE countries, regions, airports, tags, frequencies, runways, navaids");
+        txn.commit();
+    }
+
     if (verbose) std::cout << "Loading airports data...\n";
     loadCountries  (conn, files[0].dest, verbose);
     loadRegions    (conn, files[1].dest, verbose);
@@ -387,4 +396,5 @@ void loadAirportsData(const std::string& server, const std::string& user,
     loadRunways    (conn, files[4].dest, verbose);
     loadNavaids    (conn, files[5].dest, verbose);
     if (verbose) std::cout << "Airports data loaded.\n";
+    return true;
 }

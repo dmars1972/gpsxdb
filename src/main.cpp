@@ -22,6 +22,7 @@
 #include "DeltaApplier.h"
 #include "Replicator.h"
 #include "AirportsLoader.h"
+#include "FAAObstacleLoader.h"
 #include <stdexcept>
 #include <algorithm>
 #include <iomanip>
@@ -74,7 +75,7 @@ private:
 
 // ---- Status ----
 
-enum class Phase { Nodes, Merging, Ways, Reindexing, Indexing, Relations, AirportsLoading, Vacuuming, Done };
+enum class Phase { Nodes, Merging, Ways, Reindexing, Indexing, Relations, AirportsLoading, FAALoading, Vacuuming, Done };
 
 // Current time in microseconds since epoch — matches phase_start_us units
 static int64_t nowUs() {
@@ -91,6 +92,7 @@ static const char* phaseName(Phase p) {
         case Phase::Indexing:    return "Spatial Indexing";
         case Phase::Relations:  return "Relations";
         case Phase::AirportsLoading: return "Loading Airports";
+        case Phase::FAALoading:     return "Loading FAA Obstacles";
         case Phase::Vacuuming:  return "Vacuuming";
         case Phase::Done:       return "Done";
     }
@@ -335,6 +337,7 @@ static Args parseArgs(int argc, char** argv) {
             else if (ph == "relations")  a.resume_phase = Phase::Relations;
             else if (ph == "indexing")   a.resume_phase = Phase::Indexing;
             else if (ph == "airports")   a.resume_phase = Phase::AirportsLoading;
+            else if (ph == "faa")        a.resume_phase = Phase::FAALoading;
             else if (ph == "vacuum")     a.resume_phase = Phase::Vacuuming;
             else { std::cerr << "Unknown resume phase: " << ph << "\n"; std::cerr.flush(); _exit(1); }
         }
@@ -365,7 +368,7 @@ static Args parseArgs(int argc, char** argv) {
                 "    -n max_node_id     (default 20000000000)\n"
                 "    -S shard_dir       Directory for shard files (default .)\n"
                 "    -R phase           Resume at phase: nodes|merge|ways|reindex|\n"
-                "                       relations|indexing|airports|vacuum (default nodes)\n"
+                "                       relations|indexing|airports|faa|vacuum (default nodes)\n"
                 "                       Prerequisites for the chosen phase must\n"
                 "                       already be complete (e.g. -R ways requires\n"
                 "                       nodes.dat to already contain merged data and\n"
@@ -948,9 +951,12 @@ void statusThread(const Status& s, std::atomic<bool>& done,
 // ---- Delta / Poll entry point ----
 
 static int runDelta(const Args& args) {
-    // Open existing mmap (must already exist from initial import)
-    // Use num_shards=1 since we're not writing shards — just reading merged file
-    OSMMMap osmmap(args.nodes_file, args.max_node_id, 1, args.shard_dir);
+    // Open existing merged mmap read-only — delta mode only needs select()
+    // for node coordinate lookups, never writes to shards.
+    // open_shards_for_write=false skips shard file open/creation entirely.
+    OSMMMap osmmap(args.nodes_file, args.max_node_id, 1, args.shard_dir,
+                   /*open_shards_for_write=*/false);
+    osmmap.setRandomAccessHint();
 
     std::mutex db_flush_mu;
     NavDB db(0, args.server, args.user, args.database, db_flush_mu);
@@ -973,7 +979,8 @@ static int runDelta(const Args& args) {
         if (args.replication == "hour") gran = ReplicationGranularity::Hour;
         if (args.replication == "day")  gran = ReplicationGranularity::Day;
 
-        Replicator replicator(applier, db, gran);
+        Replicator replicator(applier, db, gran,
+                              args.server, args.user, args.database);
 
         if (args.sequence >= 0)
             replicator.setSequence(args.sequence);
@@ -1028,16 +1035,17 @@ int main(int argc, char** argv) {
     auto start = std::chrono::steady_clock::now();
     std::mutex db_flush_mu_early;
 
-    // -R indexing / -R airports / -R vacuum: no PBF processing needed at all
+    // -R indexing / -R airports / -R faa / -R vacuum: no PBF processing needed at all
     if (args.resume_phase == Phase::Indexing || args.resume_phase == Phase::AirportsLoading
-        || args.resume_phase == Phase::Vacuuming) {
+        || args.resume_phase == Phase::FAALoading || args.resume_phase == Phase::Vacuuming) {
         if (args.resume_phase == Phase::Indexing) {
             LOGI(-1, "resume: creating GiST spatial indexes");
             NavDB db(0, args.server, args.user, args.database, db_flush_mu_early);
             db.createGistIndexes();
             LOGI(-1, "GiST indexes done");
         }
-        if (args.resume_phase == Phase::Indexing || args.resume_phase == Phase::AirportsLoading) {
+        if (args.resume_phase == Phase::Indexing || args.resume_phase == Phase::AirportsLoading
+            || args.resume_phase == Phase::FAALoading) {
             LOGI(-1, "resume: loading airports data");
             {
                 NavDB db(0, args.server, args.user, args.database, db_flush_mu_early);
@@ -1045,6 +1053,11 @@ int main(int argc, char** argv) {
             }
             loadAirportsData(args.server, args.user, args.database, "", false);
             LOGI(-1, "airports data loaded");
+        }
+        if (args.resume_phase == Phase::FAALoading || args.resume_phase == Phase::Vacuuming) {
+            LOGI(-1, "resume: loading FAA obstacle data");
+            loadFAAObstacles(args.server, args.user, args.database, "", false);
+            LOGI(-1, "FAA obstacle data loaded");
         }
         LOGI(-1, "resume: running VACUUM ANALYZE on all tables");
         {
@@ -1305,8 +1318,12 @@ int main(int argc, char** argv) {
     loadAirportsData(args.server, args.user, args.database, "", false);
     LOGI(-1, "airports data loaded");
 
-    status.advancePhase(Phase::AirportsLoading, Phase::Vacuuming);
-    LOGI(-1, "running VACUUM ANALYZE on all tables");
+    status.advancePhase(Phase::AirportsLoading, Phase::FAALoading);
+    LOGI(-1, "loading FAA obstacle data");
+    loadFAAObstacles(args.server, args.user, args.database, "", false);
+    LOGI(-1, "FAA obstacle data loaded");
+
+    status.advancePhase(Phase::FAALoading, Phase::Vacuuming);
     {
         NavDB db(0, args.server, args.user, args.database, db_flush_mu);
         db.vacuumAnalyze();

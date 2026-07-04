@@ -50,6 +50,12 @@ Designed for full-planet and regional imports with a custom Mercator schema, par
 | `regions` | Region reference data |
 | `tags` | Unified key/value tag table for airports and navaids |
 
+### FAA obstacle tables
+
+| Table | Description |
+|---|---|
+| `faa_obstacles` | FAA Digital Obstacle File — all known man-made obstacles affecting aeronautical charting (towers, antennas, wind turbines, buildings, etc.) with AGL/AMSL heights, lighting, marking, accuracy codes, and point geometry |
+
 All geometry columns use PostGIS `geometry` type. The default SRID is EPSG:3857 (Web Mercator). Pass `-L` at import time to store as EPSG:4326 (WGS84) instead.
 
 ---
@@ -197,7 +203,7 @@ If an import is interrupted, resume at any phase without reprocessing earlier on
 ./build/osm_import -s <your_db_server> -d <your_db> -u <your_user_id> -R vacuum
 ```
 
-Resume phases: `nodes` | `merge` | `ways` | `reindex` | `relations` | `indexing` | `airports` | `vacuum`
+Resume phases: `nodes` | `merge` | `ways` | `reindex` | `relations` | `indexing` | `airports` | `faa` | `vacuum`
 
 On the first successful import, two checkpoint files are written alongside `nodes.dat`:
 - `nodes.dat.offset` — byte offset of first non-node blob in the PBF (skips node section on resume)
@@ -226,7 +232,22 @@ Continuously apply replication diffs from planet.openstreetmap.org:
   -f nodes.dat -n 20000000000
 ```
 
+While polling, osm_import also checks every 6 hours whether the OurAirports
+or FAA obstacle datasets have been refreshed upstream (via HTTP
+`Last-Modified`) and automatically reloads whichever has changed — no
+separate `-R airports`/`-R faa` run needed. The last-seen timestamp for each
+is tracked in the `external_data_state` table.
+
 Replication granularities: `minute` | `hour` | `day`
+
+### FAA Obstacles standalone loader
+
+```bash
+./build/faa_obstacles_load -s <your_db_server> -d <your_db> -u <your_user_id>
+
+# Use WGS84 coordinates instead of Mercator
+./build/faa_obstacles_load -s <your_db_server> -d <your_db> -u <your_user_id> -4
+```
 
 ### OurAirports standalone loader
 
@@ -272,6 +293,7 @@ During import, a status line is printed to stdout once per second:
 | `[Relations]` | Processing relation members, merging geometries, writing to `relations`/`roads` |
 | `[Spatial Indexing]` | Building GiST spatial indexes on all geometry columns |
 | `[Loading Airports]` | Downloading and loading OurAirports data |
+| `[Loading FAA Obstacles]` | Downloading and loading FAA Digital Obstacle File |
 | `[Vacuuming]` | Running `VACUUM ANALYZE` on all tables |
 | `[Done]` | Import complete |
 
@@ -474,6 +496,7 @@ further.
 
 - **OSM planet/extracts**: [planet.openstreetmap.org](https://planet.openstreetmap.org) or [Geofabrik](https://download.geofabrik.de)
 - **OurAirports**: [davidmegginson.github.io/ourairports-data](https://davidmegginson.github.io/ourairports-data/) (downloaded automatically at import time)
+- **FAA Digital Obstacle File**: [aeronav.faa.gov/Obst_Data/DDOF.zip](https://aeronav.faa.gov/Obst_Data/DDOF.zip) — daily-updated file of all US man-made obstacles affecting aeronautical charting (downloaded automatically at import time)
 
 ---
 

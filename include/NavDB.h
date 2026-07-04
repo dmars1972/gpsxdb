@@ -100,6 +100,12 @@ public:
     int64_t getReplicationSequence();
     void    setReplicationSequence(int64_t seq);
 
+    // Last-known remote modification time (Unix epoch seconds) for an
+    // external dataset (e.g. "airports", "faa_obstacles"), used to detect
+    // upstream updates during poll mode. Returns -1 if never recorded.
+    int64_t getExternalDataTimestamp(const std::string& name);
+    void    setExternalDataTimestamp(const std::string& name, int64_t epoch_seconds);
+
     // Drops and recreates all OSM and OurAirports tables from scratch.
     // Equivalent to running create.sql + create_airports.sql.
     // Called when -I is passed on the command line.

@@ -173,3 +173,36 @@ CREATE INDEX tags_type_idx        ON public.tags (airport_ident, entity_type);
 -- Regions / Countries
 CREATE INDEX regions_country_idx  ON public.regions  (iso_country);
 CREATE INDEX regions_code_idx     ON public.regions  (code);
+
+-- FAA Digital Obstacle File (DOF)
+-- Updated every 56 days from https://aeronav.faa.gov/Obst_Data/DOF_<date>.zip
+-- Coordinates are WGS84. Heights in feet.
+DROP TABLE IF EXISTS public.faa_obstacles;
+CREATE TABLE public.faa_obstacles (
+    id              serial PRIMARY KEY,
+    oas_number      varchar(9)  NOT NULL,  -- e.g. "48-123456"
+    verified        boolean     NOT NULL,  -- true=verified (O), false=unverified (U)
+    country         varchar(2),
+    state           varchar(2),
+    city            varchar(16),
+    latitude        double precision NOT NULL,
+    longitude       double precision NOT NULL,
+    obstacle_type   varchar(18),
+    quantity        integer,
+    agl_ht          integer,              -- height above ground level (feet)
+    amsl_ht         integer,             -- height above mean sea level (feet)
+    lighting        varchar(1),
+    horiz_accuracy  varchar(1),
+    vert_accuracy   varchar(1),
+    marking         varchar(1),
+    faa_study_no    varchar(14),
+    action          varchar(1),
+    julian_date     varchar(7),
+    geog            public.geometry      -- point in SRID matching import mode
+);
+
+CREATE INDEX faa_obstacles_geog_idx  ON public.faa_obstacles USING GIST (geog);
+CREATE INDEX faa_obstacles_type_idx  ON public.faa_obstacles (obstacle_type);
+CREATE INDEX faa_obstacles_state_idx ON public.faa_obstacles (state);
+CREATE INDEX faa_obstacles_amsl_idx  ON public.faa_obstacles (amsl_ht);
+CREATE INDEX faa_obstacles_agl_idx   ON public.faa_obstacles (agl_ht);

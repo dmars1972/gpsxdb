@@ -158,7 +158,7 @@ void DeltaApplier::createNode(NodeEntry& n) {
     auto [mx, my] = toMercator(n.lon, n.lat);
     n.lon_m = mx; n.lat_m = my;
     n.geog_wkb_hex = pointWKB(n.lon, n.lat);
-    osmmap_.insert(0, n.id, n.lon_m, n.lat_m);
+    osmmap_.update(n.id, n.lon_m, n.lat_m);
     db_.insertNode(n.id, n.name, n.lon_m, n.lat_m, n.tags, n.geog_wkb_hex);
 }
 
@@ -168,7 +168,7 @@ void DeltaApplier::modifyNode(NodeEntry& n) {
     n.geog_wkb_hex = pointWKB(n.lon, n.lat);
 
     // Update mmap
-    osmmap_.insert(0, n.id, n.lon_m, n.lat_m);
+    osmmap_.update(n.id, n.lon_m, n.lat_m);
 
     // Update DB row
     db_.updateNode(n.id, n.name, n.lon_m, n.lat_m, n.tags, n.geog_wkb_hex);
