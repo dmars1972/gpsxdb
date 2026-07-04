@@ -3,10 +3,14 @@
 #include <iostream>
 #include <fstream>
 #include <sstream>
+#include <iomanip>
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
 #include <vector>
+#include <thread>
+#include <atomic>
+#include <mutex>
 #include <curl/curl.h>
 
 namespace {
@@ -61,10 +65,15 @@ std::vector<Tile> tilesForBBox(double min_lon, double min_lat,
 
 } // namespace
 
+namespace {
+constexpr double kFeetPerMeter = 3.28084;
+} // namespace
+
 bool loadTerrain(const std::string& server, const std::string& user,
                  const std::string& database, const std::string& password,
                  double min_lon, double min_lat, double max_lon, double max_lat,
-                 int dest_srid, bool verbose) {
+                 int dest_srid, int band_ft, double simplify_m, int band_threads,
+                 bool verbose) {
     auto tiles = tilesForBBox(min_lon, min_lat, max_lon, max_lat);
     if (tiles.empty()) {
         std::cerr << "[Terrain] bounding box produced no tiles\n";
@@ -108,6 +117,9 @@ bool loadTerrain(const std::string& server, const std::string& user,
 
     if (to_load.empty()) {
         if (verbose) std::cout << "All requested tiles already loaded.\n";
+        if (band_ft > 0)
+            buildTerrainBands(server, user, database, password, band_ft, simplify_m,
+                              band_threads, verbose);
         return true;
     }
 
@@ -179,5 +191,172 @@ bool loadTerrain(const std::string& server, const std::string& user,
     if (verbose)
         std::cout << "Terrain data loaded (" << downloaded_tiles.size()
                   << " new tile(s)).\n";
+
+    if (band_ft > 0)
+        buildTerrainBands(server, user, database, password, band_ft, simplify_m,
+                          band_threads, verbose);
+
+    return true;
+}
+
+bool buildTerrainBands(const std::string& server, const std::string& user,
+                       const std::string& database, const std::string& password,
+                       int band_ft, double simplify_m, int band_threads, bool verbose) {
+    std::string connstr = "host=" + server + " dbname=" + database +
+                          " user=" + user + " sslmode=disable";
+    if (!password.empty()) connstr += " password=" + password;
+    pqxx::connection conn(connstr);
+
+    {
+        pqxx::work txn(conn);
+        txn.exec(
+            "CREATE TABLE IF NOT EXISTS public.terrain_bands ("
+            "  id serial PRIMARY KEY,"
+            "  band_min_ft integer NOT NULL,"
+            "  band_max_ft integer NOT NULL,"
+            "  geog public.geometry)");
+        txn.exec(
+            "CREATE INDEX IF NOT EXISTS terrain_bands_geog_idx "
+            "ON public.terrain_bands USING GIST (geog)");
+        txn.commit();
+    }
+
+    double min_m, max_m;
+    {
+        pqxx::work txn(conn);
+        auto r = txn.exec(
+            "SELECT min(s.min), max(s.max) "
+            "FROM public.terrain t, LATERAL ST_SummaryStats(t.rast, 1) s");
+        txn.commit();
+        if (r.empty() || r[0][0].is_null()) {
+            if (verbose) std::cout << "[Terrain] no terrain data loaded, skipping band generation\n";
+            return false;
+        }
+        min_m = r[0][0].as<double>();
+        max_m = r[0][1].as<double>();
+    }
+
+    // Round the observed elevation range out to whole bands so every real
+    // value falls strictly inside some (lo, hi] bucket.
+    int lo_ft = static_cast<int>(std::floor(min_m * kFeetPerMeter / band_ft)) * band_ft;
+    int hi_ft = static_cast<int>(std::ceil(max_m * kFeetPerMeter / band_ft)) * band_ft;
+    int n_bands = (hi_ft - lo_ft) / band_ft;
+    if (n_bands < 1) n_bands = 1;
+
+    if (verbose)
+        std::cout << "[Terrain] building " << n_bands << " elevation band(s) ("
+                  << band_ft << "ft each, " << lo_ft << "ft to " << hi_ft
+                  << "ft), merging across all loaded tiles...\n";
+
+    try {
+        pqxx::work txn(conn);
+        txn.exec("TRUNCATE public.terrain_bands");
+        txn.commit();
+    } catch (const std::exception& e) {
+        std::cerr << "[Terrain] buildTerrainBands error truncating: " << e.what() << "\n";
+        return false;
+    }
+
+    std::ostringstream frag_expr, geom_expr;
+    if (simplify_m > 0) {
+        // Simplify each small per-chunk fragment BEFORE the union, not just
+        // the final unioned shape. Rugged terrain (e.g. foothills/canyons)
+        // fragments into thousands of tiny raster-pixel-aligned polygons —
+        // unioning them raw is fine (~seconds), but ST_SimplifyPreserveTopology
+        // on the resulting huge multipolygon can pathologically hang (GEOS
+        // noding blowup on that many collinear pixel-edge vertices), badly
+        // enough that even Postgres's own statement_timeout can't cancel it
+        // (stuck inside a single uninterruptible GEOS call). Pre-simplifying
+        // each small fragment first (cheap — each is a handful of vertices)
+        // cuts total vertex count entering the union by ~75% in testing,
+        // which keeps the subsequent union+simplify fast instead of hanging.
+        frag_expr << "ST_SimplifyPreserveTopology(d.geom, " << simplify_m << ")";
+        geom_expr << "ST_SimplifyPreserveTopology(geom, " << simplify_m << ")";
+    } else {
+        frag_expr << "d.geom";
+        geom_expr << "geom";
+    }
+
+    // One band per query rather than one all-bands statement: each band's
+    // reclass isolates just its own elevation range (mapped to 1, everything
+    // else to nodata), dumps to polygons, unions across every raster
+    // row/tile so a feature spanning multiple tiles or 256x256 chunks comes
+    // out seamless, simplifies (smooths the 30m pixel-edge staircase), then
+    // ST_Dump splits the (possibly disjoint) result into indexable rows.
+    //
+    // Bands are independent (disjoint band_min_ft/band_max_ft, no ON
+    // CONFLICT/merge step), so — same pattern as main.cpp's node/way worker
+    // pools — a fixed pool of threads pulls the next unprocessed band off a
+    // shared atomic counter, each with its own pqxx::connection. Unlike the
+    // node/way workers there's no shared db_flush_mu equivalent: nothing here
+    // needs cross-thread serialization.
+    std::atomic<int> next_band{0};
+    std::atomic<long long> total_polygons{0};
+    std::mutex io_mu;  // guards stdout/stderr so progress lines don't interleave
+
+    auto worker = [&]() {
+        pqxx::connection wconn(connstr);
+        while (true) {
+            int i = next_band.fetch_add(1, std::memory_order_relaxed);
+            if (i >= n_bands) break;
+
+            int band_min = lo_ft + i * band_ft;
+            int band_max = lo_ft + (i + 1) * band_ft;
+            double band_lo_m = band_min / kFeetPerMeter;
+            double band_hi_m = band_max / kFeetPerMeter;
+
+            std::ostringstream reclass;
+            reclass << std::fixed << std::setprecision(4)
+                    << "(-999999-" << band_lo_m << "]:0, "
+                    << "(" << band_lo_m << "-" << band_hi_m << "]:1, "
+                    << "(" << band_hi_m << "-999999]:0";
+
+            std::ostringstream sql;
+            sql <<
+                "INSERT INTO public.terrain_bands(band_min_ft, band_max_ft, geog) "
+                "SELECT " << band_min << ", " << band_max << ", "
+                          "(ST_Dump(" << geom_expr.str() << ")).geom "
+                "FROM ("
+                "  SELECT ST_Union(" << frag_expr.str() << ") AS geom "
+                "  FROM public.terrain t, "
+                "       LATERAL ST_DumpAsPolygons("
+                "         ST_Reclass(t.rast, 1, '" << reclass.str() << "', '8BUI', 0), 1"
+                "       ) d "
+                "  WHERE d.val = 1"
+                ") merged";
+
+            try {
+                pqxx::work txn(wconn);
+                auto r = txn.exec(sql.str());
+                txn.commit();
+                long long n = r.affected_rows();
+                total_polygons.fetch_add(n, std::memory_order_relaxed);
+                if (verbose) {
+                    std::lock_guard lk(io_mu);
+                    std::cout << "  band " << (i + 1) << "/" << n_bands
+                              << " (" << band_min << "-" << band_max << "ft): "
+                              << n << " polygon(s)\n";
+                }
+            } catch (const std::exception& e) {
+                std::lock_guard lk(io_mu);
+                std::cerr << "[Terrain] buildTerrainBands band " << (i + 1) << "/" << n_bands
+                          << " (" << band_min << "-" << band_max << "ft) error: "
+                          << e.what() << "\n";
+                // Continue with remaining bands rather than losing the whole rebuild.
+            }
+        }
+    };
+
+    int nthreads = std::max(1, std::min(band_threads, n_bands));
+    if (verbose)
+        std::cout << "[Terrain] using " << nthreads << " thread(s)\n";
+    std::vector<std::thread> workers;
+    workers.reserve(nthreads);
+    for (int t = 0; t < nthreads; ++t) workers.emplace_back(worker);
+    for (auto& w : workers) w.join();
+
+    if (verbose)
+        std::cout << "[Terrain] terrain_bands rebuilt: " << total_polygons.load()
+                  << " polygon(s) across " << n_bands << " band(s)\n";
     return true;
 }

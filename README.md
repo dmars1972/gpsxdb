@@ -64,6 +64,7 @@ All geometry columns use PostGIS `geometry` type. The default SRID is EPSG:3857 
 |---|---|
 | `terrain` | USGS 3DEP elevation data as PostGIS `raster` tiles (US-only). Query point elevation via `ST_Value(rast, point)`. |
 | `terrain_tiles` | Tracks which 1-degree tiles have been loaded, for idempotent/incremental loading. |
+| `terrain_bands` | Elevation-band area polygons (`band_min_ft`, `band_max_ft`, `geog`) derived from `terrain` — a color-tint layer suited to a sectional-chart-style terrain display, much smaller than the raw raster. Rebuilt from scratch each time `terrain_load` runs (unless `--no-bands`). |
 
 Loaded separately via the standalone `terrain_load` tool — see below.
 
@@ -293,6 +294,27 @@ overlapping or expanded bbox only fetches what's new.
 # Use WGS84 coordinates instead of Mercator
 ./build/terrain_load -s <your_db_server> -d <your_db> -u <your_user_id> \
   --bbox -109,37,-102,41 -4
+```
+
+After loading tiles, `terrain_load` also (re)builds `terrain_bands` — elevation-band
+area polygons derived from the whole `terrain` raster (not just newly-loaded tiles),
+so a feature spanning multiple tiles comes out as one seamless shape. This is a
+full rebuild each run (cost grows with total coverage, not just what's new), split
+across a worker-thread pool (same pattern as the main import's node/way pools —
+each thread owns its own connection, no shared-lock contention since bands are
+disjoint). Each polygon is simplified before *and* after the cross-tile union —
+simplifying only the final huge unioned shape can pathologically hang over rugged
+terrain (thousands of tiny raster-pixel-aligned fragments), so small per-chunk
+fragments are smoothed first, which also cuts total storage substantially.
+
+```bash
+# Override the 500ft default band width, simplification tolerance, or thread count
+./build/terrain_load -s <your_db_server> -d <your_db> -u <your_user_id> \
+  --bbox -109,37,-102,41 --band-ft 1000 --simplify-m 100 --band-threads 8
+
+# Skip band generation entirely (raw raster only)
+./build/terrain_load -s <your_db_server> -d <your_db> -u <your_user_id> \
+  --bbox -109,37,-102,41 --no-bands
 ```
 
 ---

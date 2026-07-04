@@ -876,6 +876,7 @@ void NavDB::initializeSchema() {
         "CREATE EXTENSION IF NOT EXISTS postgis_raster",
         "DROP TABLE IF EXISTS public.terrain",
         "DROP TABLE IF EXISTS public.terrain_tiles",
+        "DROP TABLE IF EXISTS public.terrain_bands",
     };
 
     for (const char* sql : statements) {
