@@ -877,6 +877,7 @@ void NavDB::initializeSchema() {
         "DROP TABLE IF EXISTS public.terrain",
         "DROP TABLE IF EXISTS public.terrain_tiles",
         "DROP TABLE IF EXISTS public.terrain_bands",
+        "DROP TABLE IF EXISTS public.terrain_frags_staging",
     };
 
     for (const char* sql : statements) {

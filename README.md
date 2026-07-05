@@ -310,7 +310,7 @@ fragments are smoothed first, which also cuts total storage substantially.
 ```bash
 # Override the 500ft default band width, simplification tolerance, or thread count
 ./build/terrain_load -s <your_db_server> -d <your_db> -u <your_user_id> \
-  --bbox -109,37,-102,41 --band-ft 1000 --simplify-m 100 --band-threads 8
+  --bbox -109,37,-102,41 --band-ft 1000 --simplify-m 100 --threads 8
 
 # Skip band generation entirely (raw raster only)
 ./build/terrain_load -s <your_db_server> -d <your_db> -u <your_user_id> \
