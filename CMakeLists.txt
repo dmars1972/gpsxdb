@@ -32,6 +32,7 @@ add_executable(osm_import
     src/Replicator.cpp
     src/AirportsLoader.cpp
     src/FAAObstacleLoader.cpp
+    src/WMMLoader.cpp
     proto/fileformat.proto
     proto/osmformat.proto
 )

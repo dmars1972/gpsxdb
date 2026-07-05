@@ -9,6 +9,15 @@
 #include <thread>
 #include <atomic>
 #include <mutex>
+#include <ctime>
+
+double currentDecimalYear() {
+    std::time_t t = std::time(nullptr);
+    std::tm tm_utc{};
+    gmtime_r(&t, &tm_utc);
+    int year = tm_utc.tm_year + 1900;
+    return year + tm_utc.tm_yday / 365.25;
+}
 
 namespace {
 

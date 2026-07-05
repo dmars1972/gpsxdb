@@ -9,18 +9,7 @@
 #include <string>
 #include <sstream>
 #include <algorithm>
-#include <ctime>
 #include <unistd.h>
-
-namespace {
-double currentDecimalYear() {
-    std::time_t t = std::time(nullptr);
-    std::tm tm_utc{};
-    gmtime_r(&t, &tm_utc);
-    int year = tm_utc.tm_year + 1900;
-    return year + tm_utc.tm_yday / 365.25;
-}
-} // namespace
 
 int main(int argc, char** argv) {
     std::string server, database, user, password;
@@ -28,7 +17,7 @@ int main(int argc, char** argv) {
     int dest_srid = 3857;
     double year = currentDecimalYear();
     double grid_deg = 0.25;
-    double band_deg = 1.0;
+    double band_deg = 0.25;
     double simplify_m = 50.0;
     int threads = 4;
 
@@ -60,7 +49,7 @@ int main(int argc, char** argv) {
                          "                 [-4 (WGS84 instead of Mercator for wmm_bands)]\n"
                          "                 [--year <decimal year>, default: today]\n"
                          "                 [--grid-deg <deg>, default 0.25]\n"
-                         "                 [--band-deg <deg>, default 1.0] [--no-bands]\n"
+                         "                 [--band-deg <deg>, default 0.25 (matches grid-deg)] [--no-bands]\n"
                          "                 [--simplify-m <meters>, default 50, 0 to disable]\n"
                          "                 [--threads <n>, default 4]\n";
             std::cout.flush();

@@ -1,6 +1,13 @@
 #pragma once
 #include <string>
 
+// Today's date as a decimal year (e.g. 2026.51), suitable for loadWMM's
+// `year` parameter — WMM's secular-variation coefficients mean declination
+// drifts slowly even at a fixed epoch, so callers that just want "current"
+// declination (rather than a specific historical/future date) should use
+// this rather than hardcoding a year.
+double currentDecimalYear();
+
 // Computes World Magnetic Model declination (magnetic variation) globally
 // and loads it into a `wmm` PostGIS raster table (one band, degrees, east
 // positive), analogous to `terrain`. The spherical-harmonic evaluation is a
@@ -50,7 +57,7 @@ bool loadWMM(const std::string& server,
              double max_lon = 180, double max_lat = 90,
              double grid_deg = 0.25,
              int dest_srid = 3857,
-             double band_deg = 1.0,
+             double band_deg = 0.25,
              double simplify_m = 50.0,
              int threads = 4,
              bool verbose = true);
@@ -61,8 +68,10 @@ bool loadWMM(const std::string& server,
 // declination range — the whole table is rebuilt from scratch on every call
 // (TRUNCATE + regenerate), same cost/rationale as buildTerrainBands.
 //
-// band_deg: band width in degrees (e.g. 1.0, matching typical sectional
-// chart isogonic line spacing).
+// band_deg: band width in degrees. Defaults to matching grid_deg (0.25) —
+// narrower bands than the underlying raster's own grid resolution don't add
+// real precision, just slice the same data into more buckets and expose
+// the raster's pixel staircase as band-boundary noise.
 // dest_srid: SRID for the output polygons (the wmm raster itself is 4326).
 // simplify_m: ST_SimplifyPreserveTopology tolerance in meters, same
 // rationale as buildTerrainBands (smooths raster-pixel-aligned staircase
@@ -76,7 +85,7 @@ bool buildWMMBands(const std::string& server,
                     const std::string& user,
                     const std::string& database,
                     const std::string& password,
-                    double band_deg = 1.0,
+                    double band_deg = 0.25,
                     int dest_srid = 3857,
                     double simplify_m = 50.0,
                     int threads = 4,

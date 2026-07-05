@@ -44,4 +44,14 @@ private:
     // has changed. Called periodically from poll(), independent of OSM
     // replication cadence.
     void checkExternalData();
+
+    // Recomputes/reloads WMM declination on a fixed ~3-month wall-clock
+    // cadence (tracked in external_data_state like checkExternalData's
+    // sources, keyed by "wmm") — unlike airports/FAA there's no upstream
+    // "has this changed" check to make (NOAA only publishes a new
+    // coefficient model every ~5 years), but the computed declination
+    // itself drifts via secular variation as time passes, so it's worth
+    // periodically recomputing with the current date regardless. Called
+    // alongside checkExternalData() from poll().
+    void checkWMMRefresh();
 };

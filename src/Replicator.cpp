@@ -2,6 +2,7 @@
 #include "NavDB.h"
 #include "AirportsLoader.h"
 #include "FAAObstacleLoader.h"
+#include "WMMLoader.h"
 
 #include <iostream>
 #include <fstream>
@@ -15,6 +16,7 @@
 #include <chrono>
 #include <csignal>
 #include <atomic>
+#include <ctime>
 #include <curl/curl.h>
 
 static std::atomic<bool> g_stop{false};
@@ -190,6 +192,34 @@ void Replicator::checkExternalData() {
     }
 }
 
+// ~3 months. Tracked via external_data_state (keyed by "wmm") rather than
+// an in-memory timer, so the interval is measured from the last real
+// reload's wall-clock time and survives process restarts — an in-memory
+// steady_clock timer (like kExternalCheckInterval above) would instead
+// reload on every poll() restart regardless of how recently WMM was
+// actually refreshed, which is fine for a cheap HTTP HEAD check but not
+// for a 3-month cadence.
+constexpr int64_t kWMMRefreshSeconds = 90LL * 24 * 3600;
+
+void Replicator::checkWMMRefresh() {
+    int64_t now = std::time(nullptr);
+    int64_t last = db_.getExternalDataTimestamp("wmm");
+    if (last >= 0 && (now - last) < kWMMRefreshSeconds) return;
+
+    std::cout << "[Replicator] refreshing WMM declination data (3-month cadence)...\n";
+    try {
+        bool ok = loadWMM(server_, user_, database_, password_, currentDecimalYear());
+        if (ok) {
+            db_.setExternalDataTimestamp("wmm", now);
+            std::cout << "[Replicator] WMM refresh complete\n";
+        } else {
+            std::cerr << "[Replicator] WMM refresh failed, will retry next check\n";
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "[Replicator] WMM refresh failed: " << e.what() << "\n";
+    }
+}
+
 void Replicator::poll(int interval_seconds) {
     signal(SIGINT, sigintHandler);
     signal(SIGTERM, sigintHandler);
@@ -209,6 +239,11 @@ void Replicator::poll(int interval_seconds) {
         auto now = std::chrono::steady_clock::now();
         if (now - last_external_check >= kExternalCheckInterval) {
             checkExternalData();
+            // checkWMMRefresh() has its own internal (DB-persisted, ~3
+            // month) gate — checking every 6h here just decides how
+            // promptly a due refresh gets picked up, not how often it
+            // actually reloads.
+            checkWMMRefresh();
             last_external_check = now;
         }
     };
