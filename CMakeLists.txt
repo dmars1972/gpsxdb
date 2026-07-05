@@ -153,3 +153,26 @@ target_link_libraries(terrain_load PRIVATE
 
 target_compile_options(terrain_load PRIVATE -O2 -Wall -Wextra -Wno-psabi)
 target_compile_features(terrain_load PRIVATE cxx_std_20)
+
+# ---- wmm_load ----
+# Computes World Magnetic Model declination directly (no external tile
+# source, no GDAL/raster2pgsql — the raster is built via plain PostGIS
+# raster SQL calls, see WMMLoader.cpp).
+
+add_executable(wmm_load
+    src/wmm_load.cpp
+    src/WMMLoader.cpp
+)
+
+target_include_directories(wmm_load PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${PQXX_INCLUDE_DIRS}
+)
+
+target_link_libraries(wmm_load PRIVATE
+    ${PQXX_LIBRARIES}
+    ${PQ_LIB}
+)
+
+target_compile_options(wmm_load PRIVATE -O2 -Wall -Wextra -Wno-psabi)
+target_compile_features(wmm_load PRIVATE cxx_std_20)
