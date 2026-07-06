@@ -177,3 +177,31 @@ target_link_libraries(wmm_load PRIVATE
 
 target_compile_options(wmm_load PRIVATE -O2 -Wall -Wextra -Wno-psabi)
 target_compile_features(wmm_load PRIVATE cxx_std_20)
+
+# ---- airspace_load ----
+# FAA Class Airspace / Special Use Airspace GeoJSON downloads, parsed with
+# Boost.JSON (header-only here via boost/json/src.hpp in AirspaceLoader.cpp
+# — no separate libboost_json to link).
+
+add_executable(airspace_load
+    src/airspace_load.cpp
+    src/AirspaceLoader.cpp
+    src/GeoUtils.cpp
+)
+
+target_include_directories(airspace_load PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${PQXX_INCLUDE_DIRS}
+    ${PROJ_INCLUDE_DIRS}
+    ${PQ_INCLUDE}
+)
+
+target_link_libraries(airspace_load PRIVATE
+    ${PQXX_LIBRARIES}
+    ${PQ_LIB}
+    ${PROJ_LIBRARIES}
+    ${CURL_LIB}
+)
+
+target_compile_options(airspace_load PRIVATE -O2 -Wall -Wextra -Wno-psabi)
+target_compile_features(airspace_load PRIVATE cxx_std_20)

@@ -51,3 +51,36 @@ std::string pointWKB(double x, double y) {
     for (uint8_t b : buf) { out += h[b>>4]; out += h[b&0xf]; }
     return out;
 }
+
+// ---- WKB multipolygon builder ----
+
+std::string multiPolygonWKB(
+    const std::vector<std::vector<std::vector<std::pair<double,double>>>>& polygons) {
+    std::vector<uint8_t> buf;
+    auto wu32 = [&](uint32_t v) {
+        buf.push_back(v & 0xff); buf.push_back((v>>8)&0xff);
+        buf.push_back((v>>16)&0xff); buf.push_back((v>>24)&0xff);
+    };
+    auto wf64 = [&](double v) {
+        uint64_t u; memcpy(&u, &v, 8);
+        for (int i = 0; i < 8; ++i) buf.push_back((u>>(8*i))&0xff);
+    };
+    buf.push_back(0x01);
+    wu32(0x20000006); // MULTIPOLYGON with SRID flag
+    wu32(static_cast<uint32_t>(g_srid));
+    wu32(static_cast<uint32_t>(polygons.size()));
+    for (auto& rings : polygons) {
+        buf.push_back(0x01);
+        wu32(0x00000003); // POLYGON, no SRID flag (sub-geometry)
+        wu32(static_cast<uint32_t>(rings.size()));
+        for (auto& ring : rings) {
+            wu32(static_cast<uint32_t>(ring.size()));
+            for (auto& [x, y] : ring) { wf64(x); wf64(y); }
+        }
+    }
+
+    static const char* h = "0123456789ABCDEF";
+    std::string out; out.reserve(buf.size() * 2);
+    for (uint8_t b : buf) { out += h[b>>4]; out += h[b&0xf]; }
+    return out;
+}
