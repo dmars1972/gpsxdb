@@ -289,10 +289,11 @@ or FAA obstacle datasets have been refreshed upstream (via HTTP
 separate `-R airports`/`-R faa` run needed. The same 6-hour check also
 triggers a WMM declination refresh every ~3 months (matching how slowly
 secular variation actually drifts declination) and an airspace refresh
-every ~8 weeks (matching the FAA NASR/SUA publish cycle) — neither has a
-single upstream "has this changed" signal to check the way airports/FAA
-obstacles do, so these are fixed-interval instead. The last-seen timestamp
-for each is tracked in the `external_data_state` table.
+every month (simpler than matching FAA's ~8-week NASR/SUA publish cycle,
+still current enough) — neither has a single upstream "has this changed"
+signal to check the way airports/FAA obstacles do, so these are
+fixed-interval instead. The last-seen timestamp for each is tracked in the
+`external_data_state` table.
 
 Replication granularities: `minute` | `hour` | `day`
 

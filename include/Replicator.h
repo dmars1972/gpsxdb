@@ -56,12 +56,12 @@ private:
     void checkWMMRefresh();
 
     // Reloads FAA Class/Special Use Airspace + OpenAIP international
-    // airspace on a fixed ~8-week wall-clock cadence (tracked like
-    // checkWMMRefresh, keyed "airspace") — matches the FAA NASR/SUA
-    // subscription's own ~8-week publish cycle. Same reasoning as
-    // checkWMMRefresh for using a fixed interval rather than an upstream
-    // Last-Modified check: OpenAIP's paginated API has no single
-    // Last-Modified to check, and the FAA ArcGIS export API doesn't
-    // reliably expose one either.
+    // airspace on a fixed 1-month wall-clock cadence (tracked like
+    // checkWMMRefresh, keyed "airspace") — simpler than matching FAA's
+    // exact ~8-week NASR/SUA publish cycle, and still keeps data
+    // reasonably current. Same reasoning as checkWMMRefresh for using a
+    // fixed interval rather than an upstream Last-Modified check:
+    // OpenAIP's paginated API has no single Last-Modified to check, and
+    // the FAA ArcGIS export API doesn't reliably expose one either.
     void checkAirspaceRefresh();
 };

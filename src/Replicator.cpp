@@ -222,10 +222,12 @@ void Replicator::checkWMMRefresh() {
 }
 
 // FAA's NASR/SUA subscription publishes on an ~8-week cycle; OpenAIP is
-// crowd-sourced with no fixed cadence at all. Same fixed-interval,
-// DB-persisted-timestamp approach as checkWMMRefresh, for the same reason
-// (no single upstream Last-Modified to check against).
-constexpr int64_t kAirspaceRefreshSeconds = 56LL * 24 * 3600;
+// crowd-sourced with no fixed cadence at all. A flat 1-month refresh is
+// simpler to reason about than matching FAA's exact cycle and still keeps
+// data reasonably current. Same fixed-interval, DB-persisted-timestamp
+// approach as checkWMMRefresh, for the same reason (no single upstream
+// Last-Modified to check against).
+constexpr int64_t kAirspaceRefreshSeconds = 30LL * 24 * 3600;
 
 void Replicator::checkAirspaceRefresh() {
     int64_t now = std::time(nullptr);
