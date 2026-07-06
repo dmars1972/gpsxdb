@@ -57,3 +57,9 @@ bool loadInternationalAirspace(const std::string& server,
                                const std::string& password,
                                const std::string& api_key,
                                bool verbose = true);
+
+// Reads the OpenAIP API key from ~/.openaip_api_key (never from the repo —
+// see loadInternationalAirspace above), or "" if the file doesn't exist.
+// Shared by the standalone airspace_load tool and osm_import so the key
+// only needs to be saved in one place.
+std::string defaultOpenAipApiKey();

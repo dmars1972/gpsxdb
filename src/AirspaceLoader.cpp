@@ -11,10 +11,56 @@
 #include <optional>
 #include <thread>
 #include <chrono>
+#include <vector>
+#include <utility>
+#include <cstring>
+#include <cstdint>
+#include <cstdlib>
 
 namespace json = boost::json;
 
 namespace {
+
+// Build a PostGIS-compatible EWKB hex string for a MultiPolygon, embedding
+// g_srid as the SRID. Coordinates must already be in the target projection.
+// polygons[i] is one polygon's rings (rings[0] = exterior, rest = holes);
+// each ring is a closed sequence of (x,y) points (first == last).
+//
+// Local to this file rather than GeoUtils (which osm_import can't link
+// alongside its own OSMReader.cpp — that file already has its own
+// independent pointWKB/toMercator definitions, so adding GeoUtils.cpp's
+// copies too would be a multiple-definition error) — this loader is the
+// only thing that needs MultiPolygon WKB, so it lives here instead.
+std::string multiPolygonWKB(
+    const std::vector<std::vector<std::vector<std::pair<double,double>>>>& polygons) {
+    std::vector<uint8_t> buf;
+    auto wu32 = [&](uint32_t v) {
+        buf.push_back(v & 0xff); buf.push_back((v>>8)&0xff);
+        buf.push_back((v>>16)&0xff); buf.push_back((v>>24)&0xff);
+    };
+    auto wf64 = [&](double v) {
+        uint64_t u; memcpy(&u, &v, 8);
+        for (int i = 0; i < 8; ++i) buf.push_back((u>>(8*i))&0xff);
+    };
+    buf.push_back(0x01);
+    wu32(0x20000006); // MULTIPOLYGON with SRID flag
+    wu32(static_cast<uint32_t>(g_srid));
+    wu32(static_cast<uint32_t>(polygons.size()));
+    for (auto& rings : polygons) {
+        buf.push_back(0x01);
+        wu32(0x00000003); // POLYGON, no SRID flag (sub-geometry)
+        wu32(static_cast<uint32_t>(rings.size()));
+        for (auto& ring : rings) {
+            wu32(static_cast<uint32_t>(ring.size()));
+            for (auto& [x, y] : ring) { wf64(x); wf64(y); }
+        }
+    }
+
+    static const char* h = "0123456789ABCDEF";
+    std::string out; out.reserve(buf.size() * 2);
+    for (uint8_t b : buf) { out += h[b>>4]; out += h[b&0xf]; }
+    return out;
+}
 
 size_t curlWrite(void* ptr, size_t size, size_t nmemb, void* stream) {
     std::ofstream* f = static_cast<std::ofstream*>(stream);
@@ -566,4 +612,16 @@ bool loadInternationalAirspace(const std::string& server, const std::string& use
                   << " skipped (no/invalid geometry), " << us_skipped
                   << " skipped (US, covered by FAA data)\n";
     return count > 0;
+}
+
+std::string defaultOpenAipApiKey() {
+    const char* home = getenv("HOME");
+    if (!home) return "";
+    std::ifstream f(std::string(home) + "/.openaip_api_key");
+    if (!f.is_open()) return "";
+    std::string key;
+    std::getline(f, key);
+    while (!key.empty() && (key.back() == '\n' || key.back() == '\r' || key.back() == ' '))
+        key.pop_back();
+    return key;
 }

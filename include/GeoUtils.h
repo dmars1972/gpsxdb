@@ -2,7 +2,6 @@
 #include <string>
 #include <utility>
 #include <cstdint>
-#include <vector>
 
 // Process-level SRID — set at startup from -L flag.
 // 3857 = Web Mercator (default), 4326 = WGS84 lon/lat.
@@ -19,10 +18,3 @@ std::pair<double,double> toMercator(double lon, double lat);
 // embedding g_srid as the SRID. Coordinates must already be
 // in the target projection (Mercator or WGS84 depending on g_srid).
 std::string pointWKB(double x, double y);
-
-// Build a PostGIS-compatible EWKB hex string for a MultiPolygon, embedding
-// g_srid as the SRID. Coordinates must already be in the target projection.
-// polygons[i] is one polygon's rings (rings[0] = exterior, rest = holes);
-// each ring is a closed sequence of (x,y) points (first == last).
-std::string multiPolygonWKB(
-    const std::vector<std::vector<std::vector<std::pair<double,double>>>>& polygons);

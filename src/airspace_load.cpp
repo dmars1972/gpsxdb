@@ -6,35 +6,11 @@
 #include "AirspaceLoader.h"
 #include "GeoUtils.h"
 #include <iostream>
-#include <fstream>
 #include <string>
-#include <cstdlib>
 #include <unistd.h>
-#include <pwd.h>
 
 // Defined here for the standalone binary (osm_import defines it in main.cpp)
 int g_srid = 3857;
-
-namespace {
-// Falls back to ~/.openaip_api_key (mirroring how DB credentials can fall
-// back to ~/.pgpass) so the key doesn't need to be typed/scripted on every
-// invocation, and never needs to live in the repo.
-std::string defaultApiKeyPath() {
-    const char* home = getenv("HOME");
-    if (!home) home = getpwuid(getuid())->pw_dir;
-    return std::string(home) + "/.openaip_api_key";
-}
-
-std::string readApiKeyFile(const std::string& path) {
-    std::ifstream f(path);
-    if (!f.is_open()) return "";
-    std::string key;
-    std::getline(f, key);
-    while (!key.empty() && (key.back() == '\n' || key.back() == '\r' || key.back() == ' '))
-        key.pop_back();
-    return key;
-}
-} // namespace
 
 int main(int argc, char** argv) {
     std::string server, database, user, password, api_key;
@@ -64,7 +40,7 @@ int main(int argc, char** argv) {
     if (server.empty() || database.empty() || user.empty()) {
         std::cerr << "Error: -s, -d, -u are required\n"; return 1;
     }
-    if (do_intl && api_key.empty()) api_key = readApiKeyFile(defaultApiKeyPath());
+    if (do_intl && api_key.empty()) api_key = defaultOpenAipApiKey();
     if (do_intl && api_key.empty()) {
         std::cerr << "Warning: no OpenAIP API key (--api-key or ~/.openaip_api_key) — "
                      "skipping international airspace\n";

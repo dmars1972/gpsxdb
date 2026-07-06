@@ -33,6 +33,7 @@ add_executable(osm_import
     src/AirportsLoader.cpp
     src/FAAObstacleLoader.cpp
     src/WMMLoader.cpp
+    src/AirspaceLoader.cpp
     proto/fileformat.proto
     proto/osmformat.proto
 )

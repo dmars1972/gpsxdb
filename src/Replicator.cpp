@@ -3,6 +3,7 @@
 #include "AirportsLoader.h"
 #include "FAAObstacleLoader.h"
 #include "WMMLoader.h"
+#include "AirspaceLoader.h"
 
 #include <iostream>
 #include <fstream>
@@ -220,6 +221,39 @@ void Replicator::checkWMMRefresh() {
     }
 }
 
+// FAA's NASR/SUA subscription publishes on an ~8-week cycle; OpenAIP is
+// crowd-sourced with no fixed cadence at all. Same fixed-interval,
+// DB-persisted-timestamp approach as checkWMMRefresh, for the same reason
+// (no single upstream Last-Modified to check against).
+constexpr int64_t kAirspaceRefreshSeconds = 56LL * 24 * 3600;
+
+void Replicator::checkAirspaceRefresh() {
+    int64_t now = std::time(nullptr);
+    int64_t last = db_.getExternalDataTimestamp("airspace");
+    if (last >= 0 && (now - last) < kAirspaceRefreshSeconds) return;
+
+    std::cout << "[Replicator] refreshing airspace data (8-week cadence)...\n";
+    try {
+        bool ok = loadClassAirspace(server_, user_, database_, password_, false);
+        ok = loadSpecialUseAirspace(server_, user_, database_, password_, false) && ok;
+        std::string openaip_key = defaultOpenAipApiKey();
+        if (!openaip_key.empty()) {
+            ok = loadInternationalAirspace(server_, user_, database_, password_, openaip_key, false) && ok;
+        } else {
+            std::cerr << "[Replicator] no OpenAIP API key (~/.openaip_api_key) — "
+                         "skipping international airspace refresh\n";
+        }
+        if (ok) {
+            db_.setExternalDataTimestamp("airspace", now);
+            std::cout << "[Replicator] airspace refresh complete\n";
+        } else {
+            std::cerr << "[Replicator] airspace refresh had failures, will retry next check\n";
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "[Replicator] airspace refresh failed: " << e.what() << "\n";
+    }
+}
+
 void Replicator::poll(int interval_seconds) {
     signal(SIGINT, sigintHandler);
     signal(SIGTERM, sigintHandler);
@@ -239,11 +273,12 @@ void Replicator::poll(int interval_seconds) {
         auto now = std::chrono::steady_clock::now();
         if (now - last_external_check >= kExternalCheckInterval) {
             checkExternalData();
-            // checkWMMRefresh() has its own internal (DB-persisted, ~3
-            // month) gate — checking every 6h here just decides how
-            // promptly a due refresh gets picked up, not how often it
-            // actually reloads.
+            // checkWMMRefresh()/checkAirspaceRefresh() each have their own
+            // internal (DB-persisted) gate — checking every 6h here just
+            // decides how promptly a due refresh gets picked up, not how
+            // often either actually reloads.
             checkWMMRefresh();
+            checkAirspaceRefresh();
             last_external_check = now;
         }
     };

@@ -24,6 +24,7 @@
 #include "AirportsLoader.h"
 #include "FAAObstacleLoader.h"
 #include "WMMLoader.h"
+#include "AirspaceLoader.h"
 #include <stdexcept>
 #include <algorithm>
 #include <iomanip>
@@ -76,7 +77,7 @@ private:
 
 // ---- Status ----
 
-enum class Phase { Nodes, Merging, Ways, Reindexing, Indexing, Relations, AirportsLoading, FAALoading, WMMLoading, Vacuuming, Done };
+enum class Phase { Nodes, Merging, Ways, Reindexing, Indexing, Relations, AirportsLoading, FAALoading, WMMLoading, AirspaceLoading, Vacuuming, Done };
 
 // Current time in microseconds since epoch — matches phase_start_us units
 static int64_t nowUs() {
@@ -95,6 +96,7 @@ static const char* phaseName(Phase p) {
         case Phase::AirportsLoading: return "Loading Airports";
         case Phase::FAALoading:     return "Loading FAA Obstacles";
         case Phase::WMMLoading:     return "Loading WMM Declination";
+        case Phase::AirspaceLoading: return "Loading Airspace";
         case Phase::Vacuuming:  return "Vacuuming";
         case Phase::Done:       return "Done";
     }
@@ -341,6 +343,7 @@ static Args parseArgs(int argc, char** argv) {
             else if (ph == "airports")   a.resume_phase = Phase::AirportsLoading;
             else if (ph == "faa")        a.resume_phase = Phase::FAALoading;
             else if (ph == "wmm")        a.resume_phase = Phase::WMMLoading;
+            else if (ph == "airspace")   a.resume_phase = Phase::AirspaceLoading;
             else if (ph == "vacuum")     a.resume_phase = Phase::Vacuuming;
             else { std::cerr << "Unknown resume phase: " << ph << "\n"; std::cerr.flush(); _exit(1); }
         }
@@ -371,7 +374,7 @@ static Args parseArgs(int argc, char** argv) {
                 "    -n max_node_id     (default 20000000000)\n"
                 "    -S shard_dir       Directory for shard files (default .)\n"
                 "    -R phase           Resume at phase: nodes|merge|ways|reindex|\n"
-                "                       relations|indexing|airports|faa|wmm|vacuum (default nodes)\n"
+                "                       relations|indexing|airports|faa|wmm|airspace|vacuum (default nodes)\n"
                 "                       Prerequisites for the chosen phase must\n"
                 "                       already be complete (e.g. -R ways requires\n"
                 "                       nodes.dat to already contain merged data and\n"
@@ -1038,10 +1041,10 @@ int main(int argc, char** argv) {
     auto start = std::chrono::steady_clock::now();
     std::mutex db_flush_mu_early;
 
-    // -R indexing / -R airports / -R faa / -R wmm / -R vacuum: no PBF processing needed at all
+    // -R indexing / -R airports / -R faa / -R wmm / -R airspace / -R vacuum: no PBF processing needed at all
     if (args.resume_phase == Phase::Indexing || args.resume_phase == Phase::AirportsLoading
         || args.resume_phase == Phase::FAALoading || args.resume_phase == Phase::WMMLoading
-        || args.resume_phase == Phase::Vacuuming) {
+        || args.resume_phase == Phase::AirspaceLoading || args.resume_phase == Phase::Vacuuming) {
         if (args.resume_phase == Phase::Indexing) {
             LOGI(-1, "resume: creating GiST spatial indexes");
             NavDB db(0, args.server, args.user, args.database, db_flush_mu_early);
@@ -1069,6 +1072,18 @@ int main(int argc, char** argv) {
             loadWMM(args.server, args.user, args.database, "", currentDecimalYear(),
                     -180, -90, 180, 90, 0.25, 3857, 0.25, 50.0, 4, false);
             LOGI(-1, "WMM declination data loaded");
+        }
+        if (args.resume_phase == Phase::WMMLoading || args.resume_phase == Phase::AirspaceLoading
+            || args.resume_phase == Phase::Vacuuming) {
+            LOGI(-1, "resume: loading airspace data");
+            loadClassAirspace(args.server, args.user, args.database, "", false);
+            loadSpecialUseAirspace(args.server, args.user, args.database, "", false);
+            std::string openaip_key = defaultOpenAipApiKey();
+            if (!openaip_key.empty())
+                loadInternationalAirspace(args.server, args.user, args.database, "", openaip_key, false);
+            else
+                LOGI(-1, "no OpenAIP API key found (~/.openaip_api_key) — skipping international airspace");
+            LOGI(-1, "airspace data loaded");
         }
         LOGI(-1, "resume: running VACUUM ANALYZE on all tables");
         {
@@ -1340,7 +1355,20 @@ int main(int argc, char** argv) {
             -180, -90, 180, 90, 0.25, 3857, 0.25, 50.0, 4, false);
     LOGI(-1, "WMM declination data loaded");
 
-    status.advancePhase(Phase::WMMLoading, Phase::Vacuuming);
+    status.advancePhase(Phase::WMMLoading, Phase::AirspaceLoading);
+    LOGI(-1, "loading airspace data");
+    loadClassAirspace(args.server, args.user, args.database, "", false);
+    loadSpecialUseAirspace(args.server, args.user, args.database, "", false);
+    {
+        std::string openaip_key = defaultOpenAipApiKey();
+        if (!openaip_key.empty())
+            loadInternationalAirspace(args.server, args.user, args.database, "", openaip_key, false);
+        else
+            LOGI(-1, "no OpenAIP API key found (~/.openaip_api_key) — skipping international airspace");
+    }
+    LOGI(-1, "airspace data loaded");
+
+    status.advancePhase(Phase::AirspaceLoading, Phase::Vacuuming);
     {
         NavDB db(0, args.server, args.user, args.database, db_flush_mu);
         db.vacuumAnalyze();
