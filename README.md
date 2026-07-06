@@ -1,8 +1,18 @@
-# osmpgsqlimport
+# gpsxdb
 
-A high-performance OpenStreetMap PBF importer for PostgreSQL/PostGIS, written in C++20.
+A navigation database builder for **GA (General Aviation) Experimental
+aircraft GPS systems**, written in C++20. It imports and combines
+OpenStreetMap, FAA, OpenAIP, NOAA, and USGS/Copernicus data into a single
+PostGIS database that a homebuilt-aircraft glass panel or EFB can query
+directly — roads and terrain for moving-map display, magnetic declination
+for heading correction, charted airspace boundaries, and FAA obstacle data,
+alongside a full worldwide airport/navaid database.
 
-Designed for full-planet and regional imports with a custom Mercator schema, parallel processing, and efficient random-access node lookup via a memory-mapped flat file.
+At its core is a high-performance OpenStreetMap PBF importer (the original
+purpose of this project) with a custom Mercator schema, parallel
+processing, and efficient random-access node lookup via a memory-mapped
+flat file — built to handle a full-planet import, not just regional
+extracts.
 
 ---
 
@@ -13,9 +23,14 @@ Designed for full-planet and regional imports with a custom Mercator schema, par
 - **Direct PostgreSQL COPY** — no ORM, no temp tables, no ON CONFLICT overhead; bulk-loads via `pqxx::stream_to`
 - **Custom Mercator schema** — all coordinates stored as EPSG:3857 (Web Mercator) to match tile rendering pipelines
 - **Normalized tag tables** — separate `*_tags` tables per entity type rather than hstore columns
-- **Phase-resumable** — blob-aligned PBF offset checkpoints allow restarting at any phase (nodes, merge, ways, relations, indexing, airports) without re-processing earlier phases
+- **Phase-resumable** — blob-aligned PBF offset checkpoints allow restarting at any phase (nodes, merge, ways, relations, indexing, airports, FAA obstacles, WMM, airspace) without re-processing earlier phases
 - **Delta/replication support** — applies OSC change files (`.osc`/`.osc.gz`) with tag diffing; polling mode tracks sequences via the database
 - **Integrated OurAirports data** — loads airports, runways, frequencies, navaids, countries, and regions from [OurAirports](https://ourairports.com/) as a final step
+- **FAA obstacle data** — all known US man-made obstacles affecting aeronautical charting (towers, antennas, wind turbines, etc.)
+- **Terrain elevation** — USGS 3DEP (US) and Copernicus DEM GLO-30 (worldwide) raster elevation, plus derived elevation-band polygons for sectional-chart-style terrain tinting
+- **WMM magnetic declination** — a direct port of NOAA's public WMM spherical-harmonic model, computed globally and stored as both a raster and declination-band polygons
+- **Charted airspace** — FAA Class Airspace and Special Use Airspace (US), plus OpenAIP international airspace (rest of world)
+- **Post-import data quality check** — spot-checks a sample of points against public records (real airport/obstacle facts, an independent WMM implementation) after each import
 - **GiST spatial indexes** — built after all data is loaded, not during import, for maximum efficiency
 
 ---
@@ -67,6 +82,26 @@ All geometry columns use PostGIS `geometry` type. The default SRID is EPSG:3857 
 | `terrain_bands` | Elevation-band area polygons (`band_min_ft`, `band_max_ft`, `geog`) derived from `terrain` — a color-tint layer suited to a sectional-chart-style terrain display, much smaller than the raw raster. Rebuilt from scratch each time `terrain_load` runs (unless `--no-bands`). |
 
 Loaded separately via the standalone `terrain_load` tool — see below.
+
+### WMM (magnetic declination) tables
+
+| Table | Description |
+|---|---|
+| `wmm` | Magnetic declination as PostGIS `raster` tiles, one 10-degree cell per row, always EPSG:4326 regardless of the destination SRID used elsewhere. Query point declination via `ST_Value(rast, point)`. |
+| `wmm_cells` | Tracks which 10-degree cells have been computed, for idempotent/incremental (re)loading. |
+| `wmm_bands` | Declination-band area polygons (`band_min_deg`, `band_max_deg`, `geog`) derived from `wmm` — analogous to `terrain_bands`. Rebuilt from scratch each time `wmm_load` runs (unless `--no-bands`). |
+
+Loaded separately via the standalone `wmm_load` tool — see below.
+
+### Airspace tables
+
+| Table | Description |
+|---|---|
+| `class_airspace` | FAA Class Airspace (US + territories) — Class A/B/C/D/E/G surface areas, Mode-C veils, with floor/ceiling altitudes. |
+| `special_use_airspace` | FAA Special Use Airspace (US + territories) — Military Operations Areas, Restricted, Warning, Alert, and Prohibited areas, with times-of-use. |
+| `international_airspace` | OpenAIP airspace covering every country except the US (FAA data is authoritative there). `type`/`icao_class`/`lower_unit`/`lower_ref`/`upper_unit`/`upper_ref` are OpenAIP's raw numeric codes, not decoded to names — see `include/AirspaceLoader.h`. |
+
+Loaded separately via the standalone `airspace_load` tool — see below.
 
 ---
 
@@ -209,11 +244,17 @@ If an import is interrupted, resume at any phase without reprocessing earlier on
 # Re-run airports loading only
 ./build/osm_import -s <your_db_server> -d <your_db> -u <your_user_id> -R airports
 
+# Re-run WMM declination loading only
+./build/osm_import -s <your_db_server> -d <your_db> -u <your_user_id> -R wmm
+
+# Re-run airspace loading only
+./build/osm_import -s <your_db_server> -d <your_db> -u <your_user_id> -R airspace
+
 # Re-run VACUUM ANALYZE only
 ./build/osm_import -s <your_db_server> -d <your_db> -u <your_user_id> -R vacuum
 ```
 
-Resume phases: `nodes` | `merge` | `ways` | `reindex` | `relations` | `indexing` | `airports` | `faa` | `vacuum`
+Resume phases: `nodes` | `merge` | `ways` | `reindex` | `relations` | `indexing` | `airports` | `faa` | `wmm` | `airspace` | `vacuum`
 
 On the first successful import, two checkpoint files are written alongside `nodes.dat`:
 - `nodes.dat.offset` — byte offset of first non-node blob in the PBF (skips node section on resume)
@@ -245,8 +286,13 @@ Continuously apply replication diffs from planet.openstreetmap.org:
 While polling, osm_import also checks every 6 hours whether the OurAirports
 or FAA obstacle datasets have been refreshed upstream (via HTTP
 `Last-Modified`) and automatically reloads whichever has changed — no
-separate `-R airports`/`-R faa` run needed. The last-seen timestamp for each
-is tracked in the `external_data_state` table.
+separate `-R airports`/`-R faa` run needed. The same 6-hour check also
+triggers a WMM declination refresh every ~3 months (matching how slowly
+secular variation actually drifts declination) and an airspace refresh
+every ~8 weeks (matching the FAA NASR/SUA publish cycle) — neither has a
+single upstream "has this changed" signal to check the way airports/FAA
+obstacles do, so these are fixed-interval instead. The last-seen timestamp
+for each is tracked in the `external_data_state` table.
 
 Replication granularities: `minute` | `hour` | `day`
 
@@ -315,6 +361,47 @@ fragments are smoothed first, which also cuts total storage substantially.
 # Skip band generation entirely (raw raster only)
 ./build/terrain_load -s <your_db_server> -d <your_db> -u <your_user_id> \
   --bbox -109,37,-102,41 --no-bands
+```
+
+3DEP is US-only; pass `--source copernicus` to load Copernicus DEM GLO-30
+instead for coverage anywhere else in the world (see
+`load_copernicus_regions.sh`/`load_copernicus_global_rest.sh`/
+`load_copernicus_final.sh` for ready-made region bboxes).
+
+### WMM (magnetic declination) loader
+
+Computes World Magnetic Model declination directly from NOAA's public
+WMM2025 coefficients (embedded in `WMMLoader.cpp`, no external data file or
+network fetch needed for the model itself) and loads it globally by
+default — unlike terrain, there's no per-region tile source, so a full
+global (re)load takes only a few seconds. The globe is divided into
+resumable 10-degree cells (`wmm_cells`), same idea as `terrain_tiles`.
+
+```bash
+./build/wmm_load -s <your_db_server> -d <your_db> -u <your_user_id>
+
+# Restrict to a bbox, override band width, or use a specific date
+./build/wmm_load -s <your_db_server> -d <your_db> -u <your_user_id> \
+  --bbox -109,37,-102,41 --band-deg 1 --year 2027.5
+```
+
+### Airspace loader
+
+Loads FAA Class Airspace and Special Use Airspace (US + territories, no
+API key needed) and OpenAIP international airspace (everywhere else,
+requires a free API key from [openaip.net](https://www.openaip.net/) —
+read from `~/.openaip_api_key` by default, never committed to the repo).
+
+```bash
+./build/airspace_load -s <your_db_server> -d <your_db> -u <your_user_id>
+
+# Load just one source
+./build/airspace_load -s <your_db_server> -d <your_db> -u <your_user_id> --class-only
+./build/airspace_load -s <your_db_server> -d <your_db> -u <your_user_id> --sua-only
+./build/airspace_load -s <your_db_server> -d <your_db> -u <your_user_id> --intl-only
+
+# Skip international airspace (e.g. no API key available)
+./build/airspace_load -s <your_db_server> -d <your_db> -u <your_user_id> --no-intl
 ```
 
 ---
@@ -595,6 +682,11 @@ further.
 - **OSM planet/extracts**: [planet.openstreetmap.org](https://planet.openstreetmap.org) or [Geofabrik](https://download.geofabrik.de)
 - **OurAirports**: [davidmegginson.github.io/ourairports-data](https://davidmegginson.github.io/ourairports-data/) (downloaded automatically at import time)
 - **FAA Digital Obstacle File**: [aeronav.faa.gov/Obst_Data/DDOF.zip](https://aeronav.faa.gov/Obst_Data/DDOF.zip) — daily-updated file of all US man-made obstacles affecting aeronautical charting (downloaded automatically at import time)
+- **USGS 3DEP**: 1 arc-second (~30m) elevation, US + territories only
+- **Copernicus DEM GLO-30**: [copernicus-dem-30m.s3.amazonaws.com](https://copernicus-dem-30m.s3.amazonaws.com/) — ~30m elevation, worldwide, public AWS Open Data, no API key
+- **NOAA/NCEI World Magnetic Model**: [ncei.noaa.gov/products/world-magnetic-model](https://www.ncei.noaa.gov/products/world-magnetic-model) — WMM2025 coefficients, embedded in this project's source rather than fetched at runtime
+- **FAA Class/Special Use Airspace**: FAA Aeronautical Information Services' public ArcGIS open data portal (adds-faa.opendata.arcgis.com), downloaded automatically
+- **OpenAIP**: [openaip.net](https://www.openaip.net/) — crowd-sourced international airspace, CC BY-NC 4.0 (noncommercial use only), requires a free API key
 
 ---
 
