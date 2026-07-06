@@ -319,6 +319,45 @@ fragments are smoothed first, which also cuts total storage substantially.
 
 ---
 
+## Data quality check
+
+`dq_check.py` spot-checks a live `nav` database after an import: it samples
+100 points across the continental US (5 major hub airports, 5 minor GA
+fields, 4 named landmarks, and 86 randomly-sampled points rejection-tested
+for real OSM coverage) and checks six data layers at each — nearest
+airport, FAA obstacles, charted airspace (class + special use), WMM
+magnetic declination, nearby roads (`ways`), and nearby land-use areas
+(`areas`). WMM declination is additionally cross-checked against
+[pygeomag](https://pypi.org/project/pygeomag/) (an independent NOAA WMM
+implementation, not this project's own `WMMLoader.cpp`), and a handful of
+stable public facts are checked directly (e.g. the real height of the
+KVLY-TV mast) so a future regression has a chance of being caught without
+a human eyeballing the SQL results. Meant to be rerun occasionally after a
+fresh import, not part of the build.
+
+```bash
+pip install -r requirements-dq_check.txt
+
+python3 dq_check.py -s <your_db_server> -d <your_db> -u <your_user_id>
+# writes dq_report.html; add --json results.json to also dump raw per-point data
+```
+
+**Initial run (2026-07-06, after the first full-planet import):** all 6
+golden-fact checks passed, all 5 major hubs correctly showed Class B
+airspace, WMM matched the independent model on all 100 points (mean
+deviation 0.032°, max 0.095° — consistent with the underlying raster's
+0.25° grid resolution, not a defect). Two standout matches against famous
+public height records: the KVLY-TV mast came back at 2,060 ft AGL against
+its well-known public figure of 2,063 ft, and the tallest obstacle within
+5nm of the Statue of Liberty (One World Trade Center) came back at 1,792 ft
+AGL against its iconic 1,776 ft spire height. Real street names surfaced
+next to the White House (Pennsylvania Avenue NW, E Street NW), and nearby
+airport lookups correctly found the White House South Lawn Helipad and a
+`closed`-status Crissy Field next to the Golden Gate Bridge, matching its
+real decommissioned status.
+
+---
+
 
 ## Status line
 
