@@ -12,12 +12,13 @@
 # (e.g. Middle East / Africa / South Asia) -- harmless, the overlap is just
 # re-checked and skipped as already-loaded, not re-downloaded.
 #
-# NOT covered: Pacific islands east of the antimeridian (Fiji, French
-# Polynesia, Kiribati, etc. -- bbox wraparound isn't handled) and
-# Antarctica/high-Arctic land (minimal Copernicus coverage there anyway).
-# Alaska, Hawaii, and Puerto Rico are US territory covered by 3DEP, not
-# included here or in load_copernicus_regions.sh -- load those via
-# --source 3dep separately if needed.
+# NOT covered here: northern Canada (above 60N), Alaska, Greenland, the
+# Svalbard/high-Arctic gap, and the Pacific islands that cross the
+# antimeridian -- see load_copernicus_final.sh for those. Antarctica is
+# deliberately skipped everywhere (minimal Copernicus coverage, no
+# permanent civil GA population). Hawaii and Puerto Rico are US territory
+# covered by 3DEP, not included in any of these Copernicus scripts -- load
+# those via --source 3dep separately if needed.
 #
 # Deliberately passes --no-bands on every call: buildTerrainBands rebuilds
 # terrain_bands from the ENTIRE terrain table on every invocation, so calling
