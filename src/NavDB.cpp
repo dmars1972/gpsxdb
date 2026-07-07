@@ -424,46 +424,6 @@ std::string NavDB::getWay(int64_t id) {
 
 // ---- delta / update methods ----
 
-void NavDB::updateNode(int64_t id, const std::string& name,
-                       double lon_m, double lat_m,
-                       const Tags& tags, const std::string& geog) {
-    try {
-        pqxx::work txn(*conn_);
-        txn.exec(
-            "UPDATE nodes SET name=$2, longitude_m=$3, latitude_m=$4, geog=$5 WHERE id=$1",
-            pqxx::params{id, name, lon_m, lat_m, geog});
-        txn.commit();
-    } catch (const std::exception& e) {
-        std::cerr << "[NavDB] updateNode error: " << e.what() << "\n"; throw;
-    }
-    // Diff tags: delete removed, insert new
-    try {
-        pqxx::work txn(*conn_);
-        // Get existing tags
-        auto rows = txn.exec(
-            "SELECT key_name, key_value FROM node_tags WHERE id=$1",
-            pqxx::params{id});
-        std::unordered_map<std::string,std::string> existing;
-        for (const auto& r : rows) existing[r[0].c_str()] = r[1].c_str();
-
-        for (auto& [k, v] : tags) {
-            auto it = existing.find(k);
-            if (it == existing.end())
-                txn.exec("INSERT INTO node_tags(id,key_name,key_value) VALUES($1,$2,$3)",
-                         pqxx::params{id, k, v});
-            else if (it->second != v)
-                txn.exec("UPDATE node_tags SET key_value=$3 WHERE id=$1 AND key_name=$2",
-                         pqxx::params{id, k, v});
-            existing.erase(k);
-        }
-        for (auto& [k, _] : existing)
-            txn.exec("DELETE FROM node_tags WHERE id=$1 AND key_name=$2", pqxx::params{id, k});
-        txn.commit();
-    } catch (const std::exception& e) {
-        std::cerr << "[NavDB] updateNode tags error: " << e.what() << "\n"; throw;
-    }
-}
-
 static void diffTags(pqxx::work& txn, int64_t id,
                      const std::string& tag_table, const Tags& tags) {
     std::string sel_q = "SELECT key_name, key_value FROM " + tag_table + " WHERE id=$1";
@@ -488,11 +448,31 @@ static void diffTags(pqxx::work& txn, int64_t id,
         txn.exec(del_q, pqxx::params{id, k});
 }
 
+void NavDB::updateNode(int64_t id, const std::string& name,
+                       double lon_m, double lat_m,
+                       const Tags& tags, const std::string& geog) {
+    try {
+        pqxx::work txn(*conn_);
+        txn.exec(
+            "INSERT INTO nodes(id, name, longitude_m, latitude_m, geog) VALUES ($1,$2,$3,$4,$5) "
+            "ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, longitude_m=EXCLUDED.longitude_m, "
+            "latitude_m=EXCLUDED.latitude_m, geog=EXCLUDED.geog",
+            pqxx::params{id, name, lon_m, lat_m, geog});
+        diffTags(txn, id, "node_tags", tags);
+        txn.commit();
+    } catch (const std::exception& e) {
+        std::cerr << "[NavDB] updateNode error: " << e.what() << "\n"; throw;
+    }
+}
+
 void NavDB::updateWay(int64_t id, const std::string& name,
                       const Tags& tags, const std::string& geog) {
     try {
         pqxx::work txn(*conn_);
-        txn.exec("UPDATE ways SET name=$2, geog=$3 WHERE id=$1", pqxx::params{id, name, geog});
+        txn.exec(
+            "INSERT INTO ways(id, name, geog) VALUES ($1,$2,$3) "
+            "ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, geog=EXCLUDED.geog",
+            pqxx::params{id, name, geog});
         diffTags(txn, id, "way_tags", tags);
         txn.commit();
     } catch (const std::exception& e) {
@@ -504,7 +484,10 @@ void NavDB::updateArea(int64_t id, const std::string& name,
                        const Tags& tags, const std::string& geog) {
     try {
         pqxx::work txn(*conn_);
-        txn.exec("UPDATE areas SET name=$2, geog=$3 WHERE id=$1", pqxx::params{id, name, geog});
+        txn.exec(
+            "INSERT INTO areas(id, name, geog) VALUES ($1,$2,$3) "
+            "ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, geog=EXCLUDED.geog",
+            pqxx::params{id, name, geog});
         diffTags(txn, id, "area_tags", tags);
         txn.commit();
     } catch (const std::exception& e) {
@@ -517,11 +500,29 @@ void NavDB::updateRelation(int64_t id, const std::string& name,
     try {
         pqxx::work txn(*conn_);
         std::optional<std::string> g = geog.empty() ? std::nullopt : std::make_optional(geog);
-        txn.exec("UPDATE relations SET name=$2, geog=$3 WHERE id=$1", pqxx::params{id, name, g});
+        txn.exec(
+            "INSERT INTO relations(id, name, geog) VALUES ($1,$2,$3) "
+            "ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, geog=EXCLUDED.geog",
+            pqxx::params{id, name, g});
         diffTags(txn, id, "relation_tags", tags);
         txn.commit();
     } catch (const std::exception& e) {
         std::cerr << "[NavDB] updateRelation error: " << e.what() << "\n"; throw;
+    }
+}
+
+void NavDB::updateRoad(int64_t id, const std::string& name,
+                       const Tags& tags, const std::string& geog) {
+    try {
+        pqxx::work txn(*conn_);
+        txn.exec(
+            "INSERT INTO roads(id, name, geog) VALUES ($1,$2,$3) "
+            "ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, geog=EXCLUDED.geog",
+            pqxx::params{id, name, geog});
+        diffTags(txn, id, "road_tags", tags);
+        txn.commit();
+    } catch (const std::exception& e) {
+        std::cerr << "[NavDB] updateRoad error: " << e.what() << "\n"; throw;
     }
 }
 

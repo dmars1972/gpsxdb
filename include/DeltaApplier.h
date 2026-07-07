@@ -51,4 +51,15 @@ private:
 
     // Build relation geometry from member ways
     std::string buildRelationGeom(const RelationEntry& r);
+
+    // Shared upsert logic for create/modify — a way can transition between
+    // open (ways) and closed (areas) between edits, so this always clears
+    // the non-matching table first, then upserts into the correct one.
+    // Used identically by createWay and modifyWay.
+    void upsertWay(WayEntry& w);
+
+    // Shared upsert logic for create/modify — also keeps the roads table
+    // (relations tagged route=road or highway=*) in sync. Used identically
+    // by createRelation and modifyRelation.
+    void upsertRelation(RelationEntry& r);
 };

@@ -159,7 +159,16 @@ void DeltaApplier::createNode(NodeEntry& n) {
     n.lon_m = mx; n.lat_m = my;
     n.geog_wkb_hex = pointWKB(n.lon, n.lat);
     osmmap_.update(n.id, n.lon_m, n.lat_m);
-    db_.insertNode(n.id, n.name, n.lon_m, n.lat_m, n.tags, n.geog_wkb_hex);
+    // Matches insertNode's own guard: only tagged nodes get a `nodes` row —
+    // most OSM nodes are untagged way-geometry vertices, tracked only via
+    // the mmap coordinate store.
+    if (n.tags.empty()) return;
+    // updateNode is an upsert (see NavDB.h) — using it here rather than the
+    // buffered insertNode avoids a real race: if a later diff in the same
+    // backlog batch modifies this same node before insertNode's buffer
+    // flushes, the modify's upsert would insert the row first, and the
+    // stale buffered create would then collide with it on flush.
+    db_.updateNode(n.id, n.name, n.lon_m, n.lat_m, n.tags, n.geog_wkb_hex);
 }
 
 void DeltaApplier::modifyNode(NodeEntry& n) {
@@ -181,30 +190,30 @@ void DeltaApplier::deleteNode(int64_t id) {
 
 // ---- way/area operations ----
 
-void DeltaApplier::createWay(WayEntry& w) {
+// Shared by createWay/modifyWay. Previously createWay used the buffered
+// insertWay/insertArea (fine on its own) while modifyWay deleted from both
+// tables and then called updateWay/updateArea — but those were plain
+// UPDATEs, which silently affect zero rows against a just-deleted (or
+// never-existing) id, permanently losing the write. updateWay/updateArea
+// are now upserts (see NavDB.h), so this single path is correct for both:
+// clear the non-matching table (in case the way/area type flipped between
+// edits), then upsert into the correct one.
+void DeltaApplier::upsertWay(WayEntry& w) {
     bool is_closed = false;
     std::string geom = buildWayGeom(w, is_closed);
     if (geom.empty()) return;
-    if (is_closed)
-        db_.insertArea(w.id, w.name, w.tags, geom);
-    else
-        db_.insertWay(w.id, w.name, w.tags, geom);
-}
 
-void DeltaApplier::modifyWay(WayEntry& w) {
-    bool is_closed = false;
-    std::string geom = buildWayGeom(w, is_closed);
-    if (geom.empty()) return;
-
-    // May have changed between way and area — delete from both, reinsert
-    db_.deleteEntity(w.id, "way");
-    db_.deleteEntity(w.id, "area");
-
-    if (is_closed)
+    if (is_closed) {
+        db_.deleteEntity(w.id, "way");
         db_.updateArea(w.id, w.name, w.tags, geom);
-    else
+    } else {
+        db_.deleteEntity(w.id, "area");
         db_.updateWay(w.id, w.name, w.tags, geom);
+    }
 }
+
+void DeltaApplier::createWay(WayEntry& w) { upsertWay(w); }
+void DeltaApplier::modifyWay(WayEntry& w) { upsertWay(w); }
 
 void DeltaApplier::deleteWay(int64_t id) {
     db_.deleteEntity(id, "way");
@@ -213,31 +222,26 @@ void DeltaApplier::deleteWay(int64_t id) {
 
 // ---- relation operations ----
 
-void DeltaApplier::createRelation(RelationEntry& r) {
-    std::string geom = buildRelationGeom(r);
-    db_.insertRelation(r.id, r.name, r.tags, geom);
-
-    auto route_it   = r.tags.find("route");
-    auto highway_it = r.tags.find("highway");
-    bool is_road = (route_it   != r.tags.end() && route_it->second == "road") ||
-                   (highway_it != r.tags.end());
-    if (is_road && !geom.empty())
-        db_.insertRoad(r.id, r.name, r.tags, geom);
-}
-
-void DeltaApplier::modifyRelation(RelationEntry& r) {
+// Shared by createRelation/modifyRelation, same rationale as upsertWay:
+// updateRelation/updateRoad are upserts, so create and modify need no
+// distinct handling here beyond OSC's own create/modify bookkeeping
+// (tracked by the caller via created_/modified_ counters).
+void DeltaApplier::upsertRelation(RelationEntry& r) {
     std::string geom = buildRelationGeom(r);
     db_.updateRelation(r.id, r.name, r.tags, geom);
 
-    // Sync roads table
-    db_.deleteEntity(r.id, "road");
     auto route_it   = r.tags.find("route");
     auto highway_it = r.tags.find("highway");
     bool is_road = (route_it   != r.tags.end() && route_it->second == "road") ||
                    (highway_it != r.tags.end());
     if (is_road && !geom.empty())
-        db_.insertRoad(r.id, r.name, r.tags, geom);
+        db_.updateRoad(r.id, r.name, r.tags, geom);
+    else
+        db_.deleteEntity(r.id, "road");
 }
+
+void DeltaApplier::createRelation(RelationEntry& r) { upsertRelation(r); }
+void DeltaApplier::modifyRelation(RelationEntry& r) { upsertRelation(r); }
 
 void DeltaApplier::deleteRelation(int64_t id) {
     db_.deleteEntity(id, "relation");

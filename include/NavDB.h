@@ -80,6 +80,18 @@ public:
         getWayCoordsMap(const std::vector<int64_t>& ids);
 
     // ---- Delta / update methods ----
+    // All of these are upserts (INSERT ... ON CONFLICT (id) DO UPDATE), not
+    // plain UPDATEs — they're used for both OSC "create" and "modify"
+    // events, and the target row may not exist yet (e.g. a way that
+    // transitioned from open to closed gets deleted from the other table
+    // first, so the row genuinely doesn't exist at this point) or may
+    // already exist (a true modify). A plain UPDATE would silently affect
+    // zero rows and lose the write entirely in the "doesn't exist yet"
+    // case. Safe to use ON CONFLICT unconditionally here since these are
+    // only ever called from DeltaApplier (poll/delta mode), never from the
+    // bulk importer's worker threads, which is the only place the
+    // ways/areas/roads/relations primary keys are ever dropped for bulk
+    // load performance.
     void updateNode(int64_t id, const std::string& name,
                     double lon_m, double lat_m,
                     const Tags& tags, const std::string& geog_wkb_hex);
@@ -92,6 +104,9 @@ public:
 
     void updateRelation(int64_t id, const std::string& name,
                         const Tags& tags, const std::string& geog_wkb_hex);
+
+    void updateRoad(int64_t id, const std::string& name,
+                    const Tags& tags, const std::string& geog_wkb_hex);
 
     // Delete entity and its tags from all relevant tables
     void deleteEntity(int64_t id, const std::string& type);
