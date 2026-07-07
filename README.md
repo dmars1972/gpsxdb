@@ -365,9 +365,21 @@ fragments are smoothed first, which also cuts total storage substantially.
 ```
 
 3DEP is US-only; pass `--source copernicus` to load Copernicus DEM GLO-30
-instead for coverage anywhere else in the world (see
+instead for coverage anywhere else in the world. For the whole planet at
+once, pass `--global` instead of `--bbox`:
+
+```bash
+./build/terrain_load -s <your_db_server> -d <your_db> -u <your_user_id> --global --threads 10
+```
+
+This loads Copernicus DEM GLO-30 for all 19 populated non-US regions in one
+call — the same regions previously split across the (now superseded)
 `load_copernicus_regions.sh`/`load_copernicus_global_rest.sh`/
-`load_copernicus_final.sh` for ready-made region bboxes).
+`load_copernicus_final.sh` scripts. Deliberately excludes the continental
+US (3DEP is authoritative there — run a separate `--source 3dep` pass) and
+Antarctica (minimal Copernicus coverage, no permanent civil GA population).
+Band generation is suppressed per-region and runs once at the very end
+instead of 19 times over; pass `--no-bands` to skip it entirely.
 
 ### WMM (magnetic declination) loader
 

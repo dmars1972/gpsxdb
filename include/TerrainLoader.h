@@ -97,3 +97,35 @@ bool buildTerrainBands(const std::string& server,
                        double simplify_m = 50.0,
                        int threads = 4,
                        bool verbose = true);
+
+// Loads Copernicus DEM GLO-30 for every populated non-US region on the
+// planet, in one call — the same 19 named region bboxes previously split
+// across load_copernicus_regions.sh (Canada/Mexico/Central America/
+// Caribbean), load_copernicus_global_rest.sh (South America, Europe,
+// Africa, Middle East, Asia, Russia, Oceania/Australia), and
+// load_copernicus_final.sh (northern Canada, Alaska, Greenland, Svalbard/
+// high-Arctic, Pacific islands crossing the antimeridian), now embedded
+// directly rather than orchestrated via three separate shell scripts.
+// Deliberately excludes the continental US (3DEP is authoritative there —
+// load that separately with --source 3dep) and Antarctica (minimal
+// Copernicus coverage, no permanent civil GA population).
+//
+// Each region is loaded with band generation suppressed (equivalent to
+// --no-bands) — rebuilding terrain_bands after every one of 19 regions
+// would mean redoing that expensive whole-table rebuild 19 times over.
+// If band_ft > 0, a single buildTerrainBands call runs once at the very
+// end, across the whole newly-expanded terrain table. Pass band_ft = 0
+// to skip band generation entirely, same as loadTerrain.
+//
+// Returns false only if every single region failed to load anything
+// (a fully-connected run will normally return true even if a handful of
+// individual tiles within a region were unavailable, same as loadTerrain).
+bool loadGlobalTerrain(const std::string& server,
+                       const std::string& user,
+                       const std::string& database,
+                       const std::string& password,
+                       int dest_srid = 3857,
+                       int band_ft = 500,
+                       double simplify_m = 50.0,
+                       int threads = 10,
+                       bool verbose = true);
