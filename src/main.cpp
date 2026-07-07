@@ -25,6 +25,7 @@
 #include "FAAObstacleLoader.h"
 #include "WMMLoader.h"
 #include "AirspaceLoader.h"
+#include "TerrainLoader.h"
 #include <stdexcept>
 #include <algorithm>
 #include <iomanip>
@@ -77,7 +78,7 @@ private:
 
 // ---- Status ----
 
-enum class Phase { Nodes, Merging, Ways, Reindexing, Indexing, Relations, AirportsLoading, FAALoading, WMMLoading, AirspaceLoading, Vacuuming, Done };
+enum class Phase { Nodes, Merging, Ways, Reindexing, Indexing, Relations, AirportsLoading, FAALoading, WMMLoading, AirspaceLoading, TerrainLoading, Vacuuming, Done };
 
 // Current time in microseconds since epoch — matches phase_start_us units
 static int64_t nowUs() {
@@ -97,6 +98,7 @@ static const char* phaseName(Phase p) {
         case Phase::FAALoading:     return "Loading FAA Obstacles";
         case Phase::WMMLoading:     return "Loading WMM Declination";
         case Phase::AirspaceLoading: return "Loading Airspace";
+        case Phase::TerrainLoading: return "Loading Terrain";
         case Phase::Vacuuming:  return "Vacuuming";
         case Phase::Done:       return "Done";
     }
@@ -344,6 +346,7 @@ static Args parseArgs(int argc, char** argv) {
             else if (ph == "faa")        a.resume_phase = Phase::FAALoading;
             else if (ph == "wmm")        a.resume_phase = Phase::WMMLoading;
             else if (ph == "airspace")   a.resume_phase = Phase::AirspaceLoading;
+            else if (ph == "terrain")    a.resume_phase = Phase::TerrainLoading;
             else if (ph == "vacuum")     a.resume_phase = Phase::Vacuuming;
             else { std::cerr << "Unknown resume phase: " << ph << "\n"; std::cerr.flush(); _exit(1); }
         }
@@ -374,7 +377,7 @@ static Args parseArgs(int argc, char** argv) {
                 "    -n max_node_id     (default 20000000000)\n"
                 "    -S shard_dir       Directory for shard files (default .)\n"
                 "    -R phase           Resume at phase: nodes|merge|ways|reindex|\n"
-                "                       relations|indexing|airports|faa|wmm|airspace|vacuum (default nodes)\n"
+                "                       relations|indexing|airports|faa|wmm|airspace|terrain|vacuum (default nodes)\n"
                 "                       Prerequisites for the chosen phase must\n"
                 "                       already be complete (e.g. -R ways requires\n"
                 "                       nodes.dat to already contain merged data and\n"
@@ -1041,10 +1044,11 @@ int main(int argc, char** argv) {
     auto start = std::chrono::steady_clock::now();
     std::mutex db_flush_mu_early;
 
-    // -R indexing / -R airports / -R faa / -R wmm / -R airspace / -R vacuum: no PBF processing needed at all
+    // -R indexing / -R airports / -R faa / -R wmm / -R airspace / -R terrain / -R vacuum: no PBF processing needed at all
     if (args.resume_phase == Phase::Indexing || args.resume_phase == Phase::AirportsLoading
         || args.resume_phase == Phase::FAALoading || args.resume_phase == Phase::WMMLoading
-        || args.resume_phase == Phase::AirspaceLoading || args.resume_phase == Phase::Vacuuming) {
+        || args.resume_phase == Phase::AirspaceLoading || args.resume_phase == Phase::TerrainLoading
+        || args.resume_phase == Phase::Vacuuming) {
         if (args.resume_phase == Phase::Indexing) {
             LOGI(-1, "resume: creating GiST spatial indexes");
             NavDB db(0, args.server, args.user, args.database, db_flush_mu_early);
@@ -1084,6 +1088,15 @@ int main(int argc, char** argv) {
             else
                 LOGI(-1, "no OpenAIP API key found (~/.openaip_api_key) — skipping international airspace");
             LOGI(-1, "airspace data loaded");
+        }
+        if (args.resume_phase == Phase::AirspaceLoading || args.resume_phase == Phase::TerrainLoading
+            || args.resume_phase == Phase::Vacuuming) {
+            LOGI(-1, "resume: loading terrain elevation data");
+            loadTerrain(args.server, args.user, args.database, "",
+                       -125, 24, -66, 50, TerrainSource::USGS3DEP, 3857, 500, 50.0, 4, false);
+            loadGlobalTerrain(args.server, args.user, args.database, "",
+                             3857, 500, 50.0, 4, false);
+            LOGI(-1, "terrain elevation data loaded");
         }
         LOGI(-1, "resume: running VACUUM ANALYZE on all tables");
         {
@@ -1368,7 +1381,15 @@ int main(int argc, char** argv) {
     }
     LOGI(-1, "airspace data loaded");
 
-    status.advancePhase(Phase::AirspaceLoading, Phase::Vacuuming);
+    status.advancePhase(Phase::AirspaceLoading, Phase::TerrainLoading);
+    LOGI(-1, "loading terrain elevation data");
+    loadTerrain(args.server, args.user, args.database, "",
+               -125, 24, -66, 50, TerrainSource::USGS3DEP, 3857, 500, 50.0, 4, false);
+    loadGlobalTerrain(args.server, args.user, args.database, "",
+                     3857, 500, 50.0, 4, false);
+    LOGI(-1, "terrain elevation data loaded");
+
+    status.advancePhase(Phase::TerrainLoading, Phase::Vacuuming);
     {
         NavDB db(0, args.server, args.user, args.database, db_flush_mu);
         db.vacuumAnalyze();

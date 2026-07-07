@@ -250,11 +250,14 @@ If an import is interrupted, resume at any phase without reprocessing earlier on
 # Re-run airspace loading only
 ./build/osm_import -s <your_db_server> -d <your_db> -u <your_user_id> -R airspace
 
+# Re-run terrain elevation loading only
+./build/osm_import -s <your_db_server> -d <your_db> -u <your_user_id> -R terrain
+
 # Re-run VACUUM ANALYZE only
 ./build/osm_import -s <your_db_server> -d <your_db> -u <your_user_id> -R vacuum
 ```
 
-Resume phases: `nodes` | `merge` | `ways` | `reindex` | `relations` | `indexing` | `airports` | `faa` | `wmm` | `airspace` | `vacuum`
+Resume phases: `nodes` | `merge` | `ways` | `reindex` | `relations` | `indexing` | `airports` | `faa` | `wmm` | `airspace` | `terrain` | `vacuum`
 
 On the first successful import, two checkpoint files are written alongside `nodes.dat`:
 - `nodes.dat.offset` — byte offset of first non-node blob in the PBF (skips node section on resume)
@@ -492,6 +495,9 @@ During import, a status line is printed to stdout once per second:
 | `[Spatial Indexing]` | Building GiST spatial indexes on all geometry columns |
 | `[Loading Airports]` | Downloading and loading OurAirports data |
 | `[Loading FAA Obstacles]` | Downloading and loading FAA Digital Obstacle File |
+| `[Loading WMM Declination]` | Computing and loading World Magnetic Model declination, globally |
+| `[Loading Airspace]` | Downloading and loading FAA Class/Special Use Airspace + OpenAIP international airspace |
+| `[Loading Terrain]` | Downloading and loading 3DEP (US) + Copernicus DEM GLO-30 (rest of world) elevation, plus `terrain_bands` |
 | `[Vacuuming]` | Running `VACUUM ANALYZE` on all tables |
 | `[Done]` | Import complete |
 

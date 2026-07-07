@@ -34,6 +34,7 @@ add_executable(osm_import
     src/FAAObstacleLoader.cpp
     src/WMMLoader.cpp
     src/AirspaceLoader.cpp
+    src/TerrainLoader.cpp
     proto/fileformat.proto
     proto/osmformat.proto
 )
