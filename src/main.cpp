@@ -26,6 +26,7 @@
 #include "WMMLoader.h"
 #include "AirspaceLoader.h"
 #include "TerrainLoader.h"
+#include "PlanetDownloader.h"
 #include <stdexcept>
 #include <algorithm>
 #include <iomanip>
@@ -273,6 +274,7 @@ struct Args {
     int64_t     max_node_id    = 20'000'000'000LL;
     bool        verbose        = false;
     bool        init_schema    = false;
+    bool        download_planet = false;  // -i acts as the destination path
     bool        use_mercator   = true;  // false = store as WGS84 (EPSG:4326)
     int         queue_size     = 10000;
     int         node_threads   = 1;  // RPi5-safe default; see README for tuning
@@ -322,6 +324,7 @@ static Args parseArgs(int argc, char** argv) {
         else if ((arg == "--way-threads"  || arg == "-w") && i+1 < argc) a.way_threads  = safeInt(argv[++i], "--way-threads");
         else if  (arg == "--verbose"      || arg == "-v")                a.verbose      = true;
         else if  (arg == "--init"         || arg == "-I")                a.init_schema  = true;
+        else if  (arg == "--download-planet")                            a.download_planet = true;
         else if  (arg == "--wgs84"        || arg == "-L")                a.use_mercator = false;
         else if ((arg == "--mode"         || arg == "-m") && i+1 < argc) {
             std::string m = argv[++i];
@@ -366,6 +369,13 @@ static Args parseArgs(int argc, char** argv) {
                 "    -h                 Show this help and exit\n"
                 "  Import mode (default):\n"
                 "    -i <file.osm.pbf>  Input PBF file\n"
+                "    --download-planet  Download the latest planet-latest.osm.pbf from\n"
+                "                       planet.openstreetmap.org before importing, saving it\n"
+                "                       to the -i path (default ./planet-latest.osm.pbf if -i\n"
+                "                       omitted). Resumable (safe to re-run after an\n"
+                "                       interruption) and checksum-verified. The file is ~100GB\n"
+                "                       and takes hours to download -- make sure the -i path is\n"
+                "                       on a volume with enough free space.\n"
                 "    -t node_threads    (default 1, see README for tuning)\n"
                 "    -w way_threads     (default 6, see README for tuning)\n"
                 "    NOTE: watch Q: (queue depth) in the status line to tune\n"
@@ -401,7 +411,8 @@ static Args parseArgs(int argc, char** argv) {
         std::cerr << "Error: -s, -d, -u are required\n"; std::cerr.flush(); _exit(1);
     }
     if (a.mode == Mode::Import && a.infile.empty()) {
-        std::cerr << "Error: -i <file.osm.pbf> required for import mode\n"; std::cerr.flush(); _exit(1);
+        if (a.download_planet) a.infile = "./planet-latest.osm.pbf";
+        else { std::cerr << "Error: -i <file.osm.pbf> required for import mode\n"; std::cerr.flush(); _exit(1); }
     }
     if (a.mode == Mode::Delta && a.osc_file.empty()) {
         std::cerr << "Error: -o <file.osc.gz> required for delta mode\n"; std::cerr.flush(); _exit(1);
@@ -1015,6 +1026,20 @@ int main(int argc, char** argv) {
 
     // Set global SRID for all WKB geometry builders
     g_srid = args.use_mercator ? 3857 : 4326;
+
+    // --download-planet: fetch the latest planet file before touching the
+    // DB at all, so a failed/incomplete download doesn't leave the schema
+    // wiped (-I) with nothing to import.
+    if (args.download_planet) {
+        LOGI(-1, "downloading latest planet file to ", args.infile);
+        if (!downloadLatestPlanet(args.infile, true)) {
+            std::cerr << "Planet download failed — aborting before touching the database. "
+                         "Re-run with the same arguments to resume.\n";
+            std::cerr.flush();
+            _exit(1);
+        }
+        LOGI(-1, "planet file downloaded and verified");
+    }
 
     // -I: drop and recreate all tables before starting the import
     if (args.init_schema) {

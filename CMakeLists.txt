@@ -35,6 +35,7 @@ add_executable(osm_import
     src/WMMLoader.cpp
     src/AirspaceLoader.cpp
     src/TerrainLoader.cpp
+    src/PlanetDownloader.cpp
     proto/fileformat.proto
     proto/osmformat.proto
 )

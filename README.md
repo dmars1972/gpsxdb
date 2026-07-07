@@ -192,6 +192,25 @@ osmium fileinfo -e planet-latest.osm.pbf | grep "Max ID"
   -v -l osm.log
 ```
 
+Don't already have `planet-latest.osm.pbf`? Pass `--download-planet` to have
+`osm_import` fetch the latest one from planet.openstreetmap.org before
+importing (saved to the `-i` path, `./planet-latest.osm.pbf` if `-i` is
+omitted). The file is on the order of 100GB, so this takes hours — the
+download is resumable (safe to re-run after an interruption or crash) and
+checksum-verified against upstream's published MD5 before the import
+proceeds, and it happens before `-I` touches the database, so a failed
+download never leaves you with a wiped schema and nothing to import:
+
+```bash
+./build/osm_import \
+  -i planet-latest.osm.pbf --download-planet \
+  -s <your_db_server> -d <your_db> -u <your_user_id> \
+  -I \
+  -n 20000000000 \
+  -f nodes.dat \
+  -v -l osm.log
+```
+
 `-I` drops and recreates all tables before the import begins — equivalent
 to running `create.sql` and `create_airports.sql` manually. Safe to use on
 a fresh database or when reimporting from scratch. **Do not use `-I` with
