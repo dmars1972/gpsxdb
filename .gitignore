@@ -23,7 +23,9 @@ nohup.out
 *.osm.pbf
 *.osc
 *.osc.gz
-/tmp/ourairports_*
+
+# Scratch/temp directory
+/tmp/
 
 # Editor artifacts
 .vscode/
