@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cmath>
 #include <vector>
+#include <set>
 #include <algorithm>
 #include <thread>
 #include <atomic>
@@ -383,6 +384,24 @@ bool buildTerrainBands(const std::string& server, const std::string& user,
         txn.exec(
             "CREATE INDEX IF NOT EXISTS terrain_bands_geog_idx "
             "ON public.terrain_bands USING GIST (geog)");
+        // Tracks the parameters of an in-progress (possibly interrupted)
+        // rebuild, plus whether its staging phase has fully finished — see
+        // the resumability comment further down. Single row, same idiom as
+        // osm_replication_state.
+        txn.exec(
+            "CREATE TABLE IF NOT EXISTS public.terrain_bands_build_state ("
+            "  id integer PRIMARY KEY CHECK (id = 1),"
+            "  band_ft integer NOT NULL,"
+            "  simplify_m double precision NOT NULL,"
+            "  lo_ft integer NOT NULL,"
+            "  hi_ft integer NOT NULL,"
+            "  staging_complete boolean NOT NULL DEFAULT false)");
+        // Which (rx, ry) staging grid cells (see kRegionSizeM below) have
+        // already been reclassified/dumped into terrain_frags_staging —
+        // the checkpoint list for resuming an interrupted staging phase.
+        txn.exec(
+            "CREATE TABLE IF NOT EXISTS public.terrain_frags_staging_progress ("
+            "  rx integer NOT NULL, ry integer NOT NULL, PRIMARY KEY (rx, ry))");
         txn.commit();
     }
 
@@ -413,13 +432,62 @@ bool buildTerrainBands(const std::string& server, const std::string& user,
                   << band_ft << "ft each, " << lo_ft << "ft to " << hi_ft
                   << "ft), merging across all loaded tiles...\n";
 
-    try {
+    // Resumability: this whole function is meant to fully rebuild
+    // terrain_bands from scratch on every call (see the doc comment in
+    // TerrainLoader.h) — but at global scale, the staging phase below is a
+    // multi-hour, CPU-bound operation with no natural checkpoints, and
+    // losing all of it to a crash/kill/reboot partway through (observed
+    // firsthand: a single global rebuild ran 7+ hours before this fix
+    // existed) meant a full restart from zero. terrain_bands_build_state
+    // records the parameters of whatever rebuild is currently in flight;
+    // if a call arrives whose parameters match a row already there, this
+    // is treated as resuming that same interrupted rebuild rather than
+    // starting over — staging_complete and terrain_frags_staging_progress
+    // say exactly how much of it is already done. Any other case (no row,
+    // or parameters differ — e.g. a genuinely new rebuild requested with
+    // different band_ft/simplify_m) wipes everything and starts clean, so
+    // resumption never silently reuses stale/incompatible data.
+    bool resuming = false;
+    bool staging_complete = false;
+    {
         pqxx::work txn(conn);
-        txn.exec("TRUNCATE public.terrain_bands");
+        auto r = txn.exec(
+            "SELECT staging_complete FROM public.terrain_bands_build_state "
+            "WHERE id = 1 AND band_ft = $1 AND simplify_m = $2 AND lo_ft = $3 AND hi_ft = $4",
+            pqxx::params{band_ft, simplify_m, lo_ft, hi_ft});
         txn.commit();
-    } catch (const std::exception& e) {
-        std::cerr << "[Terrain] buildTerrainBands error truncating: " << e.what() << "\n";
-        return false;
+        if (!r.empty()) {
+            resuming = true;
+            staging_complete = r[0][0].as<bool>();
+        }
+    }
+
+    if (resuming && verbose)
+        std::cout << "[Terrain] resuming an interrupted rebuild (staging "
+                  << (staging_complete ? "already complete" : "incomplete, resuming") << ")\n";
+
+    if (!resuming) {
+        try {
+            pqxx::work txn(conn);
+            txn.exec("TRUNCATE public.terrain_bands");
+            txn.exec("DROP TABLE IF EXISTS public.terrain_frags_staging");
+            txn.exec(
+                "CREATE TABLE public.terrain_frags_staging ("
+                "  band_id integer NOT NULL,"
+                "  rx integer NOT NULL,"
+                "  ry integer NOT NULL,"
+                "  geom public.geometry)");
+            txn.exec("TRUNCATE public.terrain_frags_staging_progress");
+            txn.exec(
+                "INSERT INTO public.terrain_bands_build_state(id, band_ft, simplify_m, lo_ft, hi_ft, staging_complete) "
+                "VALUES (1, $1, $2, $3, $4, false) "
+                "ON CONFLICT (id) DO UPDATE SET band_ft=$1, simplify_m=$2, lo_ft=$3, hi_ft=$4, staging_complete=false",
+                pqxx::params{band_ft, simplify_m, lo_ft, hi_ft});
+            txn.commit();
+        } catch (const std::exception& e) {
+            std::cerr << "[Terrain] buildTerrainBands error truncating: " << e.what() << "\n";
+            return false;
+        }
     }
 
     // Simplify at every tier (fragment, region, final) rather than just the
@@ -466,38 +534,149 @@ bool buildTerrainBands(const std::string& server, const std::string& user,
         reclass_all << "(" << band_lo_m << "-" << band_hi_m << "]:" << (i + 1);
     }
 
-    if (verbose)
-        std::cout << "[Terrain] dumping and simplifying raster fragments for all bands "
-                     "(single pass over " << n_bands << " bands)...\n";
+    if (staging_complete) {
+        if (verbose) std::cout << "[Terrain] staging already complete, skipping to band union\n";
+    } else {
+        // Chunked by the same kRegionSizeM grid used one tier down for the
+        // hierarchical union, rather than one INSERT...SELECT over the
+        // entire terrain table: at global scale that single query is a
+        // multi-hour, all-or-nothing operation with no checkpoint (this was
+        // observed directly — a global rebuild ran 7+ hours on this one
+        // statement before this fix existed) and no parallelism. Chunking
+        // by grid cell gives both: each cell commits (and is marked done in
+        // terrain_frags_staging_progress) independently, so a crash/kill
+        // only loses whatever cell(s) were mid-flight, and — since cells are
+        // independent, like bands below — a thread pool processes them
+        // concurrently instead of one connection doing the whole table
+        // serially. t.rast && envelope uses the GIST index to cheaply skip
+        // cells with no matching tiles (open ocean, etc.), so the many empty
+        // cells in a near-global bounding box cost little.
+        // buildTerrainBands isn't given dest_srid (unlike loadTerrain) — the
+        // terrain table's actual SRID (whatever it was loaded with, default
+        // 3857 but -4 selects 4326) has to be read back from the data
+        // itself rather than assumed, for ST_MakeEnvelope below.
+        int terrain_srid;
+        {
+            pqxx::work txn(conn);
+            auto r = txn.exec("SELECT ST_SRID(rast) FROM public.terrain LIMIT 1");
+            txn.commit();
+            terrain_srid = r[0][0].as<int>();
+        }
 
-    try {
-        pqxx::work txn(conn);
-        txn.exec("DROP TABLE IF EXISTS public.terrain_frags_staging");
-        txn.exec(
-            "CREATE TABLE public.terrain_frags_staging ("
-            "  band_id integer NOT NULL,"
-            "  rx integer NOT NULL,"
-            "  ry integer NOT NULL,"
-            "  geom public.geometry)");
-        std::ostringstream sql;
-        sql <<
-            "INSERT INTO public.terrain_frags_staging(band_id, rx, ry, geom) "
-            "SELECT val, floor(ST_X(ST_Centroid(geom)) / " << kRegionSizeM << ")::int, "
-            "            floor(ST_Y(ST_Centroid(geom)) / " << kRegionSizeM << ")::int, geom "
-            "FROM ("
-            "  SELECT d.val::int AS val, " << frag_expr.str() << " AS geom "
-            "  FROM public.terrain t, "
-            "       LATERAL ST_DumpAsPolygons("
-            "         ST_Reclass(t.rast, 1, '" << reclass_all.str() << "', '32BUI', 0), 1"
-            "       ) d "
-            "  WHERE d.val > 0"
-            ") simplified";
-        txn.exec(sql.str());
-        txn.exec("CREATE INDEX ON public.terrain_frags_staging (band_id)");
-        txn.commit();
-    } catch (const std::exception& e) {
-        std::cerr << "[Terrain] buildTerrainBands error building staging fragments: " << e.what() << "\n";
-        return false;
+        double ext_minx, ext_miny, ext_maxx, ext_maxy;
+        {
+            pqxx::work txn(conn);
+            auto r = txn.exec(
+                "SELECT ST_XMin(e), ST_YMin(e), ST_XMax(e), ST_YMax(e) "
+                "FROM (SELECT ST_Extent(ST_Envelope(rast)) AS e FROM public.terrain) t");
+            txn.commit();
+            ext_minx = r[0][0].as<double>();
+            ext_miny = r[0][1].as<double>();
+            ext_maxx = r[0][2].as<double>();
+            ext_maxy = r[0][3].as<double>();
+        }
+        int rx_lo = static_cast<int>(std::floor(ext_minx / kRegionSizeM));
+        int rx_hi = static_cast<int>(std::floor(ext_maxx / kRegionSizeM));
+        int ry_lo = static_cast<int>(std::floor(ext_miny / kRegionSizeM));
+        int ry_hi = static_cast<int>(std::floor(ext_maxy / kRegionSizeM));
+
+        std::vector<std::pair<int,int>> cells;
+        {
+            pqxx::work txn(conn);
+            auto done_rows = txn.exec("SELECT rx, ry FROM public.terrain_frags_staging_progress");
+            txn.commit();
+            std::set<std::pair<int,int>> done;
+            for (const auto& row : done_rows) done.insert({row[0].as<int>(), row[1].as<int>()});
+            for (int rx = rx_lo; rx <= rx_hi; ++rx)
+                for (int ry = ry_lo; ry <= ry_hi; ++ry)
+                    if (!done.count({rx, ry})) cells.push_back({rx, ry});
+        }
+
+        if (verbose)
+            std::cout << "[Terrain] staging " << cells.size() << " grid cell(s) ("
+                      << (rx_hi - rx_lo + 1) * (ry_hi - ry_lo + 1) - static_cast<int>(cells.size())
+                      << " already done)...\n";
+
+        std::atomic<size_t> next_cell{0};
+        std::atomic<int> cells_failed{0};
+        std::mutex stage_io_mu;
+        auto stage_worker = [&]() {
+            try {
+                pqxx::connection wconn(connstr);
+                while (true) {
+                    size_t idx = next_cell.fetch_add(1, std::memory_order_relaxed);
+                    if (idx >= cells.size()) break;
+                    auto [rx, ry] = cells[idx];
+                    double cx0 = rx * kRegionSizeM, cx1 = (rx + 1) * kRegionSizeM;
+                    double cy0 = ry * kRegionSizeM, cy1 = (ry + 1) * kRegionSizeM;
+                    // t.rast && envelope alone would let a raster row whose
+                    // bbox straddles a cell boundary match more than one
+                    // cell's query, reclassifying/dumping (and inserting)
+                    // it once per matching chunk — real duplicated geometry
+                    // near every 500km grid line, not just an inefficiency.
+                    // The && test stays as the cheap GIST-indexed
+                    // pre-filter (narrows 3M+ rows down to a small
+                    // candidate set fast); ST_Contains on that already-small
+                    // set then gives each row to exactly one cell, by which
+                    // cell contains its centroid — no duplicates, no gaps.
+                    std::ostringstream sql;
+                    sql << std::fixed << std::setprecision(4) <<
+                        "INSERT INTO public.terrain_frags_staging(band_id, rx, ry, geom) "
+                        "SELECT val, " << rx << ", " << ry << ", geom "
+                        "FROM ("
+                        "  SELECT d.val::int AS val, " << frag_expr.str() << " AS geom "
+                        "  FROM public.terrain t, "
+                        "       LATERAL ST_DumpAsPolygons("
+                        "         ST_Reclass(t.rast, 1, '" << reclass_all.str() << "', '32BUI', 0), 1"
+                        "       ) d "
+                        "  WHERE d.val > 0 AND t.rast && ST_MakeEnvelope("
+                        << cx0 << ", " << cy0 << ", " << cx1 << ", " << cy1 << ", " << terrain_srid << ") "
+                        "  AND ST_Contains(ST_MakeEnvelope("
+                        << cx0 << ", " << cy0 << ", " << cx1 << ", " << cy1 << ", " << terrain_srid << "), "
+                        "ST_Centroid(t.rast::geometry))"
+                        ") simplified";
+                    try {
+                        pqxx::work txn(wconn);
+                        txn.exec(sql.str());
+                        txn.exec("INSERT INTO public.terrain_frags_staging_progress(rx, ry) VALUES ($1, $2)",
+                                 pqxx::params{rx, ry});
+                        txn.commit();
+                    } catch (const std::exception& e) {
+                        std::lock_guard lk(stage_io_mu);
+                        std::cerr << "[Terrain] staging cell (" << rx << "," << ry << ") error: "
+                                  << e.what() << " — will retry next run\n";
+                        cells_failed.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+            } catch (const std::exception& e) {
+                std::lock_guard lk(stage_io_mu);
+                std::cerr << "[Terrain] staging worker thread error: " << e.what() << "\n";
+            }
+        };
+
+        int stage_threads = std::max(1, std::min(threads, static_cast<int>(cells.size())));
+        if (!cells.empty()) {
+            std::vector<std::thread> stage_workers;
+            stage_workers.reserve(stage_threads);
+            for (int t = 0; t < stage_threads; ++t) stage_workers.emplace_back(stage_worker);
+            for (auto& w : stage_workers) w.join();
+        }
+
+        if (cells_failed.load() > 0) {
+            std::cerr << "[Terrain] " << cells_failed.load()
+                      << " staging cell(s) failed — re-run to resume and retry them\n";
+            return false;
+        }
+
+        try {
+            pqxx::work txn(conn);
+            txn.exec("CREATE INDEX IF NOT EXISTS terrain_frags_staging_band_idx ON public.terrain_frags_staging (band_id)");
+            txn.exec("UPDATE public.terrain_bands_build_state SET staging_complete = true WHERE id = 1");
+            txn.commit();
+        } catch (const std::exception& e) {
+            std::cerr << "[Terrain] buildTerrainBands error finalizing staging: " << e.what() << "\n";
+            return false;
+        }
     }
 
     // Bands are independent (disjoint band_min_ft/band_max_ft, no ON
@@ -506,7 +685,27 @@ bool buildTerrainBands(const std::string& server, const std::string& user,
     // shared atomic counter, each with its own pqxx::connection. Unlike the
     // node/way workers there's no shared db_flush_mu equivalent: nothing here
     // needs cross-thread serialization.
-    std::atomic<int> next_band{0};
+    //
+    // Each band's INSERT is already one atomic transaction (commits all of
+    // that band's polygons or none), so resumability here needs no extra
+    // tracking table — a band already present in terrain_bands (by
+    // band_min_ft) simply isn't re-added to the work list.
+    std::vector<int> band_indices;
+    {
+        pqxx::work txn(conn);
+        auto done_rows = txn.exec("SELECT DISTINCT band_min_ft FROM public.terrain_bands");
+        txn.commit();
+        std::set<int> done_mins;
+        for (const auto& row : done_rows) done_mins.insert(row[0].as<int>());
+        for (int i = 0; i < n_bands; ++i)
+            if (!done_mins.count(lo_ft + i * band_ft)) band_indices.push_back(i);
+    }
+    if (verbose && resuming)
+        std::cout << "[Terrain] " << (n_bands - static_cast<int>(band_indices.size()))
+                  << "/" << n_bands << " band(s) already done, unioning "
+                  << band_indices.size() << " remaining\n";
+
+    std::atomic<size_t> next_band{0};
     std::atomic<long long> total_polygons{0};
     std::mutex io_mu;  // guards stdout/stderr so progress lines don't interleave
 
@@ -518,8 +717,9 @@ bool buildTerrainBands(const std::string& server, const std::string& user,
         try {
             pqxx::connection wconn(connstr);
             while (true) {
-                int i = next_band.fetch_add(1, std::memory_order_relaxed);
-                if (i >= n_bands) break;
+                size_t idx = next_band.fetch_add(1, std::memory_order_relaxed);
+                if (idx >= band_indices.size()) break;
+                int i = band_indices[idx];
 
                 int band_min = lo_ft + i * band_ft;
                 int band_max = lo_ft + (i + 1) * band_ft;
@@ -574,17 +774,25 @@ bool buildTerrainBands(const std::string& server, const std::string& user,
         }
     };
 
-    int nthreads = std::max(1, std::min(threads, n_bands));
-    if (verbose)
-        std::cout << "[Terrain] using " << nthreads << " thread(s)\n";
-    std::vector<std::thread> workers;
-    workers.reserve(nthreads);
-    for (int t = 0; t < nthreads; ++t) workers.emplace_back(worker);
-    for (auto& w : workers) w.join();
+    if (!band_indices.empty()) {
+        int nthreads = std::max(1, std::min(threads, static_cast<int>(band_indices.size())));
+        if (verbose)
+            std::cout << "[Terrain] using " << nthreads << " thread(s)\n";
+        std::vector<std::thread> workers;
+        workers.reserve(nthreads);
+        for (int t = 0; t < nthreads; ++t) workers.emplace_back(worker);
+        for (auto& w : workers) w.join();
+    }
 
+    // Full success (every band processed, whether just now or across a
+    // resumed run) — clear the in-progress state so the next call, even
+    // with identical parameters, correctly does a fresh rebuild rather than
+    // being mistaken for resuming this now-finished one.
     try {
         pqxx::work txn(conn);
         txn.exec("DROP TABLE IF EXISTS public.terrain_frags_staging");
+        txn.exec("TRUNCATE public.terrain_frags_staging_progress");
+        txn.exec("DELETE FROM public.terrain_bands_build_state WHERE id = 1");
         txn.commit();
     } catch (const std::exception& e) {
         std::cerr << "[Terrain] buildTerrainBands error dropping staging table: " << e.what() << "\n";
