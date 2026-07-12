@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Data quality spot-check for the nav database.
 
-Samples points across the continental US (a fixed set of major/minor
-airports and named landmarks, plus N random points rejection-sampled to
-real OSM coverage) and checks six data layers against each: nearest
-airport, FAA obstacles, charted airspace (class + special use), WMM
+Samples points globally (a fixed set of major/minor airports and named
+landmarks on multiple continents, plus N random points rejection-sampled
+to real OSM coverage, sphere-correctly distributed so latitude doesn't
+oversample near the poles) and checks against each: nearest airport,
+FAA obstacles (US only -- there's no global obstacle dataset), charted
+airspace (FAA class/special-use in the US, OpenAIP everywhere else), WMM
 magnetic declination, nearby roads (ways), and nearby land-use areas
 (areas). Cross-checks WMM declination against pygeomag (an independent
 NOAA WMM implementation, not this project's own WMMLoader.cpp) and a
@@ -14,12 +16,19 @@ human eyeballing the SQL results.
 
 Meant to be rerun occasionally after a fresh import (or on a schedule),
 not part of the build. Writes an HTML report; pass --json to also dump
-the raw per-point results.
+the raw per-point results (always complete, unlike the HTML table below).
+
+At large sample sizes (thousands of points) the HTML report caps how many
+individual random-point rows it renders (see --max-table-rows) so the page
+stays a reasonable size to load in a browser -- aggregate stats always
+cover the full sample regardless, and every fixed point (airports,
+landmarks) is always shown in full.
 
 Requires: psycopg2-binary, pygeomag (see requirements-dq_check.txt)
 """
 import argparse
 import json
+import math
 import random
 import sys
 
@@ -28,21 +37,73 @@ from pygeomag import GeoMag
 
 # ---- Fixed sample points ----
 
-MAJOR_AIRPORT_IDENTS = ["KATL", "KORD", "KLAX", "KJFK", "KDFW"]
+MAJOR_AIRPORT_IDENTS = [
+    "KATL", "KORD", "KLAX", "KJFK", "KDFW",  # US
+    "EGLL",  # London Heathrow
+    "LFPG",  # Paris Charles de Gaulle
+    "EDDF",  # Frankfurt
+    "RJTT",  # Tokyo Haneda
+    "ZBAA",  # Beijing Capital
+    "VHHH",  # Hong Kong
+    "YSSY",  # Sydney
+    "OMDB",  # Dubai
+    "CYYZ",  # Toronto Pearson
+    "FAOR",  # Johannesburg O.R. Tambo
+]
 
 LANDMARKS = [
     (38.8977, -77.0365, "White House, Washington DC"),
     (37.8199, -122.4783, "Golden Gate Bridge, San Francisco"),
     (40.6892, -74.0445, "Statue of Liberty, NYC"),
     (47.2530, -97.2905, "KVLY-TV mast, Blanchard ND (tall-tower obstacle check)"),
+    (48.8584, 2.2945, "Eiffel Tower, Paris"),
+    (29.9792, 31.1342, "Great Pyramid of Giza"),
+    (-33.8568, 151.2153, "Sydney Opera House"),
+    (-22.9519, -43.2105, "Christ the Redeemer, Rio de Janeiro"),
+    (51.5007, -0.1246, "Big Ben, London"),
+    (55.7520, 37.6175, "Red Square, Moscow"),
+    (35.6586, 139.7454, "Tokyo Tower"),
+    (-13.1631, -72.5450, "Machu Picchu, Peru"),
 ]
 
-CONUS_BBOX = (-124.7, 24.5, -66.9, 49.4)  # min_lon, min_lat, max_lon, max_lat
+# Sampling extent for random points: excludes the extreme polar caps
+# (minimal/degenerate OSM coverage above ~85 deg either way) but is
+# otherwise the whole planet -- this DB covers 3DEP (US) + Copernicus
+# DEM (everywhere else) for terrain and a full-planet OSM import, so
+# unlike the original CONUS-only version there's no reason to restrict
+# sampling to the US.
+WORLD_BBOX = (-180.0, -85.0, 180.0, 85.0)  # min_lon, min_lat, max_lon, max_lat
+
+# OpenAIP's icao_class integer convention (best-effort -- see
+# include/AirspaceLoader.h; OpenAIP doesn't publish these as named
+# constants anywhere queryable, this mapping is inferred from their
+# public API docs). 8 and any other unlisted value render as "?".
+ICAO_CLASS_LABELS = {0: "A", 1: "B", 2: "C", 3: "D", 4: "E", 5: "F", 6: "G"}
+
+# Very rough continent bucketing for the summary breakdown only -- not
+# meant to be geopolitically precise, just enough to sanity-check that
+# random sampling actually landed on multiple continents.
+def rough_region(lat, lon):
+    if lat > 7 and -170 <= lon <= -50:
+        return "North America"
+    if lat <= 7 and lon <= -34:
+        return "South America"
+    if -35 <= lat <= 37 and -20 <= lon <= 52:
+        return "Africa"
+    if 35 <= lat <= 72 and -25 <= lon <= 45:
+        return "Europe"
+    if lon > 45 or lon < -170:
+        return "Asia/Oceania"
+    return "Other"
+
 
 # Stable, independently-verifiable public facts to check the live DB
 # against on every run. These don't change over time, so a mismatch here
 # is a real signal of a data problem, not just a note. Sources are the
-# comments beside each value, not this codebase.
+# comments beside each value, not this codebase. Both rely on FAA obstacle
+# data, so (like the obstacles check generally) these are inherently
+# US-specific -- there's no equivalent global obstacle dataset to check
+# against elsewhere.
 GOLDEN_FACTS = [
     {
         "title": "KVLY-TV mast, Blanchard ND",
@@ -63,6 +124,16 @@ GOLDEN_FACTS = [
 
 def declination(gm, year, lat, lon):
     return gm.calculate(glat=lat, glon=lon, alt=0, time=year).d
+
+
+def _sample_lat(rng, min_lat, max_lat):
+    # Uniform-on-sphere latitude sampling: naive uniform-in-degrees
+    # sampling clusters points near the poles (a degree of longitude
+    # spans much less true surface area up there), so sample uniformly
+    # in sin(latitude) instead and invert.
+    s_min = math.sin(math.radians(min_lat))
+    s_max = math.sin(math.radians(max_lat))
+    return math.degrees(math.asin(rng.uniform(s_min, s_max)))
 
 
 def build_points(cur, n_random, seed):
@@ -99,10 +170,15 @@ def build_points(cur, n_random, seed):
     rng = random.Random(seed)
     attempts = 0
     target = len(points) + n_random
-    while len(points) < target and attempts < n_random * 60:
+    # Global hit-rate (land + OSM way coverage) is much lower than the
+    # original CONUS-only version's (~100%, CONUS is essentially fully
+    # OSM-mapped) -- oceans, ice caps, and remote unmapped land all
+    # reject. 300x gives generous headroom before giving up early.
+    max_attempts = n_random * 300
+    while len(points) < target and attempts < max_attempts:
         attempts += 1
-        lon = rng.uniform(CONUS_BBOX[0], CONUS_BBOX[2])
-        lat = rng.uniform(CONUS_BBOX[1], CONUS_BBOX[3])
+        lon = rng.uniform(WORLD_BBOX[0], WORLD_BBOX[2])
+        lat = _sample_lat(rng, WORLD_BBOX[1], WORLD_BBOX[3])
         cur.execute(
             """
             SELECT count(*) FROM ways
@@ -133,6 +209,8 @@ def query_point(cur, gm, year, lat, lon):
     r = cur.fetchone()
     row["nearest_airport"] = {"ident": r[0], "name": r[1], "type": r[2], "dist_km": round(r[3] / 1000, 2)} if r else None
 
+    # FAA Digital Obstacle File is US + territories only -- zero results
+    # elsewhere reflects lack of source data, not a data quality problem.
     cur.execute(
         """
         SELECT count(*), max(amsl_ht), max(agl_ht) FROM faa_obstacles
@@ -162,6 +240,20 @@ def query_point(cur, gm, year, lat, lon):
         (lon, lat),
     )
     row["sua"] = [{"type": a, "name": b} for a, b in cur.fetchall()]
+
+    # OpenAIP covers every country except the US (FAA is authoritative
+    # there) -- see include/AirspaceLoader.h. icao_class/type are raw
+    # OpenAIP numeric codes; icao_class is decoded best-effort via
+    # ICAO_CLASS_LABELS, type is shown as-is.
+    cur.execute(
+        """
+        SELECT name, type, icao_class, country FROM international_airspace
+        WHERE ST_Contains(geog, ST_Transform(ST_SetSRID(ST_MakePoint(%s,%s),4326),3857))
+        ORDER BY icao_class LIMIT 5
+        """,
+        (lon, lat),
+    )
+    row["intl_airspace"] = [{"name": a, "type": b, "icao_class": c, "country": d} for a, b, c, d in cur.fetchall()]
 
     cur.execute(
         """
@@ -221,18 +313,64 @@ def esc(s):
 KIND_LABEL = {"major_airport": "Major airport", "minor_airport": "Minor airport", "landmark": "Landmark", "random": "Random point"}
 
 
-def render_html(results, golden_results, mean_diff, max_diff):
+def select_table_rows(results, max_rows):
+    """Pick which rows the HTML table renders when there are more results
+    than max_rows. Fixed points (airports/landmarks) always make the cut;
+    random points are prioritized by "interesting-ness" (WMM outliers,
+    zero-coverage points) then filled out with an evenly-spaced subsample
+    for geographic spread. Returns (rows_to_show, n_random_omitted)."""
+    fixed = [r for r in results if r["kind"] != "random"]
+    randoms = [r for r in results if r["kind"] == "random"]
+    if len(fixed) + len(randoms) <= max_rows:
+        return results, 0
+
+    budget = max(0, max_rows - len(fixed))
+    if budget >= len(randoms):
+        return results, 0
+
+    def interesting(r):
+        d = r["wmm"]["diff"]
+        flags = 0
+        if d is not None and d > 0.15:
+            flags += 2
+        if r["ways_total"] == 0 and r["areas_total"] == 0:
+            flags += 1
+        return flags
+
+    scored = sorted(randoms, key=interesting, reverse=True)
+    n_flagged = sum(1 for r in scored if interesting(r) > 0)
+    flagged = scored[:min(n_flagged, budget)]
+    remaining_budget = budget - len(flagged)
+
+    rest = [r for r in randoms if r not in flagged]
+    if remaining_budget > 0 and rest:
+        step = max(1, len(rest) // remaining_budget)
+        subsample = rest[::step][:remaining_budget]
+    else:
+        subsample = []
+
+    shown_randoms = flagged + subsample
+    shown_idx = {r["idx"] for r in shown_randoms}
+    shown = [r for r in results if r["kind"] != "random" or r["idx"] in shown_idx]
+    shown.sort(key=lambda r: r["idx"])
+    return shown, len(randoms) - len(shown_randoms)
+
+
+def render_html(results, golden_results, mean_diff, max_diff, max_table_rows):
     def fmt_airspace(row):
         parts = []
         seen = set()
         for a in row["class_airspace"]:
-            key = (a["class"], a["name"])
+            key = ("faa", a["class"], a["name"])
             if key in seen:
                 continue
             seen.add(key)
             parts.append(f'<span class="chip chip-cls">{esc(a["class"] or "—")}</span> {esc(a["name"])}')
         for s in row["sua"]:
             parts.append(f'<span class="chip chip-sua">{esc(s["type"])}</span> {esc(s["name"])}')
+        for a in row.get("intl_airspace", []):
+            label = ICAO_CLASS_LABELS.get(a["icao_class"], "?")
+            parts.append(f'<span class="chip chip-cls">{esc(label)}</span> {esc(a["name"])} <span class="muted small">({esc(a["country"])})</span>')
         return "<br>".join(parts) if parts else '<span class="muted">none charted (Class G)</span>'
 
     def fmt_names(row, key):
@@ -254,8 +392,10 @@ def render_html(results, golden_results, mean_diff, max_diff):
             return "—"
         return f'{esc(a["ident"])} {esc(a["name"])} <span class="muted">({a["type"]}, {a["dist_km"]}km)</span>'
 
+    shown, n_omitted = select_table_rows(results, max_table_rows)
+
     rows_html = []
-    for r in results:
+    for r in shown:
         cls = "pass" if r["wmm"]["diff"] is not None and r["wmm"]["diff"] <= 0.1 else "warn"
         rows_html.append(f"""
         <tr data-kind="{r['kind']}">
@@ -288,8 +428,25 @@ def render_html(results, golden_results, mean_diff, max_diff):
     landmarks = [r for r in results if r["kind"] == "landmark"]
     random_pts = [r for r in results if r["kind"] == "random"]
     class_b = sum(1 for r in major if any(a["class"] == "B" for a in r["class_airspace"]))
-    no_class = sum(1 for r in results if not r["class_airspace"])
+    no_class = sum(1 for r in results if not r["class_airspace"] and not r.get("intl_airspace"))
     golden_pass = sum(1 for g in golden_results if g["pass"])
+
+    region_counts = {}
+    for r in random_pts:
+        reg = rough_region(r["lat"], r["lon"])
+        region_counts[reg] = region_counts.get(reg, 0) + 1
+    region_stats_html = "".join(
+        f'<div class="stat"><span class="n">{n}</span><span class="lbl">{esc(reg)} (random pts)</span></div>'
+        for reg, n in sorted(region_counts.items(), key=lambda kv: -kv[1])
+    )
+
+    table_note = (
+        f'<p class="muted small">Showing {len(shown)} of {len(results)} points '
+        f'({n_omitted} random points omitted from this table for size -- prioritized by WMM '
+        f'deviation and zero-coverage flags, then an even geographic subsample; pass --json for '
+        f'the complete dataset).</p>'
+        if n_omitted else ""
+    )
 
     return f"""<title>Data Quality Check — nav database</title>
 <style>
@@ -373,11 +530,11 @@ footer {{ color: var(--text-muted); font-size: 0.8rem; border-top: 1px solid var
 </style>
 <div class="wrap">
   <header>
-    <p class="eyebrow">osmpgsqlimport &middot; nav database data quality check</p>
+    <p class="eyebrow">gpsxdb &middot; nav database data quality check</p>
     <h1>Spot check against public records</h1>
-    <p class="subhead">{len(results)} points across the continental US, checked against airports, obstacles,
-    charted airspace, magnetic declination (WMM), roads, and land-use areas, then cross-referenced against
-    publicly known facts.</p>
+    <p class="subhead">{len(results)} points sampled globally, checked against airports, obstacles (FAA, US only),
+    charted airspace (FAA class/SUA in the US, OpenAIP elsewhere), magnetic declination (WMM), roads, and
+    land-use areas, then cross-referenced against publicly known facts.</p>
   </header>
   <div class="stats">
     <div class="stat"><span class="n">{len(results)}</span><span class="lbl">Points checked</span></div>
@@ -386,6 +543,7 @@ footer {{ color: var(--text-muted); font-size: 0.8rem; border-top: 1px solid var
     <div class="stat"><span class="n">{max_diff:.3f}&deg;</span><span class="lbl">Max WMM deviation</span></div>
     <div class="stat"><span class="n">{no_class}</span><span class="lbl">Points correctly uncharted (Class G)</span></div>
     <div class="stat"><span class="n">{golden_pass} / {len(golden_results)}</span><span class="lbl">Golden-fact checks passed</span></div>
+    {region_stats_html}
   </div>
   <section>
     <h2>Golden-fact checks</h2>
@@ -394,13 +552,14 @@ footer {{ color: var(--text-muted); font-size: 0.8rem; border-top: 1px solid var
     </div>
   </section>
   <section>
-    <h2>All {len(results)} points <span class="count">&mdash; {len(major)} major airports, {len(minor)} minor airports, {len(landmarks)} landmarks, {len(random_pts)} random CONUS points</span></h2>
+    <h2>All {len(results)} points <span class="count">&mdash; {len(major)} major airports, {len(minor)} minor airports, {len(landmarks)} landmarks, {len(random_pts)} random global points</span></h2>
+    {table_note}
     <div class="filters">
-      <button class="filter-btn active" data-filter="all">All ({len(results)})</button>
+      <button class="filter-btn active" data-filter="all">All ({len(shown)})</button>
       <button class="filter-btn" data-filter="major_airport">Major airports ({len(major)})</button>
       <button class="filter-btn" data-filter="minor_airport">Minor airports ({len(minor)})</button>
       <button class="filter-btn" data-filter="landmark">Landmarks ({len(landmarks)})</button>
-      <button class="filter-btn" data-filter="random">Random ({len(random_pts)})</button>
+      <button class="filter-btn" data-filter="random">Random ({sum(1 for r in shown if r['kind']=='random')})</button>
     </div>
     <div class="table-scroll">
       <table id="results">
@@ -432,9 +591,10 @@ def main():
     ap.add_argument("-d", "--database", default="nav")
     ap.add_argument("-u", "--user", default="daniel")
     ap.add_argument("-p", "--password", default=None)
-    ap.add_argument("--n-random", type=int, default=86, help="random CONUS points, on top of 5 major + 5 minor airports + 4 landmarks")
+    ap.add_argument("--n-random", type=int, default=10000, help="random global points, on top of the fixed major/minor airports and landmarks (default 10000)")
     ap.add_argument("--seed", type=int, default=None, help="seed for random point selection (omit for a fresh sample each run)")
     ap.add_argument("--year", type=float, default=None, help="decimal year for WMM cross-check (default: today)")
+    ap.add_argument("--max-table-rows", type=int, default=500, help="cap on individual rows rendered in the HTML table (default 500); fixed points always shown in full, random points prioritized by interestingness then subsampled -- full data is always in --json regardless")
     ap.add_argument("-o", "--output", default="dq_report.html")
     ap.add_argument("--json", default=None, help="also write raw per-point results as JSON to this path")
     args = ap.parse_args()
@@ -457,12 +617,13 @@ def main():
 
     results = []
     by_label = {}
+    progress_every = 200 if len(points) > 1000 else 20
     for i, p in enumerate(points):
         row = {"idx": i, "lat": round(p["lat"], 5), "lon": round(p["lon"], 5), "kind": p["kind"], "label": p["label"]}
         row.update(query_point(cur, gm, year, p["lat"], p["lon"]))
         results.append(row)
         by_label[p["label"]] = row
-        if (i + 1) % 20 == 0:
+        if (i + 1) % progress_every == 0:
             print(f"  {i+1}/{len(points)}", file=sys.stderr)
 
     kvly = next(r for r in results if "KVLY" in r["label"])
@@ -482,7 +643,7 @@ def main():
     mean_diff = sum(diffs) / len(diffs) if diffs else 0.0
     max_diff = max(diffs) if diffs else 0.0
 
-    html = render_html(results, golden_results, mean_diff, max_diff)
+    html = render_html(results, golden_results, mean_diff, max_diff, args.max_table_rows)
     with open(args.output, "w") as f:
         f.write(html)
     print(f"Wrote {args.output}", file=sys.stderr)
