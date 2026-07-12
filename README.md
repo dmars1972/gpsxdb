@@ -158,6 +158,24 @@ psql -h localhost -U <your_user_id> -d <your_db> -f create.sql
 psql -h localhost -U <your_user_id> -d <your_db> -f create_airports.sql
 ```
 
+### Authentication
+
+**A `~/.pgpass` file is required.** None of the tools in this project
+accept a password on the command line or via a `-p`/`--password` flag —
+every `pqxx::connection` and `psql`/`raster2pgsql` shell-out relies
+entirely on libpq's standard [`.pgpass`](https://www.postgresql.org/docs/current/libpq-pgpass.html)
+mechanism (or peer/trust auth for local connections). Add a line to
+`~/.pgpass` (mode `0600`) for each host/database/user you'll connect as:
+
+```
+hostname:port:database:username:password
+```
+
+`*` is a valid wildcard for any field (e.g. `myhost:5432:*:myuser:mypass`
+covers every database on that host for that user). Without a matching
+`.pgpass` entry (or passwordless local auth), every tool here will fail
+to connect.
+
 ### PostgreSQL tuning (recommended for import)
 
 Add to `postgresql.conf` and restart **before** starting the import:

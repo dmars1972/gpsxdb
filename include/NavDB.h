@@ -4,10 +4,10 @@
 #include <vector>
 #include <unordered_map>
 #include <cstdint>
-#include <memory>
 #include <mutex>
 
 #include <pqxx/pqxx>
+#include "DbClient.h"
 
 using Tags = std::unordered_map<std::string, std::string>;
 
@@ -22,7 +22,7 @@ using Tags = std::unordered_map<std::string, std::string>;
  * the shared way/area/road tables. The COPY into the per-thread temp table
  * is NOT held under this mutex (it's already isolated per thread).
  */
-class NavDB {
+class NavDB : public DbClient {
 public:
     NavDB(int thread_id,
           const std::string& host,
@@ -166,7 +166,7 @@ private:
     int thread_id_;
     int commit_interval_;
 
-    std::unique_ptr<pqxx::connection> conn_;
+    // conn_ (the actual pqxx::connection) is inherited from DbClient.
     std::mutex& db_flush_mu_;  // shared across all NavDB instances
 
     std::vector<NodeRecord> node_buf_;

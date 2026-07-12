@@ -1,9 +1,10 @@
 // Standalone terrain elevation loader (USGS 3DEP or Copernicus DEM GLO-30).
-// Usage: terrain_load -s <host> -d <db> -u <user> [-p <password>]
+// Usage: terrain_load -s <host> -d <db> -u <user>
 //                      (--bbox minlon,minlat,maxlon,maxlat | --global) [-4]
 //                      [--source 3dep|copernicus]
 //                      [--band-ft <feet>] [--no-bands] [--simplify-m <meters>]
 //                      [--threads <n>]
+// Requires ~/.pgpass for authentication (no -p/password flag).
 #include "TerrainLoader.h"
 #include <iostream>
 #include <string>
@@ -12,7 +13,7 @@
 #include <unistd.h>
 
 int main(int argc, char** argv) {
-    std::string server, database, user, password;
+    std::string server, database, user;
     double min_lon = 0, min_lat = 0, max_lon = 0, max_lat = 0;
     bool have_bbox = false;
     bool global = false;
@@ -27,7 +28,6 @@ int main(int argc, char** argv) {
         if      ((arg == "-s") && i+1 < argc) server   = argv[++i];
         else if ((arg == "-d") && i+1 < argc) database = argv[++i];
         else if ((arg == "-u") && i+1 < argc) user     = argv[++i];
-        else if ((arg == "-p") && i+1 < argc) password = argv[++i];
         else if  (arg == "-4")                dest_srid = 4326;
         else if  (arg == "--no-bands")        band_ft = 0;
         else if  (arg == "--global")          global = true;
@@ -52,7 +52,7 @@ int main(int argc, char** argv) {
             have_bbox = true;
         }
         else if (arg == "-h" || arg == "--help") {
-            std::cout << "Usage: terrain_load -s <host> -d <db> -u <user> [-p <pass>]\n"
+            std::cout << "Usage: terrain_load -s <host> -d <db> -u <user>\n"
                          "                     (--bbox minlon,minlat,maxlon,maxlat | --global)\n"
                          "                     [-4 (WGS84 instead of Mercator)]\n"
                          "                     [--source 3dep|copernicus, default 3dep (US-only, higher accuracy);\n"
@@ -66,7 +66,9 @@ int main(int argc, char** argv) {
                          "  continental US -- 3DEP is authoritative there, load separately with\n"
                          "  --source 3dep -- and Antarctica). Ignores --bbox and --source. Band\n"
                          "  generation is suppressed per-region and runs once at the very end\n"
-                         "  instead (or pass --no-bands to skip it entirely).\n";
+                         "  instead (or pass --no-bands to skip it entirely).\n"
+                         "\n"
+                         "Requires ~/.pgpass for authentication.\n";
             std::cout.flush();
             _exit(0);
         }
@@ -91,12 +93,11 @@ int main(int argc, char** argv) {
         _exit(1);
     }
 
+    TerrainLoader loader(server, user, database);
     bool ok = global
-        ? loadGlobalTerrain(server, user, database, password,
-                            dest_srid, band_ft, simplify_m, threads, true)
-        : loadTerrain(server, user, database, password,
-                     min_lon, min_lat, max_lon, max_lat,
-                     source, dest_srid, band_ft, simplify_m, threads, true);
+        ? loader.loadGlobal(dest_srid, band_ft, simplify_m, threads, true)
+        : loader.load(min_lon, min_lat, max_lon, max_lat,
+                      source, dest_srid, band_ft, simplify_m, threads, true);
     std::cout.flush();
     // _exit skips static destructor teardown that causes double-free with PROJ/pqxx
     _exit(ok ? 0 : 1);

@@ -54,10 +54,10 @@ static long remoteLastModified(const std::string& url) {
 Replicator::Replicator(DeltaApplier& applier, NavDB& db,
                         ReplicationGranularity granularity,
                         std::string server, std::string user,
-                        std::string database, std::string password)
+                        std::string database)
     : applier_(applier), db_(db), granularity_(granularity),
       server_(std::move(server)), user_(std::move(user)),
-      database_(std::move(database)), password_(std::move(password)) {}
+      database_(std::move(database)) {}
 
 std::string Replicator::baseUrl() const {
     switch (granularity_) {
@@ -177,8 +177,8 @@ void Replicator::checkExternalData() {
                   << " data has been updated upstream, reloading...\n";
         try {
             bool ok = (std::string(src.name) == "airports")
-                ? loadAirportsData(server_, user_, database_, password_, false)
-                : loadFAAObstacles(server_, user_, database_, password_, false);
+                ? AirportsLoader(server_, user_, database_).load(false)
+                : FAAObstacleLoader(server_, user_, database_).load(false);
             if (ok) {
                 db_.setExternalDataTimestamp(src.name, remote_mtime);
                 std::cout << "[Replicator] " << src.name << " reload complete\n";
@@ -209,7 +209,7 @@ void Replicator::checkWMMRefresh() {
 
     std::cout << "[Replicator] refreshing WMM declination data (3-month cadence)...\n";
     try {
-        bool ok = loadWMM(server_, user_, database_, password_, currentDecimalYear());
+        bool ok = WMMLoader(server_, user_, database_).load(currentDecimalYear());
         if (ok) {
             db_.setExternalDataTimestamp("wmm", now);
             std::cout << "[Replicator] WMM refresh complete\n";
@@ -236,11 +236,12 @@ void Replicator::checkAirspaceRefresh() {
 
     std::cout << "[Replicator] refreshing airspace data (8-week cadence)...\n";
     try {
-        bool ok = loadClassAirspace(server_, user_, database_, password_, false);
-        ok = loadSpecialUseAirspace(server_, user_, database_, password_, false) && ok;
+        AirspaceLoader airspace(server_, user_, database_);
+        bool ok = airspace.loadClassAirspace(false);
+        ok = airspace.loadSpecialUseAirspace(false) && ok;
         std::string openaip_key = defaultOpenAipApiKey();
         if (!openaip_key.empty()) {
-            ok = loadInternationalAirspace(server_, user_, database_, password_, openaip_key, false) && ok;
+            ok = airspace.loadInternationalAirspace(openaip_key, false) && ok;
         } else {
             std::cerr << "[Replicator] no OpenAIP API key (~/.openaip_api_key) — "
                          "skipping international airspace refresh\n";

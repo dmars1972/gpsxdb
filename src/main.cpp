@@ -2,6 +2,7 @@
 #include "OSMMMap.h"
 #include "NavDB.h"
 #include "Log.h"
+#include "GeoUtils.h"
 
 #include <iostream>
 #include <string>
@@ -164,100 +165,17 @@ struct Status {
 };
 
 // ---- WKB helpers ----
-
+//
 // Process-level SRID — set at startup from -M flag.
 // 3857 = Web Mercator (default), 4326 = WGS84
 int g_srid = 3857;
 
-static std::string buildWayGeom(const std::vector<std::pair<double,double>>& coords,
-                                bool& is_closed) {
-    if (coords.size() < 2) return "";
-    is_closed = (coords.size() >= 4 &&
-                 coords.front().first  == coords.back().first &&
-                 coords.front().second == coords.back().second);
-
-    auto toHex = [](const std::vector<uint8_t>& b) {
-        static const char h[] = "0123456789ABCDEF";
-        std::string s; s.reserve(b.size()*2);
-        for (auto x : b) { s += h[x>>4]; s += h[x&0xF]; }
-        return s;
-    };
-    auto wd = [](std::vector<uint8_t>& buf, double v) {
-        uint8_t t[8]; memcpy(t, &v, 8);
-        buf.insert(buf.end(), t, t+8);
-    };
-    auto wu32 = [](std::vector<uint8_t>& buf, uint32_t v) {
-        buf.push_back(v&0xFF); buf.push_back((v>>8)&0xFF);
-        buf.push_back((v>>16)&0xFF); buf.push_back((v>>24)&0xFF);
-    };
-
-    std::vector<uint8_t> buf;
-    buf.push_back(0x01);
-    if (is_closed) {
-        wu32(buf, 0x20000003); // WKB polygon with SRID flag
-        wu32(buf, static_cast<uint32_t>(g_srid));
-        wu32(buf, 1);          // 1 ring
-    } else {
-        wu32(buf, 0x20000002); // WKB linestring with SRID flag
-        wu32(buf, static_cast<uint32_t>(g_srid));
-    }
-    wu32(buf, static_cast<uint32_t>(coords.size()));
-    for (auto& [x, y] : coords) { wd(buf, x); wd(buf, y); }
-    return toHex(buf);
-}
-
-static std::string mergeWayGeoms(const std::vector<std::string>& wkb_hexes) {
-    auto fromHex = [](const std::string& hex) {
-        std::vector<uint8_t> b; b.reserve(hex.size()/2);
-        for (size_t i = 0; i + 1 < hex.size(); i += 2) {
-            auto n = [](char c) -> uint8_t {
-                if (c >= '0' && c <= '9') return c-'0';
-                if (c >= 'A' && c <= 'F') return c-'A'+10;
-                if (c >= 'a' && c <= 'f') return c-'a'+10;
-                return 0;
-            };
-            b.push_back((n(hex[i]) << 4) | n(hex[i+1]));
-        }
-        return b;
-    };
-    auto toHex = [](const std::vector<uint8_t>& b) {
-        static const char h[] = "0123456789ABCDEF";
-        std::string s; s.reserve(b.size()*2);
-        for (auto x : b) { s += h[x>>4]; s += h[x&0xF]; }
-        return s;
-    };
-    auto wu32 = [](std::vector<uint8_t>& buf, uint32_t v) {
-        buf.push_back(v&0xFF); buf.push_back((v>>8)&0xFF);
-        buf.push_back((v>>16)&0xFF); buf.push_back((v>>24)&0xFF);
-    };
-
-    // Only include LineString (type 2) and MultiLineString (type 5) —
-    // skip Polygon (type 3) and other non-linear geometries
-    auto isLinear = [](const std::vector<uint8_t>& b) -> bool {
-        if (b.size() < 5) return false;
-        // byte 0 = byte order, bytes 1-4 = geometry type (little-endian)
-        uint32_t gtype = b[1] | (b[2]<<8) | (b[3]<<16) | (b[4]<<24);
-        // strip SRID flag if present
-        gtype &= 0xFFFF;
-        return gtype == 2 || gtype == 5;
-    };
-
-    std::vector<std::vector<uint8_t>> parts;
-    for (auto& h : wkb_hexes) {
-        if (h.empty()) continue;
-        auto b = fromHex(h);
-        if (isLinear(b)) parts.push_back(std::move(b));
-    }
-    if (parts.empty()) return "";
-
-    std::vector<uint8_t> buf;
-    buf.push_back(0x01);
-    wu32(buf, 0x20000005); // MultiLineString with SRID flag
-    wu32(buf, static_cast<uint32_t>(g_srid));
-    wu32(buf, static_cast<uint32_t>(parts.size()));
-    for (auto& p : parts) buf.insert(buf.end(), p.begin(), p.end());
-    return toHex(buf);
-}
+// buildWayGeom, mergeWayGeoms, and the ring/polygon WKB primitives used by
+// buildMultipolygon below live in GeoUtils now — they're pure geometry
+// construction with no OSM-specific dependencies, unlike buildMultipolygon
+// itself (needs RelationEntry and NavDB), so they're usable by loaders
+// that have nothing to do with OSM relations (AirspaceLoader,
+// FAAObstacleLoader already share GeoUtils for pointWKB).
 
 // ---- Args ----
 
@@ -621,99 +539,6 @@ void nodeThread(int tid,
 // Returns an empty string if the rings can't be assembled (e.g. missing
 // member geometries, disconnected rings), in which case the relation is
 // stored with an empty geometry rather than a wrong one.
-
-using Ring    = std::vector<std::pair<double,double>>;
-using Segment = std::vector<std::pair<double,double>>;
-
-// Try to stitch a set of open segments into closed rings.
-// Returns the stitched rings, or empty if stitching fails.
-static std::vector<Ring> stitchRings(std::vector<Segment> segs) {
-    std::vector<Ring> rings;
-
-    while (!segs.empty()) {
-        // Start a new ring with the first available segment
-        Ring ring = std::move(segs.front());
-        segs.erase(segs.begin());
-
-        bool progress = true;
-        while (progress) {
-            progress = false;
-            if (ring.size() >= 4 &&
-                ring.front().first  == ring.back().first &&
-                ring.front().second == ring.back().second) {
-                break; // ring is closed — done
-            }
-            for (size_t i = 0; i < segs.size(); ++i) {
-                auto& seg = segs[i];
-                if (seg.empty()) continue;
-                auto& rb = ring.back();
-                if (seg.front().first  == rb.first &&
-                    seg.front().second == rb.second) {
-                    // append forward
-                    ring.insert(ring.end(), seg.begin() + 1, seg.end());
-                    segs.erase(segs.begin() + i);
-                    progress = true; break;
-                }
-                if (seg.back().first  == rb.first &&
-                    seg.back().second == rb.second) {
-                    // append reversed
-                    ring.insert(ring.end(), seg.rbegin() + 1, seg.rend());
-                    segs.erase(segs.begin() + i);
-                    progress = true; break;
-                }
-            }
-        }
-
-        // Ensure ring is closed
-        if (!ring.empty() &&
-            (ring.front().first  != ring.back().first ||
-             ring.front().second != ring.back().second)) {
-            ring.push_back(ring.front());
-        }
-
-        if (ring.size() >= 4)
-            rings.push_back(std::move(ring));
-    }
-    return rings;
-}
-
-// Write a WKB ring (LinearRing) into a buffer
-static void writeWkbRing(std::vector<uint8_t>& buf, const Ring& ring) {
-    auto wu32 = [&](uint32_t v) {
-        buf.push_back(v & 0xff); buf.push_back((v>>8)&0xff);
-        buf.push_back((v>>16)&0xff); buf.push_back((v>>24)&0xff);
-    };
-    auto wf64 = [&](double v) {
-        uint64_t u; memcpy(&u, &v, 8);
-        for (int i = 0; i < 8; ++i) buf.push_back((u >> (8*i)) & 0xff);
-    };
-    wu32(static_cast<uint32_t>(ring.size()));
-    for (auto& [x, y] : ring) { wf64(x); wf64(y); }
-}
-
-// Write a WKB POLYGON (one outer + zero or more inner rings)
-static void writeWkbPolygon(std::vector<uint8_t>& buf,
-                             const Ring& outer,
-                             const std::vector<Ring>& inners) {
-    auto wu32 = [&](uint32_t v) {
-        buf.push_back(v & 0xff); buf.push_back((v>>8)&0xff);
-        buf.push_back((v>>16)&0xff); buf.push_back((v>>24)&0xff);
-    };
-    buf.push_back(1);           // little-endian
-    wu32(0x20000003);           // WKB type: POLYGON with SRID
-    wu32(static_cast<uint32_t>(g_srid));
-    wu32(1 + inners.size());    // ring count
-    writeWkbRing(buf, outer);
-    for (auto& inner : inners) writeWkbRing(buf, inner);
-}
-
-static std::string toHex(const std::vector<uint8_t>& buf) {
-    static const char* h = "0123456789ABCDEF";
-    std::string out;
-    out.reserve(buf.size() * 2);
-    for (uint8_t b : buf) { out += h[b>>4]; out += h[b&0xf]; }
-    return out;
-}
 
 static std::string buildMultipolygon(
         const RelationEntry& item, NavDB& db) {
@@ -1087,40 +912,44 @@ int main(int argc, char** argv) {
                 NavDB db(0, args.server, args.user, args.database, db_flush_mu_early);
                 db.truncateForResume("airports");
             }
-            loadAirportsData(args.server, args.user, args.database, "", false);
+            AirportsLoader(args.server, args.user, args.database).load(false);
             LOGI(-1, "airports data loaded");
         }
         if (args.resume_phase == Phase::FAALoading || args.resume_phase == Phase::Vacuuming) {
             LOGI(-1, "resume: loading FAA obstacle data");
-            loadFAAObstacles(args.server, args.user, args.database, "", false);
+            FAAObstacleLoader(args.server, args.user, args.database).load(false);
             LOGI(-1, "FAA obstacle data loaded");
         }
         if (args.resume_phase == Phase::FAALoading || args.resume_phase == Phase::WMMLoading
             || args.resume_phase == Phase::Vacuuming) {
             LOGI(-1, "resume: loading WMM declination data");
-            loadWMM(args.server, args.user, args.database, "", currentDecimalYear(),
+            WMMLoader(args.server, args.user, args.database).load(currentDecimalYear(),
                     -180, -90, 180, 90, 0.25, 3857, 0.25, 50.0, 4, false);
             LOGI(-1, "WMM declination data loaded");
         }
         if (args.resume_phase == Phase::WMMLoading || args.resume_phase == Phase::AirspaceLoading
             || args.resume_phase == Phase::Vacuuming) {
             LOGI(-1, "resume: loading airspace data");
-            loadClassAirspace(args.server, args.user, args.database, "", false);
-            loadSpecialUseAirspace(args.server, args.user, args.database, "", false);
-            std::string openaip_key = defaultOpenAipApiKey();
-            if (!openaip_key.empty())
-                loadInternationalAirspace(args.server, args.user, args.database, "", openaip_key, false);
-            else
-                LOGI(-1, "no OpenAIP API key found (~/.openaip_api_key) — skipping international airspace");
+            {
+                AirspaceLoader airspace(args.server, args.user, args.database);
+                airspace.loadClassAirspace(false);
+                airspace.loadSpecialUseAirspace(false);
+                std::string openaip_key = defaultOpenAipApiKey();
+                if (!openaip_key.empty())
+                    airspace.loadInternationalAirspace(openaip_key, false);
+                else
+                    LOGI(-1, "no OpenAIP API key found (~/.openaip_api_key) — skipping international airspace");
+            }
             LOGI(-1, "airspace data loaded");
         }
         if (args.resume_phase == Phase::AirspaceLoading || args.resume_phase == Phase::TerrainLoading
             || args.resume_phase == Phase::Vacuuming) {
             LOGI(-1, "resume: loading terrain elevation data");
-            loadTerrain(args.server, args.user, args.database, "",
-                       -125, 24, -66, 50, TerrainSource::USGS3DEP, 3857, 500, 50.0, 4, false);
-            loadGlobalTerrain(args.server, args.user, args.database, "",
-                             3857, 500, 50.0, 4, false);
+            {
+                TerrainLoader terrain(args.server, args.user, args.database);
+                terrain.load(-125, 24, -66, 50, TerrainSource::USGS3DEP, 3857, 500, 50.0, 4, false);
+                terrain.loadGlobal(3857, 500, 50.0, 4, false);
+            }
             LOGI(-1, "terrain elevation data loaded");
         }
         LOGI(-1, "resume: running VACUUM ANALYZE on all tables");
@@ -1379,28 +1208,29 @@ int main(int argc, char** argv) {
 
     status.advancePhase(Phase::Indexing, Phase::AirportsLoading);
     LOGI(-1, "loading airports data");
-    loadAirportsData(args.server, args.user, args.database, "", false);
+    AirportsLoader(args.server, args.user, args.database).load(false);
     LOGI(-1, "airports data loaded");
 
     status.advancePhase(Phase::AirportsLoading, Phase::FAALoading);
     LOGI(-1, "loading FAA obstacle data");
-    loadFAAObstacles(args.server, args.user, args.database, "", false);
+    FAAObstacleLoader(args.server, args.user, args.database).load(false);
     LOGI(-1, "FAA obstacle data loaded");
 
     status.advancePhase(Phase::FAALoading, Phase::WMMLoading);
     LOGI(-1, "loading WMM declination data");
-    loadWMM(args.server, args.user, args.database, "", currentDecimalYear(),
+    WMMLoader(args.server, args.user, args.database).load(currentDecimalYear(),
             -180, -90, 180, 90, 0.25, 3857, 0.25, 50.0, 4, false);
     LOGI(-1, "WMM declination data loaded");
 
     status.advancePhase(Phase::WMMLoading, Phase::AirspaceLoading);
     LOGI(-1, "loading airspace data");
-    loadClassAirspace(args.server, args.user, args.database, "", false);
-    loadSpecialUseAirspace(args.server, args.user, args.database, "", false);
     {
+        AirspaceLoader airspace(args.server, args.user, args.database);
+        airspace.loadClassAirspace(false);
+        airspace.loadSpecialUseAirspace(false);
         std::string openaip_key = defaultOpenAipApiKey();
         if (!openaip_key.empty())
-            loadInternationalAirspace(args.server, args.user, args.database, "", openaip_key, false);
+            airspace.loadInternationalAirspace(openaip_key, false);
         else
             LOGI(-1, "no OpenAIP API key found (~/.openaip_api_key) — skipping international airspace");
     }
@@ -1408,10 +1238,11 @@ int main(int argc, char** argv) {
 
     status.advancePhase(Phase::AirspaceLoading, Phase::TerrainLoading);
     LOGI(-1, "loading terrain elevation data");
-    loadTerrain(args.server, args.user, args.database, "",
-               -125, 24, -66, 50, TerrainSource::USGS3DEP, 3857, 500, 50.0, 4, false);
-    loadGlobalTerrain(args.server, args.user, args.database, "",
-                     3857, 500, 50.0, 4, false);
+    {
+        TerrainLoader terrain(args.server, args.user, args.database);
+        terrain.load(-125, 24, -66, 50, TerrainSource::USGS3DEP, 3857, 500, 50.0, 4, false);
+        terrain.loadGlobal(3857, 500, 50.0, 4, false);
+    }
     LOGI(-1, "terrain elevation data loaded");
 
     status.advancePhase(Phase::TerrainLoading, Phase::Vacuuming);

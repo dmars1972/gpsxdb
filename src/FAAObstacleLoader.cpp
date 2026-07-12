@@ -107,9 +107,7 @@ static std::string obstaclePointWKB(double lon, double lat) {
 // OBSTACLE_TYPE, QUANTITY, AGL_HT, AMSL_HT, LIGHTING, HOR_ACC, VER_ACC,
 // MARK_INDICATOR, FAA_STUDY_NO, ACTION, JULIAN_DATE
 
-bool loadFAAObstacles(const std::string& server, const std::string& user,
-                      const std::string& database, const std::string& password,
-                      bool verbose) {
+bool FAAObstacleLoader::load(bool verbose) {
     const std::string csv_url  = "https://aeronav.faa.gov/Obst_Data/DAILY_DOF_CSV.ZIP";
     const std::string zip_path = "/tmp/faa_ddof_csv.zip";
     const std::string csv_dir  = "/tmp/faa_ddof_csv";
@@ -155,14 +153,9 @@ bool loadFAAObstacles(const std::string& server, const std::string& user,
 
     if (verbose) std::cout << "Loading FAA obstacle data from " << actual_csv << "...\n";
 
-    std::string conn_str = "host=" + server + " dbname=" + database +
-                           " user=" + user;
-    if (!password.empty()) conn_str += " password=" + password;
-    pqxx::connection conn(conn_str);
-
     // Create table if it doesn't exist, then truncate
     {
-        pqxx::nontransaction txn(conn);
+        pqxx::nontransaction txn(conn_);
         txn.exec(R"(
             CREATE TABLE IF NOT EXISTS public.faa_obstacles (
                 id              serial PRIMARY KEY,
@@ -194,12 +187,12 @@ bool loadFAAObstacles(const std::string& server, const std::string& user,
         txn.exec("CREATE INDEX IF NOT EXISTS faa_obstacles_agl_idx   ON public.faa_obstacles (agl_ht)");
     }
     {
-        pqxx::work txn(conn);
+        pqxx::work txn(conn_);
         txn.exec("TRUNCATE faa_obstacles");
         txn.commit();
     }
 
-    pqxx::work txn(conn);
+    pqxx::work txn(conn_);
     auto stream = pqxx::stream_to::table(txn, {"faa_obstacles"}, {
         "oas_number", "verified", "country", "state", "city",
         "latitude", "longitude", "obstacle_type", "quantity",

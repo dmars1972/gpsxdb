@@ -347,9 +347,7 @@ static void loadNavaids(pqxx::connection& conn, const std::string& path, bool ve
 
 // ---- Public entry point ----
 
-bool loadAirportsData(const std::string& server, const std::string& user,
-                      const std::string& database, const std::string& password,
-                      bool verbose) {
+bool AirportsLoader::load(bool verbose) {
     const std::string base = "https://davidmegginson.github.io/ourairports-data/";
     const std::string tmp  = "/tmp/ourairports_";
 
@@ -372,29 +370,24 @@ bool loadAirportsData(const std::string& server, const std::string& user,
         if (verbose) std::cout << "OK\n";
     }
 
-    std::string connstr = "host=" + server + " dbname=" + database +
-                          " user=" + user + " sslmode=disable";
-    if (!password.empty()) connstr += " password=" + password;
-
-    pqxx::connection conn(connstr);
-    { pqxx::work txn(conn); txn.exec("SET synchronous_commit = off"); txn.commit(); }
+    { pqxx::work txn(conn_); txn.exec("SET synchronous_commit = off"); txn.commit(); }
 
     // Truncate before reload so this is safe to call more than once against
     // a live database (e.g. periodic upstream-update checks in poll mode),
     // not just once against freshly-created empty tables.
     {
-        pqxx::work txn(conn);
+        pqxx::work txn(conn_);
         txn.exec("TRUNCATE countries, regions, airports, tags, frequencies, runways, navaids");
         txn.commit();
     }
 
     if (verbose) std::cout << "Loading airports data...\n";
-    loadCountries  (conn, files[0].dest, verbose);
-    loadRegions    (conn, files[1].dest, verbose);
-    loadAirports   (conn, files[2].dest, verbose);
-    loadFrequencies(conn, files[3].dest, verbose);
-    loadRunways    (conn, files[4].dest, verbose);
-    loadNavaids    (conn, files[5].dest, verbose);
+    loadCountries  (conn_, files[0].dest, verbose);
+    loadRegions    (conn_, files[1].dest, verbose);
+    loadAirports   (conn_, files[2].dest, verbose);
+    loadFrequencies(conn_, files[3].dest, verbose);
+    loadRunways    (conn_, files[4].dest, verbose);
+    loadNavaids    (conn_, files[5].dest, verbose);
     if (verbose) std::cout << "Airports data loaded.\n";
     return true;
 }

@@ -8,45 +8,12 @@
 #include <stdexcept>
 #include <cstring>
 #include <arpa/inet.h>  // ntohl
-#include <proj.h>       // PROJ 6+ C API
 
-// ---- WKB helpers ----
-
-static std::string toHex(const std::vector<uint8_t>& bytes) {
-    static const char hex[] = "0123456789ABCDEF";
-    std::string s;
-    s.reserve(bytes.size() * 2);
-    for (auto b : bytes) {
-        s += hex[b >> 4];
-        s += hex[b & 0xF];
-    }
-    return s;
-}
-
-static void writeDouble(std::vector<uint8_t>& buf, double v) {
-    uint8_t tmp[8];
-    memcpy(tmp, &v, 8);
-    buf.insert(buf.end(), tmp, tmp + 8);
-}
-
-static void writeUint32(std::vector<uint8_t>& buf, uint32_t v) {
-    buf.push_back(v & 0xFF);
-    buf.push_back((v >> 8) & 0xFF);
-    buf.push_back((v >> 16) & 0xFF);
-    buf.push_back((v >> 24) & 0xFF);
-}
-
-// Defined in main.cpp — set at startup from -M flag
-
-std::string pointWKB(double lon, double lat) {
-    std::vector<uint8_t> buf;
-    buf.push_back(0x01);
-    writeUint32(buf, 0x20000001); // WKB POINT with SRID flag
-    writeUint32(buf, static_cast<uint32_t>(g_srid));
-    writeDouble(buf, lon);
-    writeDouble(buf, lat);
-    return toHex(buf);
-}
+// toMercator and pointWKB used to be duplicated here (byte-for-byte
+// identical to GeoUtils.cpp) — silently unexercised as an ODR violation
+// since GeoUtils.cpp was never linked into the same binary as this file
+// until osm_import picked it up. Now declared once in GeoUtils.h
+// (included via OSMReader.h) and defined once in GeoUtils.cpp.
 
 // ---- getTags: static free function ----
 
@@ -59,31 +26,6 @@ static Tags getTags(const google::protobuf::RepeatedPtrField<std::string>& strta
              strtable.Get(static_cast<int>(vals.Get(i)));
     }
     return tags;
-}
-
-// ---- Mercator projection (thread-local PROJ context) ----
-
-struct ProjContext {
-    PJ_CONTEXT* ctx;
-    PJ* pj;
-    ProjContext() {
-        ctx = proj_context_create();
-        pj = proj_create_crs_to_crs(ctx, "EPSG:4326", "EPSG:3857", nullptr);
-        if (!pj) throw std::runtime_error("PROJ: failed to create CRS transform");
-        pj = proj_normalize_for_visualization(ctx, pj);
-    }
-    ~ProjContext() {
-        proj_destroy(pj);
-        proj_context_destroy(ctx);
-    }
-};
-
-static thread_local ProjContext tl_proj;
-
-std::pair<double,double> toMercator(double lon, double lat) {
-    PJ_COORD in  = proj_coord(lon, lat, 0, 0);
-    PJ_COORD out = proj_trans(tl_proj.pj, PJ_FWD, in);
-    return {out.xy.x, out.xy.y};
 }
 
 // ---- OSMReader ----

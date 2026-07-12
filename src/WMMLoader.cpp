@@ -333,25 +333,18 @@ std::vector<Cell> cellsForBBox(double min_lon, double min_lat, double max_lon, d
 
 } // namespace
 
-bool loadWMM(const std::string& server, const std::string& user,
-             const std::string& database, const std::string& password,
-             double year,
-             double min_lon, double min_lat, double max_lon, double max_lat,
-             double grid_deg, int dest_srid, double band_deg, double simplify_m,
-             int threads, bool verbose) {
+bool WMMLoader::load(double year,
+                      double min_lon, double min_lat, double max_lon, double max_lat,
+                      double grid_deg, int dest_srid, double band_deg, double simplify_m,
+                      int threads, bool verbose) {
     auto cells = cellsForBBox(min_lon, min_lat, max_lon, max_lat);
     if (cells.empty()) {
         std::cerr << "[WMM] bounding box produced no cells\n";
         return false;
     }
 
-    std::string connstr = "host=" + server + " dbname=" + database +
-                          " user=" + user + " sslmode=disable";
-    if (!password.empty()) connstr += " password=" + password;
-
-    pqxx::connection conn(connstr);
     {
-        pqxx::work txn(conn);
+        pqxx::work txn(conn_);
         txn.exec("CREATE EXTENSION IF NOT EXISTS postgis_raster");
         txn.exec("CREATE TABLE IF NOT EXISTS public.wmm (rid serial PRIMARY KEY, rast public.raster)");
         txn.exec("CREATE INDEX IF NOT EXISTS wmm_rast_gist ON public.wmm USING GIST (ST_ConvexHull(rast))");
@@ -364,7 +357,7 @@ bool loadWMM(const std::string& server, const std::string& user,
 
     std::vector<Cell> to_load;
     for (auto& c : cells) {
-        pqxx::work txn(conn);
+        pqxx::work txn(conn_);
         auto r = txn.exec("SELECT 1 FROM wmm_cells WHERE cell_name=$1", pqxx::params{c.name});
         txn.commit();
         if (r.empty()) to_load.push_back(c);
@@ -374,7 +367,7 @@ bool loadWMM(const std::string& server, const std::string& user,
     if (to_load.empty()) {
         if (verbose) std::cout << "All requested cells already loaded.\n";
         if (band_deg > 0)
-            buildWMMBands(server, user, database, password, band_deg, dest_srid, simplify_m, threads, verbose);
+            buildBands(band_deg, dest_srid, simplify_m, threads, verbose);
         return true;
     }
 
@@ -391,7 +384,7 @@ bool loadWMM(const std::string& server, const std::string& user,
         // process via std::terminate(), so a transient connection failure
         // here must not be allowed to propagate past this thread.
         try {
-            pqxx::connection wconn(connstr);
+            pqxx::connection wconn = newConnection();
             while (true) {
                 size_t idx = next_cell.fetch_add(1, std::memory_order_relaxed);
                 if (idx >= to_load.size()) break;
@@ -465,21 +458,14 @@ bool loadWMM(const std::string& server, const std::string& user,
     if (verbose) std::cout << "WMM data loaded (" << total_loaded.load() << " new cell(s)).\n";
 
     if (band_deg > 0)
-        buildWMMBands(server, user, database, password, band_deg, dest_srid, simplify_m, threads, verbose);
+        buildBands(band_deg, dest_srid, simplify_m, threads, verbose);
 
     return true;
 }
 
-bool buildWMMBands(const std::string& server, const std::string& user,
-                    const std::string& database, const std::string& password,
-                    double band_deg, int dest_srid, double simplify_m, int threads, bool verbose) {
-    std::string connstr = "host=" + server + " dbname=" + database +
-                          " user=" + user + " sslmode=disable";
-    if (!password.empty()) connstr += " password=" + password;
-    pqxx::connection conn(connstr);
-
+bool WMMLoader::buildBands(double band_deg, int dest_srid, double simplify_m, int threads, bool verbose) {
     {
-        pqxx::work txn(conn);
+        pqxx::work txn(conn_);
         txn.exec(
             "CREATE TABLE IF NOT EXISTS public.wmm_bands ("
             "  id serial PRIMARY KEY,"
@@ -494,7 +480,7 @@ bool buildWMMBands(const std::string& server, const std::string& user,
 
     double min_deg, max_deg;
     {
-        pqxx::work txn(conn);
+        pqxx::work txn(conn_);
         auto r = txn.exec(
             "SELECT min(s.min), max(s.max) "
             "FROM public.wmm t, LATERAL ST_SummaryStats(t.rast, 1) s");
@@ -518,7 +504,7 @@ bool buildWMMBands(const std::string& server, const std::string& user,
                   << " deg), merging across all computed cells...\n";
 
     try {
-        pqxx::work txn(conn);
+        pqxx::work txn(conn_);
         txn.exec("TRUNCATE public.wmm_bands");
         txn.commit();
     } catch (const std::exception& e) {
@@ -568,7 +554,7 @@ bool buildWMMBands(const std::string& server, const std::string& user,
                      "(single pass over " << n_bands << " bands)...\n";
 
     try {
-        pqxx::work txn(conn);
+        pqxx::work txn(conn_);
         txn.exec("DROP TABLE IF EXISTS public.wmm_frags_staging");
         txn.exec(
             "CREATE TABLE public.wmm_frags_staging ("
@@ -603,7 +589,7 @@ bool buildWMMBands(const std::string& server, const std::string& user,
 
     auto worker = [&]() {
         try {
-            pqxx::connection wconn(connstr);
+            pqxx::connection wconn = newConnection();
             while (true) {
                 int i = next_band.fetch_add(1, std::memory_order_relaxed);
                 if (i >= n_bands) break;
@@ -655,7 +641,7 @@ bool buildWMMBands(const std::string& server, const std::string& user,
     for (auto& w : workers) w.join();
 
     try {
-        pqxx::work txn(conn);
+        pqxx::work txn(conn_);
         txn.exec("DROP TABLE IF EXISTS public.wmm_frags_staging");
         txn.commit();
     } catch (const std::exception& e) {

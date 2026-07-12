@@ -36,6 +36,7 @@ add_executable(osm_import
     src/AirspaceLoader.cpp
     src/TerrainLoader.cpp
     src/PlanetDownloader.cpp
+    src/GeoUtils.cpp
     proto/fileformat.proto
     proto/osmformat.proto
 )

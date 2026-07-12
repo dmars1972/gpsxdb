@@ -67,21 +67,16 @@ NavDB::NavDB(int thread_id, const std::string& host,
              const std::string& user, const std::string& database,
              std::mutex& db_flush_mu,
              int commit_interval)
-    : thread_id_(thread_id), commit_interval_(commit_interval), db_flush_mu_(db_flush_mu) {
+    : DbClient(host, user, database),
+      thread_id_(thread_id), commit_interval_(commit_interval), db_flush_mu_(db_flush_mu) {
     // Stagger flush thresholds so threads don't all flush simultaneously.
     // Thread N flushes at WAY_BUFFER_SIZE + N*137 (prime offset avoids harmonics).
     way_buffer_size_ = WAY_BUFFER_SIZE + thread_id * 137;
 
-    std::string connstr = "host=" + host +
-                          " dbname=" + database +
-                          " user=" + user +
-                          " sslmode=disable";
-    conn_ = std::make_unique<pqxx::connection>(connstr);
     // Optimize for bulk import — disable WAL sync and fsync per connection
-    pqxx::work txn(*conn_);
+    pqxx::work txn(conn_);
     txn.exec("SET synchronous_commit = off");
     txn.commit();
-
 }
 
 NavDB::~NavDB() {
@@ -186,7 +181,7 @@ void NavDB::finalize_tags_locked(const std::string& table) {
     if (buf.empty()) return;
     LOGI(thread_id_, "finalize_tags table=", table, " count=", buf.size());
     try {
-        pqxx::work txn(*conn_);
+        pqxx::work txn(conn_);
         auto stream = pqxx::stream_to::table(
             txn,
             {"" + table + "_tags"},
@@ -210,7 +205,7 @@ void NavDB::flushNodes() {
     LOGI(thread_id_, "flushNodes start count=", node_buf_.size());
     std::lock_guard flush_lk(db_flush_mu_);
     try {
-        pqxx::work txn(*conn_);
+        pqxx::work txn(conn_);
         auto stream = pqxx::stream_to::table(
             txn,
             {"nodes"},
@@ -291,7 +286,7 @@ void NavDB::flushViaTemp(const std::string& /*tmp_table*/,
     if (buf.empty()) return;
     LOGI(thread_id_, "flushViaTemp real=", real_table, " count=", buf.size());
     try {
-        pqxx::work txn(*conn_);
+        pqxx::work txn(conn_);
         auto stream = pqxx::stream_to::table(
             txn, {real_table}, {"id", "name", "geog"});
         for (const auto& r : buf)
@@ -305,7 +300,7 @@ void NavDB::flushViaTemp(const std::string& /*tmp_table*/,
         auto write_geom = [](auto& stream, const NavDB::GeomRecord& r) {
             stream.write_values(r.id, r.name, r.geog);
         };
-        int written = tryCopyBatch(*conn_, real_table, buf, write_geom);
+        int written = tryCopyBatch(conn_, real_table, buf, write_geom);
         std::cerr << "[NavDB] recovered: wrote " << written << " of "
                   << buf.size() + written << " rows to " << real_table << "\n";
     }
@@ -321,7 +316,7 @@ void NavDB::flushRelations() {
     if (relation_buf_.empty()) return;
     LOGI(thread_id_, "flushRelations count=", relation_buf_.size());
     try {
-        pqxx::work txn(*conn_);
+        pqxx::work txn(conn_);
         auto stream = pqxx::stream_to::table(
             txn, {"relations"}, {"id", "name", "geog"});
         for (const auto& r : relation_buf_)
@@ -334,7 +329,7 @@ void NavDB::flushRelations() {
         auto write_rel = [](auto& stream, const NavDB::RelationRecord& r) {
             stream.write_values(r.id, r.name, r.geog);
         };
-        int written = tryCopyBatch(*conn_, "relations", relation_buf_, write_rel);
+        int written = tryCopyBatch(conn_, "relations", relation_buf_, write_rel);
         std::cerr << "[NavDB] recovered: wrote " << written << " of "
                   << relation_buf_.size() + written << " rows to relations\n";
     }
@@ -370,7 +365,7 @@ static const char* CREATE_GIST_INDEXES = R"SQL(
 void NavDB::disableIndexes() {
     LOGI(thread_id_, "disabling indexes");
     try {
-        pqxx::work txn(*conn_);
+        pqxx::work txn(conn_);
         txn.exec(DISABLE_INDEXES);
         txn.commit();
     } catch (const std::exception& e) {
@@ -383,7 +378,7 @@ void NavDB::disableIndexes() {
 void NavDB::enableIndexes() {
     LOGI(thread_id_, "enabling indexes (REINDEX may take a while)");
     try {
-        pqxx::work txn(*conn_);
+        pqxx::work txn(conn_);
         txn.exec(ENABLE_INDEXES);
         txn.commit();
     } catch (const std::exception& e) {
@@ -396,7 +391,7 @@ void NavDB::enableIndexes() {
 void NavDB::createGistIndexes() {
     LOGI(thread_id_, "creating GiST spatial indexes (may take a while)");
     try {
-        pqxx::work txn(*conn_);
+        pqxx::work txn(conn_);
         txn.exec(CREATE_GIST_INDEXES);
         txn.commit();
     } catch (const std::exception& e) {
@@ -410,7 +405,7 @@ void NavDB::createGistIndexes() {
 
 std::string NavDB::getWay(int64_t id) {
     try {
-        pqxx::work txn(*conn_);
+        pqxx::work txn(conn_);
         auto res = txn.exec(
             "SELECT geog FROM ways WHERE id = $1 UNION ALL SELECT geog FROM areas WHERE id = $1",
             pqxx::params{id});
@@ -452,7 +447,7 @@ void NavDB::updateNode(int64_t id, const std::string& name,
                        double lon_m, double lat_m,
                        const Tags& tags, const std::string& geog) {
     try {
-        pqxx::work txn(*conn_);
+        pqxx::work txn(conn_);
         txn.exec(
             "INSERT INTO nodes(id, name, longitude_m, latitude_m, geog) VALUES ($1,$2,$3,$4,$5) "
             "ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, longitude_m=EXCLUDED.longitude_m, "
@@ -468,7 +463,7 @@ void NavDB::updateNode(int64_t id, const std::string& name,
 void NavDB::updateWay(int64_t id, const std::string& name,
                       const Tags& tags, const std::string& geog) {
     try {
-        pqxx::work txn(*conn_);
+        pqxx::work txn(conn_);
         txn.exec(
             "INSERT INTO ways(id, name, geog) VALUES ($1,$2,$3) "
             "ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, geog=EXCLUDED.geog",
@@ -483,7 +478,7 @@ void NavDB::updateWay(int64_t id, const std::string& name,
 void NavDB::updateArea(int64_t id, const std::string& name,
                        const Tags& tags, const std::string& geog) {
     try {
-        pqxx::work txn(*conn_);
+        pqxx::work txn(conn_);
         txn.exec(
             "INSERT INTO areas(id, name, geog) VALUES ($1,$2,$3) "
             "ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, geog=EXCLUDED.geog",
@@ -498,7 +493,7 @@ void NavDB::updateArea(int64_t id, const std::string& name,
 void NavDB::updateRelation(int64_t id, const std::string& name,
                            const Tags& tags, const std::string& geog) {
     try {
-        pqxx::work txn(*conn_);
+        pqxx::work txn(conn_);
         std::optional<std::string> g = geog.empty() ? std::nullopt : std::make_optional(geog);
         txn.exec(
             "INSERT INTO relations(id, name, geog) VALUES ($1,$2,$3) "
@@ -514,7 +509,7 @@ void NavDB::updateRelation(int64_t id, const std::string& name,
 void NavDB::updateRoad(int64_t id, const std::string& name,
                        const Tags& tags, const std::string& geog) {
     try {
-        pqxx::work txn(*conn_);
+        pqxx::work txn(conn_);
         txn.exec(
             "INSERT INTO roads(id, name, geog) VALUES ($1,$2,$3) "
             "ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, geog=EXCLUDED.geog",
@@ -542,7 +537,7 @@ void NavDB::deleteEntity(int64_t id, const std::string& type) {
         {"relation", "relations"},
     };
     try {
-        pqxx::work txn(*conn_);
+        pqxx::work txn(conn_);
         if (tag_tables.count(type))
             { std::string q = "DELETE FROM " + tag_tables.at(type) + " WHERE id=$1";
               txn.exec(q, pqxx::params{id}); }
@@ -557,7 +552,7 @@ void NavDB::deleteEntity(int64_t id, const std::string& type) {
 
 int64_t NavDB::getReplicationSequence() {
     try {
-        pqxx::work txn(*conn_);
+        pqxx::work txn(conn_);
         auto r = txn.exec("SELECT sequence FROM osm_replication_state LIMIT 1");
         txn.commit();
         if (r.empty()) return -1;
@@ -569,7 +564,7 @@ int64_t NavDB::getReplicationSequence() {
 
 void NavDB::setReplicationSequence(int64_t seq) {
     try {
-        pqxx::work txn(*conn_);
+        pqxx::work txn(conn_);
         txn.exec(
             "INSERT INTO osm_replication_state(sequence) VALUES($1) "
             "ON CONFLICT (id) DO UPDATE SET sequence=$1",
@@ -582,7 +577,7 @@ void NavDB::setReplicationSequence(int64_t seq) {
 
 int64_t NavDB::getExternalDataTimestamp(const std::string& name) {
     try {
-        pqxx::work txn(*conn_);
+        pqxx::work txn(conn_);
         auto r = txn.exec(
             "SELECT last_modified FROM external_data_state WHERE name=$1",
             pqxx::params{name});
@@ -596,7 +591,7 @@ int64_t NavDB::getExternalDataTimestamp(const std::string& name) {
 
 void NavDB::setExternalDataTimestamp(const std::string& name, int64_t epoch_seconds) {
     try {
-        pqxx::work txn(*conn_);
+        pqxx::work txn(conn_);
         txn.exec(
             "INSERT INTO external_data_state(name, last_modified) VALUES($1, $2) "
             "ON CONFLICT (name) DO UPDATE SET last_modified=$2, checked_at=now()",
@@ -609,7 +604,7 @@ void NavDB::setExternalDataTimestamp(const std::string& name, int64_t epoch_seco
 
 void NavDB::setAutovacuum(bool enabled) {
     try {
-        pqxx::nontransaction txn(*conn_);
+        pqxx::nontransaction txn(conn_);
         txn.exec(std::string("ALTER SYSTEM SET autovacuum = ")
                  + (enabled ? "on" : "off"));
         txn.exec("SELECT pg_reload_conf()");
@@ -632,7 +627,7 @@ void NavDB::vacuumAnalyze() {
     // issues commands without wrapping them in BEGIN/COMMIT.
     for (const char* t : tables) {
         try {
-            pqxx::nontransaction txn(*conn_);
+            pqxx::nontransaction txn(conn_);
             LOGI(thread_id_, "VACUUM ANALYZE ", t);
             txn.exec("VACUUM ANALYZE " + std::string(t));
         } catch (const std::exception& e) {
@@ -657,7 +652,7 @@ void NavDB::truncateForResume(const std::string& phase) {
     }
 
     try {
-        pqxx::work txn(*conn_);
+        pqxx::work txn(conn_);
         std::string sql = "TRUNCATE " ;
         for (size_t i = 0; i < tables.size(); ++i) {
             if (i > 0) sql += ", ";
@@ -956,7 +951,7 @@ void NavDB::initializeSchema() {
 
     for (const char* sql : statements) {
         try {
-            pqxx::nontransaction txn(*conn_);
+            pqxx::nontransaction txn(conn_);
             txn.exec(sql);
         } catch (const std::exception& e) {
             throw std::runtime_error(
@@ -969,7 +964,7 @@ void NavDB::initializeSchema() {
 std::vector<std::pair<double,double>> NavDB::getWayCoords(int64_t id) {
     std::vector<std::pair<double,double>> coords;
     try {
-        pqxx::work txn(*conn_);
+        pqxx::work txn(conn_);
         auto res = txn.exec(
             "SELECT ST_X(p.geom), ST_Y(p.geom) "
             "FROM ("
@@ -994,7 +989,7 @@ NavDB::getWayCoordsMap(const std::vector<int64_t>& ids) {
     std::unordered_map<int64_t, std::vector<std::pair<double,double>>> out;
     if (ids.empty()) return out;
     try {
-        pqxx::work txn(*conn_);
+        pqxx::work txn(conn_);
         // Single round trip: dump all points for all requested IDs from
         // both ways and areas, ordered so points for each ID arrive together.
         // ST_DumpPoints preserves vertex order within each geometry.

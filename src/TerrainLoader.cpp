@@ -104,24 +104,17 @@ namespace {
 constexpr double kFeetPerMeter = 3.28084;
 } // namespace
 
-bool loadTerrain(const std::string& server, const std::string& user,
-                 const std::string& database, const std::string& password,
-                 double min_lon, double min_lat, double max_lon, double max_lat,
-                 TerrainSource source, int dest_srid, int band_ft, double simplify_m,
-                 int threads, bool verbose) {
+bool TerrainLoader::load(double min_lon, double min_lat, double max_lon, double max_lat,
+                         TerrainSource source, int dest_srid, int band_ft, double simplify_m,
+                         int threads, bool verbose) {
     auto tiles = tilesForBBox(source, min_lon, min_lat, max_lon, max_lat);
     if (tiles.empty()) {
         std::cerr << "[Terrain] bounding box produced no tiles\n";
         return false;
     }
 
-    std::string connstr = "host=" + server + " dbname=" + database +
-                          " user=" + user + " sslmode=disable";
-    if (!password.empty()) connstr += " password=" + password;
-
-    pqxx::connection conn(connstr);
     {
-        pqxx::work txn(conn);
+        pqxx::work txn(conn_);
         txn.exec("CREATE EXTENSION IF NOT EXISTS postgis_raster");
         txn.exec(
             "CREATE TABLE IF NOT EXISTS terrain_tiles ("
@@ -198,7 +191,7 @@ bool loadTerrain(const std::string& server, const std::string& user,
 
     bool table_exists;
     {
-        pqxx::work txn(conn);
+        pqxx::work txn(conn_);
         auto r = txn.exec(
             "SELECT EXISTS (SELECT 1 FROM information_schema.tables "
             "WHERE table_schema='public' AND table_name='terrain')");
@@ -208,7 +201,7 @@ bool loadTerrain(const std::string& server, const std::string& user,
 
     std::vector<Tile> to_load;
     for (auto& t : tiles) {
-        pqxx::work txn(conn);
+        pqxx::work txn(conn_);
         auto r = txn.exec("SELECT 1 FROM terrain_tiles WHERE tile_name=$1",
                           pqxx::params{t.name});
         txn.commit();
@@ -219,8 +212,7 @@ bool loadTerrain(const std::string& server, const std::string& user,
     if (to_load.empty()) {
         if (verbose) std::cout << "All requested tiles already loaded.\n";
         if (band_ft > 0)
-            buildTerrainBands(server, user, database, password, band_ft, simplify_m,
-                              threads, verbose);
+            buildBands(band_ft, simplify_m, threads, verbose);
         return true;
     }
 
@@ -315,21 +307,20 @@ bool loadTerrain(const std::string& server, const std::string& user,
         // produce corrupted/truncated SQL output (parse errors like
         // "unterminated quoted string" on otherwise-valid tiles) — a race
         // in raster2pgsql/GDAL under concurrent invocation, not something
-        // this loader can fix, so avoid triggering it instead. setenv of
-        // PGPASSWORD is also process-global, so it must be inside this lock
-        // too — concurrent setenv/unsetenv from different threads is itself
-        // a race.
+        // this loader can fix, so avoid triggering it instead.
+        //
+        // No password handling here (or anywhere in this codebase) —
+        // auth relies on ~/.pgpass, which psql honors automatically for
+        // this shell-out same as pqxx does for direct connections.
         int gen_rc, load_rc = -1;
         {
             std::lock_guard lk(raster_mu);
             gen_rc = system(gen_cmd.str().c_str());
             if (gen_rc == 0) {
                 std::ostringstream load_cmd;
-                load_cmd << "psql -h " << server << " -U " << user << " -d " << database
+                load_cmd << "psql -h " << host_ << " -U " << user_ << " -d " << database_
                           << " -q -v ON_ERROR_STOP=1 -f " << sql_file;
-                if (!password.empty()) setenv("PGPASSWORD", password.c_str(), 1);
                 load_rc = system(load_cmd.str().c_str());
-                if (!password.empty()) unsetenv("PGPASSWORD");
             }
         }
 
@@ -366,7 +357,7 @@ bool loadTerrain(const std::string& server, const std::string& user,
     size_t first_parallel_batch = 0;
     if (!table_exists) {
         while (first_parallel_batch < n_batches) {
-            if (runBatch(first_parallel_batch, conn, false)) {
+            if (runBatch(first_parallel_batch, conn_, false)) {
                 table_exists = true;
                 ++first_parallel_batch;
                 break;
@@ -389,7 +380,7 @@ bool loadTerrain(const std::string& server, const std::string& user,
             // progress — caught here so one bad connection just drops this
             // thread's remaining work instead.
             try {
-                pqxx::connection wconn(connstr);
+                pqxx::connection wconn = newConnection();
                 while (true) {
                     size_t b = next_batch.fetch_add(1, std::memory_order_relaxed);
                     if (b >= n_batches) break;
@@ -422,22 +413,14 @@ bool loadTerrain(const std::string& server, const std::string& user,
     }
 
     if (band_ft > 0)
-        buildTerrainBands(server, user, database, password, band_ft, simplify_m,
-                          threads, verbose);
+        buildBands(band_ft, simplify_m, threads, verbose);
 
     return true;
 }
 
-bool buildTerrainBands(const std::string& server, const std::string& user,
-                       const std::string& database, const std::string& password,
-                       int band_ft, double simplify_m, int threads, bool verbose) {
-    std::string connstr = "host=" + server + " dbname=" + database +
-                          " user=" + user + " sslmode=disable";
-    if (!password.empty()) connstr += " password=" + password;
-    pqxx::connection conn(connstr);
-
+bool TerrainLoader::buildBands(int band_ft, double simplify_m, int threads, bool verbose) {
     {
-        pqxx::work txn(conn);
+        pqxx::work txn(conn_);
         txn.exec(
             "CREATE TABLE IF NOT EXISTS public.terrain_bands ("
             "  id serial PRIMARY KEY,"
@@ -503,7 +486,7 @@ bool buildTerrainBands(const std::string& server, const std::string& user,
 
     double min_m, max_m;
     {
-        pqxx::work txn(conn);
+        pqxx::work txn(conn_);
         auto r = txn.exec(
             "SELECT min(s.min), max(s.max) "
             "FROM public.terrain t, LATERAL ST_SummaryStats(t.rast, 1) s");
@@ -572,7 +555,7 @@ bool buildTerrainBands(const std::string& server, const std::string& user,
     bool staging_complete = false;
     bool regions_complete = false;
     {
-        pqxx::work txn(conn);
+        pqxx::work txn(conn_);
         auto r = txn.exec(
             "SELECT staging_complete, regions_complete FROM public.terrain_bands_build_state "
             "WHERE id = 1 AND band_ft = $1 AND simplify_m = $2 AND lo_ft = $3 AND hi_ft = $4 "
@@ -593,7 +576,7 @@ bool buildTerrainBands(const std::string& server, const std::string& user,
 
     if (!resuming) {
         try {
-            pqxx::work txn(conn);
+            pqxx::work txn(conn_);
             txn.exec("TRUNCATE public.terrain_bands");
             txn.exec("DROP TABLE IF EXISTS public.terrain_frags_staging");
             txn.exec(
@@ -680,7 +663,7 @@ bool buildTerrainBands(const std::string& server, const std::string& user,
         // itself rather than assumed, for ST_MakeEnvelope below.
         int terrain_srid;
         {
-            pqxx::work txn(conn);
+            pqxx::work txn(conn_);
             auto r = txn.exec("SELECT ST_SRID(rast) FROM public.terrain LIMIT 1");
             txn.commit();
             terrain_srid = r[0][0].as<int>();
@@ -688,7 +671,7 @@ bool buildTerrainBands(const std::string& server, const std::string& user,
 
         double ext_minx, ext_miny, ext_maxx, ext_maxy;
         {
-            pqxx::work txn(conn);
+            pqxx::work txn(conn_);
             auto r = txn.exec(
                 "SELECT ST_XMin(e), ST_YMin(e), ST_XMax(e), ST_YMax(e) "
                 "FROM (SELECT ST_Extent(ST_Envelope(rast)) AS e FROM public.terrain) t");
@@ -705,7 +688,7 @@ bool buildTerrainBands(const std::string& server, const std::string& user,
 
         std::vector<std::pair<int,int>> cells;
         {
-            pqxx::work txn(conn);
+            pqxx::work txn(conn_);
             auto done_rows = txn.exec("SELECT rx, ry FROM public.terrain_frags_staging_progress");
             txn.commit();
             std::set<std::pair<int,int>> done;
@@ -725,7 +708,7 @@ bool buildTerrainBands(const std::string& server, const std::string& user,
         std::mutex stage_io_mu;
         auto stage_worker = [&]() {
             try {
-                pqxx::connection wconn(connstr);
+                pqxx::connection wconn = newConnection();
                 while (true) {
                     size_t idx = next_cell.fetch_add(1, std::memory_order_relaxed);
                     if (idx >= cells.size()) break;
@@ -792,7 +775,7 @@ bool buildTerrainBands(const std::string& server, const std::string& user,
         }
 
         try {
-            pqxx::work txn(conn);
+            pqxx::work txn(conn_);
             txn.exec("CREATE INDEX IF NOT EXISTS terrain_frags_staging_band_idx ON public.terrain_frags_staging (band_id)");
             txn.exec("UPDATE public.terrain_bands_build_state SET staging_complete = true WHERE id = 1");
             txn.commit();
@@ -827,7 +810,7 @@ bool buildTerrainBands(const std::string& server, const std::string& user,
 
         std::vector<int> chunks_remaining;
         {
-            pqxx::work txn(conn);
+            pqxx::work txn(conn_);
             auto done_rows = txn.exec("SELECT chunk_id FROM public.terrain_region_staging_progress");
             txn.commit();
             std::set<int> done;
@@ -848,7 +831,7 @@ bool buildTerrainBands(const std::string& server, const std::string& user,
             // entire process, so a transient connection failure here must
             // not be allowed to propagate past this thread.
             try {
-                pqxx::connection wconn(connstr);
+                pqxx::connection wconn = newConnection();
                 while (true) {
                     size_t idx = next_chunk.fetch_add(1, std::memory_order_relaxed);
                     if (idx >= chunks_remaining.size()) break;
@@ -895,7 +878,7 @@ bool buildTerrainBands(const std::string& server, const std::string& user,
         }
 
         try {
-            pqxx::work txn(conn);
+            pqxx::work txn(conn_);
             txn.exec("CREATE INDEX IF NOT EXISTS terrain_region_staging_band_idx ON public.terrain_region_staging (band_id)");
             txn.exec("UPDATE public.terrain_bands_build_state SET regions_complete = true WHERE id = 1");
             txn.commit();
@@ -918,7 +901,7 @@ bool buildTerrainBands(const std::string& server, const std::string& user,
     // band_min_ft) simply isn't re-added to the work list.
     std::vector<int> band_indices;
     {
-        pqxx::work txn(conn);
+        pqxx::work txn(conn_);
         auto done_rows = txn.exec("SELECT DISTINCT band_min_ft FROM public.terrain_bands");
         txn.commit();
         std::set<int> done_mins;
@@ -972,7 +955,7 @@ bool buildTerrainBands(const std::string& server, const std::string& user,
     constexpr int kExpensiveBandSlots = 1;
     std::map<int, long long> band_cost;  // band_id (1-based) -> region count
     {
-        pqxx::work txn(conn);
+        pqxx::work txn(conn_);
         auto rows = txn.exec(
             "SELECT band_id, count(*) FROM public.terrain_region_staging GROUP BY band_id");
         txn.commit();
@@ -1093,7 +1076,7 @@ bool buildTerrainBands(const std::string& server, const std::string& user,
                 // connection failure here must not be allowed to propagate
                 // past this thread.
                 try {
-                    pqxx::connection wconn(connstr);
+                    pqxx::connection wconn = newConnection();
                     while (true) {
                         size_t idx = next->fetch_add(1, std::memory_order_relaxed);
                         if (idx >= indices.size()) break;
@@ -1128,7 +1111,7 @@ bool buildTerrainBands(const std::string& server, const std::string& user,
     // with identical parameters, correctly does a fresh rebuild rather than
     // being mistaken for resuming this now-finished one.
     try {
-        pqxx::work txn(conn);
+        pqxx::work txn(conn_);
         txn.exec("DROP TABLE IF EXISTS public.terrain_frags_staging");
         txn.exec("TRUNCATE public.terrain_frags_staging_progress");
         txn.exec("TRUNCATE public.terrain_region_staging");
@@ -1177,19 +1160,16 @@ constexpr GlobalRegion kGlobalRegions[] = {
 };
 } // namespace
 
-bool loadGlobalTerrain(const std::string& server, const std::string& user,
-                       const std::string& database, const std::string& password,
-                       int dest_srid, int band_ft, double simplify_m,
-                       int threads, bool verbose) {
+bool TerrainLoader::loadGlobal(int dest_srid, int band_ft, double simplify_m,
+                               int threads, bool verbose) {
     bool any_loaded = false;
     for (const auto& r : kGlobalRegions) {
         if (verbose)
             std::cout << "[Terrain] === " << r.name << " (" << r.min_lon << "," << r.min_lat
                       << "," << r.max_lon << "," << r.max_lat << ") ===\n";
-        bool ok = loadTerrain(server, user, database, password,
-                             r.min_lon, r.min_lat, r.max_lon, r.max_lat,
-                             TerrainSource::CopernicusGLO30, dest_srid,
-                             /*band_ft=*/0, simplify_m, threads, verbose);
+        bool ok = load(r.min_lon, r.min_lat, r.max_lon, r.max_lat,
+                       TerrainSource::CopernicusGLO30, dest_srid,
+                       /*band_ft=*/0, simplify_m, threads, verbose);
         any_loaded = any_loaded || ok;
         if (verbose)
             std::cout << "[Terrain] " << r.name << ": " << (ok ? "OK" : "FAILED (no tiles loaded)") << "\n";
@@ -1201,7 +1181,7 @@ bool loadGlobalTerrain(const std::string& server, const std::string& user,
     }
 
     if (band_ft > 0)
-        buildTerrainBands(server, user, database, password, band_ft, simplify_m, threads, verbose);
+        buildBands(band_ft, simplify_m, threads, verbose);
 
     return true;
 }

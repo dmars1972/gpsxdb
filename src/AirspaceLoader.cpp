@@ -278,9 +278,7 @@ AltLimit jaltLimit(const json::object& o, const char* k) {
 
 } // namespace
 
-bool loadClassAirspace(const std::string& server, const std::string& user,
-                       const std::string& database, const std::string& password,
-                       bool verbose) {
+bool AirspaceLoader::loadClassAirspace(bool verbose) {
     const std::string url  = "https://adds-faa.opendata.arcgis.com/api/download/v1/"
                               "items/c6a62360338e408cb1512366ad61559e/geojson?layers=0";
     const std::string path = "/tmp/class_airspace.geojson";
@@ -303,12 +301,8 @@ bool loadClassAirspace(const std::string& server, const std::string& user,
         return false;
     }
 
-    std::string conn_str = "host=" + server + " dbname=" + database + " user=" + user;
-    if (!password.empty()) conn_str += " password=" + password;
-    pqxx::connection conn(conn_str);
-
     {
-        pqxx::nontransaction txn(conn);
+        pqxx::nontransaction txn(conn_);
         txn.exec(R"(
             CREATE TABLE IF NOT EXISTS public.class_airspace (
                 id          serial PRIMARY KEY,
@@ -335,12 +329,12 @@ bool loadClassAirspace(const std::string& server, const std::string& user,
         txn.exec("CREATE INDEX IF NOT EXISTS class_airspace_state_idx ON public.class_airspace (state)");
     }
     {
-        pqxx::work txn(conn);
+        pqxx::work txn(conn_);
         txn.exec("TRUNCATE public.class_airspace");
         txn.commit();
     }
 
-    pqxx::work txn(conn);
+    pqxx::work txn(conn_);
     auto stream = pqxx::stream_to::table(txn, {"class_airspace"}, {
         "ident", "icao_id", "name", "class", "type_code", "local_type",
         "lower_val", "lower_uom", "lower_code",
@@ -378,9 +372,7 @@ bool loadClassAirspace(const std::string& server, const std::string& user,
     return true;
 }
 
-bool loadSpecialUseAirspace(const std::string& server, const std::string& user,
-                            const std::string& database, const std::string& password,
-                            bool verbose) {
+bool AirspaceLoader::loadSpecialUseAirspace(bool verbose) {
     const std::string url  = "https://adds-faa.opendata.arcgis.com/api/download/v1/"
                               "items/dd0d1b726e504137ab3c41b21835d05b/geojson?layers=0";
     const std::string path = "/tmp/special_use_airspace.geojson";
@@ -401,12 +393,8 @@ bool loadSpecialUseAirspace(const std::string& server, const std::string& user,
         return false;
     }
 
-    std::string conn_str = "host=" + server + " dbname=" + database + " user=" + user;
-    if (!password.empty()) conn_str += " password=" + password;
-    pqxx::connection conn(conn_str);
-
     {
-        pqxx::nontransaction txn(conn);
+        pqxx::nontransaction txn(conn_);
         txn.exec(R"(
             CREATE TABLE IF NOT EXISTS public.special_use_airspace (
                 id            serial PRIMARY KEY,
@@ -432,12 +420,12 @@ bool loadSpecialUseAirspace(const std::string& server, const std::string& user,
         txn.exec("CREATE INDEX IF NOT EXISTS special_use_airspace_state_idx ON public.special_use_airspace (state)");
     }
     {
-        pqxx::work txn(conn);
+        pqxx::work txn(conn_);
         txn.exec("TRUNCATE public.special_use_airspace");
         txn.commit();
     }
 
-    pqxx::work txn(conn);
+    pqxx::work txn(conn_);
     auto stream = pqxx::stream_to::table(txn, {"special_use_airspace"}, {
         "name", "type_code", "class",
         "lower_val", "lower_uom", "lower_code",
@@ -475,20 +463,14 @@ bool loadSpecialUseAirspace(const std::string& server, const std::string& user,
     return true;
 }
 
-bool loadInternationalAirspace(const std::string& server, const std::string& user,
-                               const std::string& database, const std::string& password,
-                               const std::string& api_key, bool verbose) {
+bool AirspaceLoader::loadInternationalAirspace(const std::string& api_key, bool verbose) {
     if (api_key.empty()) {
         std::cerr << "[International Airspace] no OpenAIP API key provided\n";
         return false;
     }
 
-    std::string conn_str = "host=" + server + " dbname=" + database + " user=" + user;
-    if (!password.empty()) conn_str += " password=" + password;
-    pqxx::connection conn(conn_str);
-
     {
-        pqxx::nontransaction txn(conn);
+        pqxx::nontransaction txn(conn_);
         txn.exec(R"(
             CREATE TABLE IF NOT EXISTS public.international_airspace (
                 id          serial PRIMARY KEY,
@@ -516,12 +498,12 @@ bool loadInternationalAirspace(const std::string& server, const std::string& use
         txn.exec("CREATE INDEX IF NOT EXISTS international_airspace_type_idx   ON public.international_airspace (type)");
     }
     {
-        pqxx::work txn(conn);
+        pqxx::work txn(conn_);
         txn.exec("TRUNCATE public.international_airspace");
         txn.commit();
     }
 
-    pqxx::work txn(conn);
+    pqxx::work txn(conn_);
     auto stream = pqxx::stream_to::table(txn, {"international_airspace"}, {
         "openaip_id", "name", "type", "icao_class", "country",
         "lower_val", "lower_unit", "lower_ref",

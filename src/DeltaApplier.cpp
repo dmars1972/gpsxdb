@@ -12,7 +12,10 @@
 
 // ---- WKB helpers (duplicated from main.cpp for standalone use) ----
 
-static std::string toHex(const std::vector<uint8_t>& b) {
+// Named distinctly from GeoUtils::toHex (same job, lowercase output here
+// vs. uppercase there — harmless for WKB hex parsing either way, but kept
+// as-is rather than silently changed while just fixing a name collision).
+static std::string toHexLocal(const std::vector<uint8_t>& b) {
     std::ostringstream ss;
     for (auto c : b) ss << std::hex << std::setw(2) << std::setfill('0')
                         << static_cast<int>(c);
@@ -50,7 +53,7 @@ static std::string buildLineWKB(const std::vector<std::pair<double,double>>& pts
         writeLE32(b, static_cast<uint32_t>(pts.size()));
     }
     for (auto& [x, y] : pts) { writeDouble(b, x); writeDouble(b, y); }
-    return toHex(b);
+    return toHexLocal(b);
 }
 
 // Build WKB MultiLineString from a list of WKB hex strings
@@ -89,7 +92,7 @@ static std::string mergeLinestrings(const std::vector<std::string>& hexes) {
     writeLE32(b, static_cast<uint32_t>(parts.size()));
     for (auto& p : parts)
         b.insert(b.end(), p.begin(), p.end());
-    return toHex(b);
+    return toHexLocal(b);
 }
 
 // ---- DeltaApplier ----
