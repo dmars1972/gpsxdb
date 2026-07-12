@@ -9,6 +9,7 @@
 #include <cmath>
 #include <vector>
 #include <set>
+#include <map>
 #include <algorithm>
 #include <thread>
 #include <atomic>
@@ -130,6 +131,68 @@ bool loadTerrain(const std::string& server, const std::string& user,
         // Backfills the column on a table created before source-tracking
         // existed (all pre-existing rows are 3DEP, matching the default).
         txn.exec("ALTER TABLE terrain_tiles ADD COLUMN IF NOT EXISTS source text NOT NULL DEFAULT '3dep'");
+        // Point/corridor elevation lookups direct against the raw raster —
+        // the consuming application (a separate Python service) needs
+        // precise elevation at a point and along a short lookahead corridor,
+        // not the classified elevation-band polygons (terrain_bands is a
+        // separate, currently-deprioritized effort). CREATE OR REPLACE so
+        // these stay current on every terrain_load run; only depends on
+        // public.terrain existing by the time they're actually called, not
+        // at creation time. Feet is the unit convention throughout this
+        // codebase (band_min_ft/band_max_ft, kFeetPerMeter), so results are
+        // converted from the raster's native meters.
+        //
+        // p_srid defaults to 4326 (lon/lat) but accepts 3857 (Web Mercator,
+        // the raster's native SRID) directly too — ST_Transform is a no-op
+        // when source and target SRID already match, so passing 3857 costs
+        // nothing extra. DROP first: adding a parameter changes the
+        // signature, so CREATE OR REPLACE alone would leave the old 2-arg
+        // overload in place instead of replacing it.
+        txn.exec("DROP FUNCTION IF EXISTS public.elevation_at_point_ft(double precision, double precision)");
+        txn.exec(
+            "CREATE OR REPLACE FUNCTION public.elevation_at_point_ft("
+            "  p_x double precision, p_y double precision, p_srid integer DEFAULT 4326"
+            ") RETURNS double precision "
+            "LANGUAGE sql STABLE PARALLEL SAFE AS $f$ "
+            "  SELECT ST_Value(t.rast, 1, pt.g) * 3.28084 "
+            "  FROM public.terrain t, "
+            "       (SELECT ST_Transform(ST_SetSRID(ST_MakePoint(p_x, p_y), p_srid), 3857) AS g) pt "
+            "  WHERE t.rast && pt.g AND ST_Value(t.rast, 1, pt.g) IS NOT NULL "
+            "  LIMIT 1 "
+            "$f$");
+        // Samples elevation every p_interval_m meters along a geodesic
+        // bearing out to p_distance_km, for terrain-ahead lookahead
+        // profiles. ST_Project does the geodesic (spheroid) point
+        // projection so bearing/distance stay accurate at any latitude —
+        // it requires geography (always lon/lat internally), so a
+        // non-4326 origin is transformed to 4326 once up front.
+        txn.exec(
+            "DROP FUNCTION IF EXISTS public.elevation_along_bearing_ft("
+            "double precision, double precision, double precision, double precision, double precision)");
+        txn.exec(
+            "CREATE OR REPLACE FUNCTION public.elevation_along_bearing_ft("
+            "  p_x double precision, p_y double precision, "
+            "  p_bearing_deg double precision, p_distance_km double precision, "
+            "  p_interval_m double precision DEFAULT 500, "
+            "  p_srid integer DEFAULT 4326"
+            ") RETURNS TABLE(distance_m double precision, lon double precision, "
+            "                lat double precision, elevation_ft double precision) "
+            "LANGUAGE sql STABLE PARALLEL SAFE AS $f$ "
+            "  WITH origin AS ("
+            "    SELECT ST_Transform(ST_SetSRID(ST_MakePoint(p_x, p_y), p_srid), 4326)::geography AS g"
+            "  ), pts AS ("
+            "    SELECT gs::double precision AS distance_m, "
+            "           ST_Project(origin.g, gs, radians(p_bearing_deg)) AS geog "
+            "    FROM origin, generate_series(0::bigint, (p_distance_km * 1000)::bigint, "
+            "                         greatest(p_interval_m, 1)::bigint) AS gs"
+            "  ) "
+            "  SELECT pts.distance_m, "
+            "         ST_X(pts.geog::geometry) AS lon, "
+            "         ST_Y(pts.geog::geometry) AS lat, "
+            "         public.elevation_at_point_ft(ST_X(pts.geog::geometry), ST_Y(pts.geog::geometry)) AS elevation_ft "
+            "  FROM pts "
+            "  ORDER BY pts.distance_m "
+            "$f$");
         txn.commit();
     }
 
@@ -395,13 +458,46 @@ bool buildTerrainBands(const std::string& server, const std::string& user,
             "  simplify_m double precision NOT NULL,"
             "  lo_ft integer NOT NULL,"
             "  hi_ft integer NOT NULL,"
+            "  region_size_m double precision NOT NULL DEFAULT 500000,"
             "  staging_complete boolean NOT NULL DEFAULT false)");
+        // Older rows (from before region_size_m existed) predate the
+        // resumability rework entirely, but guard anyway: without this a
+        // stale row missing the column default's real value could compare
+        // equal by accident.
+        txn.exec(
+            "ALTER TABLE public.terrain_bands_build_state "
+            "ADD COLUMN IF NOT EXISTS region_size_m double precision NOT NULL DEFAULT 500000");
+        // Whether the tier-1 fine-region materialization pass (see
+        // terrain_region_staging below) has finished. Same idiom as
+        // staging_complete: an older row predates this column and defaults
+        // to false, correctly forcing that pass to run once on the next
+        // call even though its own prerequisite (terrain_frags_staging)
+        // may already be sitting there complete from before this existed.
+        txn.exec(
+            "ALTER TABLE public.terrain_bands_build_state "
+            "ADD COLUMN IF NOT EXISTS regions_complete boolean NOT NULL DEFAULT false");
         // Which (rx, ry) staging grid cells (see kRegionSizeM below) have
         // already been reclassified/dumped into terrain_frags_staging —
         // the checkpoint list for resuming an interrupted staging phase.
         txn.exec(
             "CREATE TABLE IF NOT EXISTS public.terrain_frags_staging_progress ("
             "  rx integer NOT NULL, ry integer NOT NULL, PRIMARY KEY (rx, ry))");
+        // Tier-1 output: one pre-unioned+simplified polygon per (band_id,
+        // rx, ry) fine region, computed once by a parallel pass (see
+        // below) and shared by every band's tier-2/3 union — this is what
+        // turns tier 1 from "however many bands happen to be running
+        // concurrently" parallelism into full --threads-wide parallelism
+        // regardless of how few bands are expensive enough to matter.
+        txn.exec(
+            "CREATE TABLE IF NOT EXISTS public.terrain_region_staging ("
+            "  band_id integer NOT NULL, rx integer NOT NULL, ry integer NOT NULL,"
+            "  geom public.geometry)");
+        // Checkpoint list for the tier-1 materialization pass — which
+        // geographic chunks (see kRegionMaterializeChunks below) have been
+        // fully computed and written to terrain_region_staging.
+        txn.exec(
+            "CREATE TABLE IF NOT EXISTS public.terrain_region_staging_progress ("
+            "  chunk_id integer PRIMARY KEY)");
         txn.commit();
     }
 
@@ -432,6 +528,28 @@ bool buildTerrainBands(const std::string& server, const std::string& user,
                   << band_ft << "ft each, " << lo_ft << "ft to " << hi_ft
                   << "ft), merging across all loaded tiles...\n";
 
+    // Grid size (meters, Mercator) for both the staging-chunk tier and the
+    // regional-bucketing tier further down — see the hierarchical-union
+    // comment there, and the tuning note below, for why this value in
+    // particular. Defined here (rather than closer to its uses) because the
+    // resumability check right after needs it: this value is baked into
+    // every (rx, ry) coordinate already written to terrain_frags_staging
+    // and terrain_frags_staging_progress, so a resume against
+    // differently-gridded leftover data would silently mix incompatible
+    // cell numbering — region_size_m below guards against exactly that.
+    //
+    // Was 500km; shrunk to 100km after a live OOM crash processing a
+    // globally-widespread real band (3000-3500ft) — one region's ST_Union
+    // input was still large enough at 500km to blow past available memory
+    // (~7.6GB RSS + ~12GB shared for a single backend, enough to trigger
+    // the kernel OOM killer and take down the whole Postgres cluster with
+    // it, since killing any one backend forces a full cluster restart).
+    // Finer cells mean smaller per-region unions (lower peak memory per
+    // GEOS call) at the cost of more regions to merge in the outer union —
+    // a direct trade of total call count for peak-per-call memory, which is
+    // the right trade here since peak memory is what caused the crash.
+    constexpr double kRegionSizeM = 100000.0;
+
     // Resumability: this whole function is meant to fully rebuild
     // terrain_bands from scratch on every call (see the doc comment in
     // TerrainLoader.h) — but at global scale, the staging phase below is a
@@ -445,26 +563,33 @@ bool buildTerrainBands(const std::string& server, const std::string& user,
     // starting over — staging_complete and terrain_frags_staging_progress
     // say exactly how much of it is already done. Any other case (no row,
     // or parameters differ — e.g. a genuinely new rebuild requested with
-    // different band_ft/simplify_m) wipes everything and starts clean, so
-    // resumption never silently reuses stale/incompatible data.
+    // different band_ft/simplify_m/region_size_m) wipes everything and
+    // starts clean, so resumption never silently reuses stale/incompatible
+    // data — region_size_m's inclusion here is exactly what makes tuning
+    // it (as above) safe to do even with an interrupted run's state still
+    // sitting in these tables from before the change.
     bool resuming = false;
     bool staging_complete = false;
+    bool regions_complete = false;
     {
         pqxx::work txn(conn);
         auto r = txn.exec(
-            "SELECT staging_complete FROM public.terrain_bands_build_state "
-            "WHERE id = 1 AND band_ft = $1 AND simplify_m = $2 AND lo_ft = $3 AND hi_ft = $4",
-            pqxx::params{band_ft, simplify_m, lo_ft, hi_ft});
+            "SELECT staging_complete, regions_complete FROM public.terrain_bands_build_state "
+            "WHERE id = 1 AND band_ft = $1 AND simplify_m = $2 AND lo_ft = $3 AND hi_ft = $4 "
+            "AND region_size_m = $5",
+            pqxx::params{band_ft, simplify_m, lo_ft, hi_ft, kRegionSizeM});
         txn.commit();
         if (!r.empty()) {
             resuming = true;
             staging_complete = r[0][0].as<bool>();
+            regions_complete = r[0][1].as<bool>();
         }
     }
 
     if (resuming && verbose)
         std::cout << "[Terrain] resuming an interrupted rebuild (staging "
-                  << (staging_complete ? "already complete" : "incomplete, resuming") << ")\n";
+                  << (staging_complete ? "complete" : "incomplete") << ", regions "
+                  << (regions_complete ? "complete" : "incomplete") << ")\n";
 
     if (!resuming) {
         try {
@@ -478,11 +603,13 @@ bool buildTerrainBands(const std::string& server, const std::string& user,
                 "  ry integer NOT NULL,"
                 "  geom public.geometry)");
             txn.exec("TRUNCATE public.terrain_frags_staging_progress");
+            txn.exec("TRUNCATE public.terrain_region_staging");
+            txn.exec("TRUNCATE public.terrain_region_staging_progress");
             txn.exec(
-                "INSERT INTO public.terrain_bands_build_state(id, band_ft, simplify_m, lo_ft, hi_ft, staging_complete) "
-                "VALUES (1, $1, $2, $3, $4, false) "
-                "ON CONFLICT (id) DO UPDATE SET band_ft=$1, simplify_m=$2, lo_ft=$3, hi_ft=$4, staging_complete=false",
-                pqxx::params{band_ft, simplify_m, lo_ft, hi_ft});
+                "INSERT INTO public.terrain_bands_build_state(id, band_ft, simplify_m, lo_ft, hi_ft, region_size_m, staging_complete, regions_complete) "
+                "VALUES (1, $1, $2, $3, $4, $5, false, false) "
+                "ON CONFLICT (id) DO UPDATE SET band_ft=$1, simplify_m=$2, lo_ft=$3, hi_ft=$4, region_size_m=$5, staging_complete=false, regions_complete=false",
+                pqxx::params{band_ft, simplify_m, lo_ft, hi_ft, kRegionSizeM});
             txn.commit();
         } catch (const std::exception& e) {
             std::cerr << "[Terrain] buildTerrainBands error truncating: " << e.what() << "\n";
@@ -508,10 +635,6 @@ bool buildTerrainBands(const std::string& server, const std::string& user,
     std::ostringstream frag_expr, geom_expr;
     frag_expr << wrapSimplify("d.geom");
     geom_expr << wrapSimplify("geom");
-
-    // Grid size (meters, Mercator) for the regional-bucketing tier below —
-    // see buildTerrainBands' hierarchical-union comment further down.
-    constexpr double kRegionSizeM = 500000.0;
 
     // Reclassifying+dumping the whole raster table is itself expensive at
     // country scale (hundreds of thousands of raster rows) — doing that
@@ -679,6 +802,109 @@ bool buildTerrainBands(const std::string& server, const std::string& user,
         }
     }
 
+    // Tier 1 (fine-region unions), materialized as its own parallel pass
+    // rather than computed inline within each band's own query as
+    // originally written. Inline, tier 1's parallelism was capped by
+    // however many bands happened to be running concurrently — usually
+    // fine, but the handful of genuinely globally-widespread bands (e.g.
+    // common continental-plains elevations) dominate tier 1's total cost
+    // so heavily that this was effectively single-threaded in practice:
+    // confirmed live, one such band alone took 1+ hour on a single
+    // connection while --threads-1 other workers sat idle, having long
+    // since finished their own (much cheaper) bands. Partitioning this
+    // pass by geography (chunk_id) instead of by band means every band's
+    // share of tier 1 — expensive or not — gets split across the full
+    // worker pool.
+    if (regions_complete) {
+        if (verbose) std::cout << "[Terrain] fine-region materialization already complete, skipping to band union\n";
+    } else {
+        // Independent of --threads — just checkpoint/parallelism
+        // granularity for this pass. Higher than typical thread counts so
+        // work stays reasonably balanced even though chunk cost varies
+        // (a chunk touching one of the huge bands costs far more than one
+        // that doesn't).
+        constexpr int kRegionMaterializeChunks = 64;
+
+        std::vector<int> chunks_remaining;
+        {
+            pqxx::work txn(conn);
+            auto done_rows = txn.exec("SELECT chunk_id FROM public.terrain_region_staging_progress");
+            txn.commit();
+            std::set<int> done;
+            for (const auto& row : done_rows) done.insert(row[0].as<int>());
+            for (int c = 0; c < kRegionMaterializeChunks; ++c)
+                if (!done.count(c)) chunks_remaining.push_back(c);
+        }
+        if (verbose)
+            std::cout << "[Terrain] materializing fine regions: " << chunks_remaining.size()
+                      << "/" << kRegionMaterializeChunks << " chunk(s) remaining...\n";
+
+        std::atomic<size_t> next_chunk{0};
+        std::atomic<int> chunks_failed{0};
+        std::mutex region_io_mu;
+        auto region_worker = [&]() {
+            // See the equivalent try/catch elsewhere in this function: an
+            // exception escaping a std::thread's function aborts the
+            // entire process, so a transient connection failure here must
+            // not be allowed to propagate past this thread.
+            try {
+                pqxx::connection wconn(connstr);
+                while (true) {
+                    size_t idx = next_chunk.fetch_add(1, std::memory_order_relaxed);
+                    if (idx >= chunks_remaining.size()) break;
+                    int chunk = chunks_remaining[idx];
+
+                    std::ostringstream sql;
+                    sql <<
+                        "INSERT INTO public.terrain_region_staging(band_id, rx, ry, geom) "
+                        "SELECT band_id, rx, ry, " << wrapSimplify("ST_Union(geom)") << " "
+                        "FROM public.terrain_frags_staging "
+                        "WHERE MOD(ABS(rx*31 + ry*17), " << kRegionMaterializeChunks << ") = " << chunk << " "
+                        "GROUP BY band_id, rx, ry";
+                    try {
+                        pqxx::work txn(wconn);
+                        txn.exec(sql.str());
+                        txn.exec("INSERT INTO public.terrain_region_staging_progress(chunk_id) VALUES ($1)",
+                                 pqxx::params{chunk});
+                        txn.commit();
+                    } catch (const std::exception& e) {
+                        std::lock_guard lk(region_io_mu);
+                        std::cerr << "[Terrain] region chunk " << chunk << " error: " << e.what()
+                                  << " — will retry next run\n";
+                        chunks_failed.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+            } catch (const std::exception& e) {
+                std::lock_guard lk(region_io_mu);
+                std::cerr << "[Terrain] region materialization worker error: " << e.what() << "\n";
+            }
+        };
+
+        int region_threads = std::max(1, std::min(threads, static_cast<int>(chunks_remaining.size())));
+        if (!chunks_remaining.empty()) {
+            std::vector<std::thread> region_workers;
+            region_workers.reserve(region_threads);
+            for (int t = 0; t < region_threads; ++t) region_workers.emplace_back(region_worker);
+            for (auto& w : region_workers) w.join();
+        }
+
+        if (chunks_failed.load() > 0) {
+            std::cerr << "[Terrain] " << chunks_failed.load()
+                      << " region chunk(s) failed — re-run to resume and retry them\n";
+            return false;
+        }
+
+        try {
+            pqxx::work txn(conn);
+            txn.exec("CREATE INDEX IF NOT EXISTS terrain_region_staging_band_idx ON public.terrain_region_staging (band_id)");
+            txn.exec("UPDATE public.terrain_bands_build_state SET regions_complete = true WHERE id = 1");
+            txn.commit();
+        } catch (const std::exception& e) {
+            std::cerr << "[Terrain] buildTerrainBands error finalizing region materialization: " << e.what() << "\n";
+            return false;
+        }
+    }
+
     // Bands are independent (disjoint band_min_ft/band_max_ft, no ON
     // CONFLICT/merge step), so — same pattern as main.cpp's node/way worker
     // pools — a fixed pool of threads pulls the next unprocessed band off a
@@ -705,48 +931,127 @@ bool buildTerrainBands(const std::string& server, const std::string& user,
                   << "/" << n_bands << " band(s) already done, unioning "
                   << band_indices.size() << " remaining\n";
 
-    std::atomic<size_t> next_band{0};
+    // Cost-aware admission control via two independent worker pools rather
+    // than list-order tricks. Three list-position-based mitigations were
+    // tried and each failed live: sequential dispatch let all threads
+    // arrive at a costly run of consecutive bands (811-820) simultaneously;
+    // a plain shuffle fixed that specific cluster but let a different
+    // random grouping of expensive bands (834/836/844/846/852) cause a
+    // second crash; a rank->bucket->concatenate scheme (meant to spread the
+    // costliest bands into different segments of the queue) still packed
+    // the same handful of extreme bands (811-831, all within the top ~20
+    // by cost) into the first few positions of every bucket, so fast
+    // threads clearing cheap filler caught up to multiple bucket-heads
+    // within the same window as the first one was still running — a third
+    // near-crash. With only 62 of 869 bands having any real cost and the
+    // rest near-instant/empty, there isn't enough cheap filler between
+    // expensive bands to buy real wall-clock separation from list position
+    // alone, regardless of how cleverly it's ordered. A first attempt at a
+    // shared semaphore (any thread blocks on acquire() before running an
+    // expensive band) was also wrong in a different way: cost-descending
+    // dispatch put all 19 expensive bands at the front of the queue, so all
+    // `threads` workers immediately claimed one each and 9 sat idle blocked
+    // on the semaphore instead of ever reaching the ~800 cheap bands behind
+    // them — safe, but wasted nearly all the parallelism.
+    //
+    // So: two separate pools instead of one shared queue. Query cost per
+    // band up front (terrain_region_staging row count per band_id —
+    // exactly this band's input size for the tier-2/3 union below, and a
+    // cheap proxy already computed by the tier-1 pass) and split into
+    // cheap/expensive lists. The cheap pool (the ~800+ bands at or below
+    // kExpensiveBandThreshold) runs on the full --threads pool with no
+    // gating. The expensive pool (811-829-ish, the ~19 bands above
+    // threshold) runs concurrently but on its own dedicated
+    // kExpensiveBandSlots-sized pool, processed cost-descending — capped at
+    // 1, since that's the only configuration actually proven safe: the
+    // standalone single-band test (band 817, 12,791 regions) ran 13+ hours
+    // without OOMing when it was the only thing running, and two bands from
+    // this same cluster have roughly double that region count. Neither pool
+    // can block the other.
+    constexpr long long kExpensiveBandThreshold = 2000;
+    constexpr int kExpensiveBandSlots = 1;
+    std::map<int, long long> band_cost;  // band_id (1-based) -> region count
+    {
+        pqxx::work txn(conn);
+        auto rows = txn.exec(
+            "SELECT band_id, count(*) FROM public.terrain_region_staging GROUP BY band_id");
+        txn.commit();
+        for (const auto& row : rows) band_cost[row[0].as<int>()] = row[1].as<long long>();
+    }
+    auto costOf = [&](int i) -> long long {
+        auto it = band_cost.find(i + 1);
+        return it == band_cost.end() ? 0 : it->second;
+    };
+    std::vector<int> cheap_indices, expensive_indices;
+    for (int i : band_indices)
+        (costOf(i) > kExpensiveBandThreshold ? expensive_indices : cheap_indices).push_back(i);
+    std::stable_sort(expensive_indices.begin(), expensive_indices.end(),
+                      [&](int a, int b) { return costOf(a) > costOf(b); });  // worst first
+    if (verbose && !expensive_indices.empty())
+        std::cout << "[Terrain] " << expensive_indices.size()
+                  << " expensive band(s) (>" << kExpensiveBandThreshold
+                  << " regions) will run on a dedicated " << kExpensiveBandSlots
+                  << "-thread pool alongside " << cheap_indices.size() << " cheap band(s)\n";
+
     std::atomic<long long> total_polygons{0};
     std::mutex io_mu;  // guards stdout/stderr so progress lines don't interleave
 
-    auto worker = [&]() {
-        // See the equivalent try/catch in loadTerrain's worker: an exception
-        // escaping a std::thread's function aborts the entire process via
-        // std::terminate(), so a transient connection failure here must not
-        // be allowed to propagate past this thread.
-        try {
-            pqxx::connection wconn(connstr);
-            while (true) {
-                size_t idx = next_band.fetch_add(1, std::memory_order_relaxed);
-                if (idx >= band_indices.size()) break;
-                int i = band_indices[idx];
+    // Shared per-band execution, parameterized over which list + counter a
+    // pool pulls from so the cheap and expensive pools reuse identical
+    // query logic without duplicating it.
+    auto runBand = [&](pqxx::connection& wconn, int i) {
+        int band_min = lo_ft + i * band_ft;
+        int band_max = lo_ft + (i + 1) * band_ft;
 
-                int band_min = lo_ft + i * band_ft;
-                int band_max = lo_ft + (i + 1) * band_ft;
-
-            // Hierarchical (regional) union rather than one flat ST_Union
-            // across every matching fragment countrywide: a flat/common
-            // elevation band (e.g. the Great Plains) can touch most of the
-            // loaded tiles at once, and even with fragments pre-simplified,
-            // a union over hundreds of thousands of fragments at once can
-            // still hang for the same underlying GEOS-scaling reason as the
-            // rugged-terrain case. The staging table is already bucketed
-            // into (rx, ry) above, so this just unions+simplifies within
-            // each bucket first, and only then unions the (far fewer,
-            // already-merged) bucket results — keeps every individual
-            // ST_Union call's input small regardless of the band's total
-            // footprint.
+            // Four-tier hierarchical union rather than one flat ST_Union
+            // across every matching fragment globally: a flat/widespread
+            // elevation band (e.g. continental plains/plateau terrain) can
+            // touch most of the loaded tiles at once, and even with
+            // fragments pre-simplified, a union over hundreds of thousands
+            // of fragments at once can still hang for the same underlying
+            // GEOS-scaling reason as the rugged-terrain case.
+            //
+            // Tier 1 (per-(rx,ry) fine-region unions) is NOT computed here
+            // — it's already sitting in terrain_region_staging, done by the
+            // parallel materialization pass above. This query does tiers
+            // 2-4. A single coarser-grouping tier (kSuperRegionFactor=10,
+            // ~100 fine regions per group) was enough to stop the original
+            // OOM crash, but for the single worst band in the dataset
+            // (813, 20,968 fine regions — more than 817's 12,791, which
+            // itself needed 13+ hours under that 3-tier query and never
+            // reached completion) it still wasn't fast enough: ~210
+            // super-region groups (each unioning ~100 already-complex
+            // fine-region polygons) and a final flat union of ~210 more
+            // ran over 14 hours with no end in sight. Splitting that one
+            // 10x jump into two gentler 5x steps (mid-regions, then
+            // super-regions) keeps every intermediate ST_Union call bounded
+            // to ~25 inputs on average instead of ~100, and for band 813
+            // specifically shrinks the truly-final merge from ~210 inputs
+            // down to ~34 — GEOS union cost empirically scales worse than
+            // linearly with input count/complexity, so more numerous but
+            // smaller union calls should beat fewer, larger ones even
+            // though the total amount of geometry being merged is the same.
+            constexpr int kMidRegionFactor = 5;    // fine (100km) -> mid (~500km)
+            constexpr int kSuperRegionFactor = 5;  // mid -> super (~2500km)
             std::ostringstream sql;
             sql <<
-                "WITH regions AS ("
+                "WITH midregions AS ("
+                "  SELECT floor(rx / " << kMidRegionFactor << "::float) AS mrx, "
+                "         floor(ry / " << kMidRegionFactor << "::float) AS mry, "
+                << wrapSimplify("ST_Union(geom)") << " AS geom "
+                "  FROM public.terrain_region_staging WHERE band_id = " << (i + 1)
+                << "  GROUP BY floor(rx / " << kMidRegionFactor << "::float), "
+                          "floor(ry / " << kMidRegionFactor << "::float)"
+                "), superregions AS ("
                 "  SELECT " << wrapSimplify("ST_Union(geom)") << " AS geom "
-                "  FROM public.terrain_frags_staging WHERE band_id = " << (i + 1)
-                << "  GROUP BY rx, ry"
+                "  FROM midregions"
+                << "  GROUP BY floor(mrx / " << kSuperRegionFactor << "::float), "
+                          "floor(mry / " << kSuperRegionFactor << "::float)"
                 ") "
                 "INSERT INTO public.terrain_bands(band_min_ft, band_max_ft, geog) "
                 "SELECT " << band_min << ", " << band_max << ", "
                           "(ST_Dump(" << geom_expr.str() << ")).geom "
-                "FROM (SELECT ST_Union(geom) AS geom FROM regions) merged";
+                "FROM (SELECT ST_Union(geom) AS geom FROM superregions) merged";
 
             try {
                 pqxx::work txn(wconn);
@@ -767,21 +1072,55 @@ bool buildTerrainBands(const std::string& server, const std::string& user,
                           << e.what() << "\n";
                 // Continue with remaining bands rather than losing the whole rebuild.
             }
-            }
-        } catch (const std::exception& e) {
-            std::lock_guard lk(io_mu);
-            std::cerr << "[Terrain] worker thread error: " << e.what() << "\n";
+    };
+
+    // Bands are independent (disjoint band_min_ft/band_max_ft, no ON
+    // CONFLICT/merge step) — same pattern as main.cpp's node/way worker
+    // pools, a fixed pool of threads pulls the next unprocessed index off a
+    // shared atomic counter, each with its own pqxx::connection. Factored
+    // so the cheap and expensive pools (below) share this logic while
+    // pulling from separate index lists/counters, since neither pool may
+    // block on the other.
+    auto makePool = [&](std::vector<int>& indices, int pool_size) {
+        auto next = std::make_shared<std::atomic<size_t>>(0);
+        std::vector<std::thread> pool;
+        pool.reserve(pool_size);
+        for (int t = 0; t < pool_size; ++t) {
+            pool.emplace_back([&, next]() {
+                // See the equivalent try/catch in loadTerrain's worker: an
+                // exception escaping a std::thread's function aborts the
+                // entire process via std::terminate(), so a transient
+                // connection failure here must not be allowed to propagate
+                // past this thread.
+                try {
+                    pqxx::connection wconn(connstr);
+                    while (true) {
+                        size_t idx = next->fetch_add(1, std::memory_order_relaxed);
+                        if (idx >= indices.size()) break;
+                        runBand(wconn, indices[idx]);
+                    }
+                } catch (const std::exception& e) {
+                    std::lock_guard lk(io_mu);
+                    std::cerr << "[Terrain] worker thread error: " << e.what() << "\n";
+                }
+            });
         }
+        return pool;
     };
 
     if (!band_indices.empty()) {
-        int nthreads = std::max(1, std::min(threads, static_cast<int>(band_indices.size())));
+        int nthreads = std::max(1, std::min(threads, static_cast<int>(cheap_indices.size())));
+        int ex_threads = std::min(kExpensiveBandSlots, static_cast<int>(expensive_indices.size()));
         if (verbose)
-            std::cout << "[Terrain] using " << nthreads << " thread(s)\n";
-        std::vector<std::thread> workers;
-        workers.reserve(nthreads);
-        for (int t = 0; t < nthreads; ++t) workers.emplace_back(worker);
-        for (auto& w : workers) w.join();
+            std::cout << "[Terrain] using " << nthreads << " thread(s) for "
+                      << cheap_indices.size() << " cheap band(s), " << ex_threads
+                      << " thread(s) for " << expensive_indices.size() << " expensive band(s)\n";
+        std::vector<std::thread> all_workers;
+        if (!cheap_indices.empty())
+            for (auto& w : makePool(cheap_indices, nthreads)) all_workers.push_back(std::move(w));
+        if (!expensive_indices.empty())
+            for (auto& w : makePool(expensive_indices, ex_threads)) all_workers.push_back(std::move(w));
+        for (auto& w : all_workers) w.join();
     }
 
     // Full success (every band processed, whether just now or across a
@@ -792,6 +1131,8 @@ bool buildTerrainBands(const std::string& server, const std::string& user,
         pqxx::work txn(conn);
         txn.exec("DROP TABLE IF EXISTS public.terrain_frags_staging");
         txn.exec("TRUNCATE public.terrain_frags_staging_progress");
+        txn.exec("TRUNCATE public.terrain_region_staging");
+        txn.exec("TRUNCATE public.terrain_region_staging_progress");
         txn.exec("DELETE FROM public.terrain_bands_build_state WHERE id = 1");
         txn.commit();
     } catch (const std::exception& e) {
