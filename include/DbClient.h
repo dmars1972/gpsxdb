@@ -1,6 +1,8 @@
 #pragma once
 #include <pqxx/pqxx>
 #include <string>
+#include <functional>
+#include <cstdint>
 #include "DbConn.h"
 
 // Common base for anything that owns a primary Postgres connection built
@@ -25,6 +27,17 @@ public:
     DbClient(const DbClient&) = delete;
     DbClient& operator=(const DbClient&) = delete;
 
+    // Optional progress hook: derived loaders call progress_cb_(done, total)
+    // at their own natural checkpoints (a streamed row count, a worker-pool
+    // completion counter, etc.) — total==0 means "count-only, no known
+    // total". Defaults to a no-op, so standalone CLI tools (which print
+    // their own verbose progress directly) and any other caller that never
+    // sets this behave exactly as before. osm_import's live status line is
+    // the only current consumer — see main.cpp's Status/statusThread.
+    void setProgressCallback(std::function<void(int64_t, int64_t)> cb) {
+        progress_cb_ = std::move(cb);
+    }
+
 protected:
     pqxx::connection newConnection() const {
         return pqxx::connection(makeConnString(host_, database_, user_));
@@ -32,4 +45,5 @@ protected:
 
     std::string host_, user_, database_;
     pqxx::connection conn_;
+    std::function<void(int64_t, int64_t)> progress_cb_ = [](int64_t, int64_t) {};
 };

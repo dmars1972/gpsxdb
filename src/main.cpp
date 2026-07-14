@@ -107,6 +107,28 @@ static const char* phaseName(Phase p) {
     return "";
 }
 
+// Phases where the N/A/W/R OSM counters are meaningless (frozen at their
+// Relations-phase values) and phase_progress/phase_total should be shown
+// instead — see Status::phase_progress below.
+static bool isLoaderPhase(Phase p) {
+    return p == Phase::AirportsLoading || p == Phase::FAALoading ||
+           p == Phase::WMMLoading || p == Phase::AirspaceLoading ||
+           p == Phase::TerrainLoading;
+}
+
+// Short tag for a loader phase, matching the terse N:/A:/W:/R: style used
+// for the OSM counters, rather than phaseName()'s longer descriptive text.
+static const char* loaderPhaseTag(Phase p) {
+    switch (p) {
+        case Phase::AirportsLoading: return "APT";
+        case Phase::FAALoading:      return "FAA";
+        case Phase::WMMLoading:      return "WMM";
+        case Phase::AirspaceLoading: return "ASP";
+        case Phase::TerrainLoading:  return "ELE";
+        default:                     return "";
+    }
+}
+
 // Records timing/count for one completed phase, for the final summary report.
 struct PhaseStats {
     Phase phase;
@@ -143,6 +165,10 @@ struct Status {
         phase_count_at_start.store(total, std::memory_order_relaxed);
         phase_start_us.store(now, std::memory_order_relaxed);
         phase.store(static_cast<int>(next), std::memory_order_relaxed);
+        // Stale progress from the phase that just ended shouldn't bleed
+        // into the next one's display.
+        phase_progress.store(0, std::memory_order_relaxed);
+        phase_total.store(0, std::memory_order_relaxed);
     }
 
     // Current phase counters — reset at each phase transition for display
@@ -152,6 +178,12 @@ struct Status {
     std::atomic<int64_t> relations{0};
     std::atomic<double>  progress{0.0};
     std::atomic<int>     phase{static_cast<int>(Phase::Nodes)};
+    // Generic progress for the loader phases (AirportsLoading through
+    // TerrainLoading), fed by DbClient::progress_cb_ — see isLoaderPhase().
+    // total==0 means "count-only, no known total" (displayed as a bare
+    // count rather than a done/total ratio).
+    std::atomic<int64_t> phase_progress{0};
+    std::atomic<int64_t> phase_total{0};
     // Running totals — never reset, used for final summary
     std::atomic<int64_t> total_nodes{0};
     std::atomic<int64_t> total_areas{0};
@@ -754,41 +786,55 @@ void statusThread(const Status& s, std::atomic<bool>& done,
     while (!done.load(std::memory_order_relaxed)) {
         auto now      = std::chrono::steady_clock::now();
         double elapsed = std::chrono::duration<double>(now - start).count();
-        int64_t total  = s.nodes + s.areas + s.ways + s.relations;
-        // Rate is computed from only the count accrued since this phase
-        // began, using a snapshot of the cumulative total taken at the
-        // phase transition — this keeps N/A/W/R as running totals for
-        // display while making the displayed rate phase-local.
-        int64_t phase_start = s.phase_start_us.load(std::memory_order_relaxed);
-        int64_t phase_count = total - s.phase_count_at_start.load(std::memory_order_relaxed);
-        double phase_elapsed = phase_start > 0
-            ? std::chrono::duration<double>(
-                std::chrono::microseconds(
-                    std::chrono::duration_cast<std::chrono::microseconds>(
-                        now.time_since_epoch()).count() - phase_start)).count()
-            : elapsed;
-        double rps = phase_elapsed > 0 ? phase_count / phase_elapsed : 0;
+        Phase ph = static_cast<Phase>(s.phase.load(std::memory_order_relaxed));
         // Format elapsed as H:MM:SS
         int64_t secs = static_cast<int64_t>(elapsed);
         int h = secs / 3600, m = (secs % 3600) / 60, sec = secs % 60;
         char elapsed_str[16];
         snprintf(elapsed_str, sizeof(elapsed_str), "%d:%02d:%02d", h, m, sec);
-        std::cout << "\r" << elapsed_str
-                  << " " << std::fixed << std::setprecision(1)
-                  << s.progress.load() << "%  "
-                  << "N:" << hr(s.nodes) << " A:" << hr(s.areas)
-                  << " W:" << hr(s.ways) << " R:" << hr(s.relations)
-                  << " Q:" << q.size();
-        if (!merge_done.load(std::memory_order_relaxed)) {
-            int64_t mp = osmmap.mergeProgress();
-            int64_t mt = osmmap.mergeTotal();
-            double  mp_pct = mt > 0 ? (mp * 100.0 / mt) : 0.0;
-            std::cout << " M:" << std::fixed << std::setprecision(1) << mp_pct << "%";
+
+        if (isLoaderPhase(ph)) {
+            // N/A/W/R/Q/M/rate are all meaningless here (frozen OSM
+            // counters left over from Relations, no way-queue or merge in
+            // these phases) — show the loader's own progress instead, fed
+            // via DbClient::progress_cb_ (see the loader construction
+            // sites below). total==0 means "count-only, no known total".
+            int64_t p = s.phase_progress.load(std::memory_order_relaxed);
+            int64_t t = s.phase_total.load(std::memory_order_relaxed);
+            std::cout << "\r" << elapsed_str << "  " << loaderPhaseTag(ph) << ":";
+            if (t > 0) std::cout << p << "/" << t; else std::cout << p;
+            std::cout << "   " << std::flush;
+        } else {
+            int64_t total  = s.nodes + s.areas + s.ways + s.relations;
+            // Rate is computed from only the count accrued since this phase
+            // began, using a snapshot of the cumulative total taken at the
+            // phase transition — this keeps N/A/W/R as running totals for
+            // display while making the displayed rate phase-local.
+            int64_t phase_start = s.phase_start_us.load(std::memory_order_relaxed);
+            int64_t phase_count = total - s.phase_count_at_start.load(std::memory_order_relaxed);
+            double phase_elapsed = phase_start > 0
+                ? std::chrono::duration<double>(
+                    std::chrono::microseconds(
+                        std::chrono::duration_cast<std::chrono::microseconds>(
+                            now.time_since_epoch()).count() - phase_start)).count()
+                : elapsed;
+            double rps = phase_elapsed > 0 ? phase_count / phase_elapsed : 0;
+            std::cout << "\r" << elapsed_str
+                      << " " << std::fixed << std::setprecision(1)
+                      << s.progress.load() << "%  "
+                      << "N:" << hr(s.nodes) << " A:" << hr(s.areas)
+                      << " W:" << hr(s.ways) << " R:" << hr(s.relations)
+                      << " Q:" << q.size();
+            if (!merge_done.load(std::memory_order_relaxed)) {
+                int64_t mp = osmmap.mergeProgress();
+                int64_t mt = osmmap.mergeTotal();
+                double  mp_pct = mt > 0 ? (mp * 100.0 / mt) : 0.0;
+                std::cout << " M:" << std::fixed << std::setprecision(1) << mp_pct << "%";
+            }
+            std::cout << " | " << hr(static_cast<int64_t>(rps)) << "/s  "
+                      << "[" << phaseName(ph) << "]   "
+                      << std::flush;
         }
-        Phase ph = static_cast<Phase>(s.phase.load(std::memory_order_relaxed));
-        std::cout << " | " << hr(static_cast<int64_t>(rps)) << "/s  "
-                  << "[" << phaseName(ph) << "]   "
-                  << std::flush;
         std::this_thread::sleep_for(std::chrono::milliseconds(1000));
     }
 }
@@ -873,6 +919,28 @@ int main(int argc, char** argv) {
         NavDB db(0, args.server, args.user, args.database, mu);
         db.initializeSchema();
         std::cout << "Schema initialized.\n";
+
+        // -I always wipes external_data_state (which holds the "osm"
+        // replication sequence), so a fresh -I --download-planet run
+        // otherwise leaves poll mode with no starting point at all — a
+        // human would have to figure out and pass -Q manually before
+        // replication could ever resume. Auto-seed it here by
+        // interpolating from planet-latest.osm.pbf's actual data cutoff
+        // (see estimatePlanetReplicationSequence's doc comment). Only
+        // meaningful when the planet file was just (re)downloaded fresh —
+        // an -I with a pre-existing/stale local infile has no reliable
+        // cutoff to interpolate from.
+        if (args.download_planet) {
+            int64_t seed = estimatePlanetReplicationSequence();
+            if (seed >= 0) {
+                db.setReplicationSequence(seed);
+                LOGI(-1, "auto-seeded replication sequence=", seed,
+                     " from planet-latest.osm.pbf cutoff");
+            } else {
+                std::cerr << "[Planet] could not auto-seed replication sequence — "
+                             "set one manually with -Q before running poll mode\n";
+            }
+        }
     }
 
     // Disable autovacuum for the duration of the import — bulk loading
@@ -947,8 +1015,8 @@ int main(int argc, char** argv) {
             LOGI(-1, "resume: loading terrain elevation data");
             {
                 TerrainLoader terrain(args.server, args.user, args.database);
-                terrain.load(-125, 24, -66, 50, TerrainSource::USGS3DEP, 3857, 500, 50.0, 4, false);
-                terrain.loadGlobal(3857, 500, 50.0, 4, false);
+                terrain.load(-125, 24, -66, 50, TerrainSource::USGS3DEP, 3857, 4, false);
+                terrain.loadGlobal(3857, 4, false);
             }
             LOGI(-1, "terrain elevation data loaded");
         }
@@ -1206,26 +1274,49 @@ int main(int argc, char** argv) {
     }
     LOGI(-1, "GiST indexes done");
 
+    // Every loader below gets the same progress callback: write into the
+    // shared Status object so the live status line (still running through
+    // these phases — see isLoaderPhase()) shows real progress instead of
+    // a frozen N/A/W/R block. verbose=false on every call for the same
+    // reason it always was: these loaders' own progress printing would
+    // otherwise interleave with and corrupt the \r-updating status line.
+    auto reportProgress = [&](int64_t done, int64_t total) {
+        status.phase_progress.store(done, std::memory_order_relaxed);
+        status.phase_total.store(total, std::memory_order_relaxed);
+    };
+
     status.advancePhase(Phase::Indexing, Phase::AirportsLoading);
     LOGI(-1, "loading airports data");
-    AirportsLoader(args.server, args.user, args.database).load(false);
+    {
+        AirportsLoader loader(args.server, args.user, args.database);
+        loader.setProgressCallback(reportProgress);
+        loader.load(false);
+    }
     LOGI(-1, "airports data loaded");
 
     status.advancePhase(Phase::AirportsLoading, Phase::FAALoading);
     LOGI(-1, "loading FAA obstacle data");
-    FAAObstacleLoader(args.server, args.user, args.database).load(false);
+    {
+        FAAObstacleLoader loader(args.server, args.user, args.database);
+        loader.setProgressCallback(reportProgress);
+        loader.load(false);
+    }
     LOGI(-1, "FAA obstacle data loaded");
 
     status.advancePhase(Phase::FAALoading, Phase::WMMLoading);
     LOGI(-1, "loading WMM declination data");
-    WMMLoader(args.server, args.user, args.database).load(currentDecimalYear(),
-            -180, -90, 180, 90, 0.25, 3857, 0.25, 50.0, 4, false);
+    {
+        WMMLoader loader(args.server, args.user, args.database);
+        loader.setProgressCallback(reportProgress);
+        loader.load(currentDecimalYear(), -180, -90, 180, 90, 0.25, 3857, 0.25, 50.0, 4, false);
+    }
     LOGI(-1, "WMM declination data loaded");
 
     status.advancePhase(Phase::WMMLoading, Phase::AirspaceLoading);
     LOGI(-1, "loading airspace data");
     {
         AirspaceLoader airspace(args.server, args.user, args.database);
+        airspace.setProgressCallback(reportProgress);
         airspace.loadClassAirspace(false);
         airspace.loadSpecialUseAirspace(false);
         std::string openaip_key = defaultOpenAipApiKey();
@@ -1240,8 +1331,9 @@ int main(int argc, char** argv) {
     LOGI(-1, "loading terrain elevation data");
     {
         TerrainLoader terrain(args.server, args.user, args.database);
-        terrain.load(-125, 24, -66, 50, TerrainSource::USGS3DEP, 3857, 500, 50.0, 4, false);
-        terrain.loadGlobal(3857, 500, 50.0, 4, false);
+        terrain.setProgressCallback(reportProgress);
+        terrain.load(-125, 24, -66, 50, TerrainSource::USGS3DEP, 3857, 4, false);
+        terrain.loadGlobal(3857, 4, false);
     }
     LOGI(-1, "terrain elevation data loaded");
 

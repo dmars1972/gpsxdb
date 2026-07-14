@@ -36,15 +36,7 @@ public:
     // bbox only fetches what's new.
     //
     // dest_srid: 3857 (Web Mercator, default) or 4326 (WGS84).
-    // band_ft: elevation band width in feet for the derived terrain_bands
-    // polygons (see buildBands below). Pass 0 to skip band generation
-    // entirely and only load the raw raster.
-    // simplify_m: see buildBands.
-    // threads: worker-thread count, reused for both stages — parallel tile
-    // download/load batches here, then handed to buildBands below for
-    // parallel band generation. Same rationale both times: independent units
-    // of work (batches / bands) with no shared mutable state besides tables
-    // that tolerate concurrent writers, so no serialization is needed.
+    // threads: worker-thread count for parallel tile download/load batches.
     // verbose: when true, prints download/load progress to stdout.
     //
     // Returns false if no tile could be downloaded/loaded at all. Partial
@@ -54,49 +46,8 @@ public:
               double max_lon, double max_lat,
               TerrainSource source = TerrainSource::USGS3DEP,
               int dest_srid = 3857,
-              int band_ft = 500,
-              double simplify_m = 50.0,
               int threads = 4,
               bool verbose = true);
-
-    // Derives elevation-band area polygons from the entire `terrain` raster
-    // table (not just newly-loaded tiles) and (re)populates `terrain_bands`.
-    //
-    // Each row is one contiguous polygon within a single [band_min_ft,
-    // band_max_ft) elevation range, e.g. a color-tint layer suited to a
-    // sectional-chart-style terrain display — much smaller than either the raw
-    // raster or USGS's own vector contour-line product (10ft line intervals),
-    // since it stores areas, not individual elevation isolines.
-    //
-    // Bands are unioned across ALL loaded tiles so a mountain range spanning
-    // several 1-degree tiles comes out as one seamless polygon rather than one
-    // per tile. This means the whole table is rebuilt from scratch on every
-    // call (TRUNCATE + regenerate) — cheap at the tile counts this tool is
-    // meant for (a region/state), but it does mean cost grows with total
-    // terrain coverage, not just what's newly added.
-    //
-    // simplify_m: ST_SimplifyPreserveTopology tolerance in meters, applied to
-    // each band's unioned shape before the final ST_Dump. The raw band edges
-    // trace individual 30m raster pixel boundaries (a visible staircase),
-    // which bloats vertex count/storage without adding real information;
-    // simplifying smooths that out. Pass 0 to disable. Each band is simplified
-    // independently, so adjacent bands can develop small gaps/slivers at their
-    // shared boundary at higher tolerances — fine for a visual terrain tint,
-    // not for exact-boundary analysis.
-    //
-    // threads: number of worker threads processing bands concurrently,
-    // same pattern as the main import's node/way worker pools (main.cpp) — each
-    // thread owns its own pqxx::connection (via newConnection()) and pulls the
-    // next unprocessed band off a shared atomic counter. Unlike the node/way
-    // workers, no shared mutex is needed here: each band writes disjoint
-    // (band_min_ft, band_max_ft) rows with no ON CONFLICT/merge step, so
-    // there's nothing to serialize.
-    //
-    // Returns false if `terrain` is empty (nothing to band) or on a DB error.
-    bool buildBands(int band_ft = 500,
-                    double simplify_m = 50.0,
-                    int threads = 4,
-                    bool verbose = true);
 
     // Loads Copernicus DEM GLO-30 for every populated non-US region on the
     // planet, in one call — the same 19 named region bboxes previously split
@@ -110,19 +61,10 @@ public:
     // load that separately with source USGS3DEP) and Antarctica (minimal
     // Copernicus coverage, no permanent civil GA population).
     //
-    // Each region is loaded with band generation suppressed (equivalent to
-    // --no-bands) — rebuilding terrain_bands after every one of 19 regions
-    // would mean redoing that expensive whole-table rebuild 19 times over.
-    // If band_ft > 0, a single buildBands call runs once at the very end,
-    // across the whole newly-expanded terrain table. Pass band_ft = 0 to
-    // skip band generation entirely, same as load.
-    //
     // Returns false only if every single region failed to load anything
     // (a fully-connected run will normally return true even if a handful of
     // individual tiles within a region were unavailable, same as load).
     bool loadGlobal(int dest_srid = 3857,
-                    int band_ft = 500,
-                    double simplify_m = 50.0,
                     int threads = 10,
                     bool verbose = true);
 };

@@ -363,9 +363,11 @@ bool AirspaceLoader::loadClassAirspace(bool verbose) {
             multiPolygonWKB(polygons)
         );
         ++count;
+        if ((count + skipped) % 500 == 0) progress_cb_(count + skipped, static_cast<int64_t>(feats->size()));
     }
     stream.complete();
     txn.commit();
+    progress_cb_(count + skipped, static_cast<int64_t>(feats->size()));
 
     if (verbose) std::cout << "  class airspace: " << count << " loaded, " << skipped << " skipped\n";
     std::remove(path.c_str());
@@ -454,9 +456,11 @@ bool AirspaceLoader::loadSpecialUseAirspace(bool verbose) {
             multiPolygonWKB(polygons)
         );
         ++count;
+        if ((count + skipped) % 500 == 0) progress_cb_(count + skipped, static_cast<int64_t>(feats->size()));
     }
     stream.complete();
     txn.commit();
+    progress_cb_(count + skipped, static_cast<int64_t>(feats->size()));
 
     if (verbose) std::cout << "  special use airspace: " << count << " loaded, " << skipped << " skipped\n";
     std::remove(path.c_str());
@@ -579,6 +583,7 @@ bool AirspaceLoader::loadInternationalAirspace(const std::string& api_key, bool 
         }
 
         if (verbose) std::cout << "  page " << page << ": " << count << " loaded so far\n";
+        progress_cb_(count, 0);
 
         if (static_cast<int>(items.size()) < kPageLimit) break; // last page
         // No documented rate limit on this free-tier API, but no reason to

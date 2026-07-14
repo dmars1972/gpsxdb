@@ -294,7 +294,8 @@ void Replicator::poll(int interval_seconds) {
             int64_t remote = remoteSequence();
 
             if (local < 0) {
-                std::cerr << "No local sequence number — set one with -S or run initial import first\n";
+                std::cerr << "No local sequence number — set one with -Q, or run "
+                             "-I --download-planet first (auto-seeds it)\n";
                 break;
             }
 

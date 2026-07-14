@@ -382,12 +382,12 @@ bool AirportsLoader::load(bool verbose) {
     }
 
     if (verbose) std::cout << "Loading airports data...\n";
-    loadCountries  (conn_, files[0].dest, verbose);
-    loadRegions    (conn_, files[1].dest, verbose);
-    loadAirports   (conn_, files[2].dest, verbose);
-    loadFrequencies(conn_, files[3].dest, verbose);
-    loadRunways    (conn_, files[4].dest, verbose);
-    loadNavaids    (conn_, files[5].dest, verbose);
+    loadCountries  (conn_, files[0].dest, verbose); progress_cb_(1, 6);
+    loadRegions    (conn_, files[1].dest, verbose); progress_cb_(2, 6);
+    loadAirports   (conn_, files[2].dest, verbose); progress_cb_(3, 6);
+    loadFrequencies(conn_, files[3].dest, verbose); progress_cb_(4, 6);
+    loadRunways    (conn_, files[4].dest, verbose); progress_cb_(5, 6);
+    loadNavaids    (conn_, files[5].dest, verbose); progress_cb_(6, 6);
     if (verbose) std::cout << "Airports data loaded.\n";
     return true;
 }

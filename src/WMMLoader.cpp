@@ -427,7 +427,8 @@ bool WMMLoader::load(double year,
                     txn.exec("INSERT INTO wmm_cells(cell_name) VALUES ($1) ON CONFLICT DO NOTHING",
                              pqxx::params{cell.name});
                     txn.commit();
-                    total_loaded.fetch_add(1, std::memory_order_relaxed);
+                    long long done = total_loaded.fetch_add(1, std::memory_order_relaxed) + 1;
+                    progress_cb_(done, static_cast<int64_t>(to_load.size()));
                     if (verbose) {
                         std::lock_guard lk(io_mu);
                         std::cout << "  " << cell.name << ": computed (" << grid_n << "x" << grid_n << " grid)\n";
@@ -584,6 +585,7 @@ bool WMMLoader::buildBands(double band_deg, int dest_srid, double simplify_m, in
     }
 
     std::atomic<int> next_band{0};
+    std::atomic<int> bands_done{0};
     std::atomic<long long> total_polygons{0};
     std::mutex io_mu;
 
@@ -626,6 +628,7 @@ bool WMMLoader::buildBands(double band_deg, int dest_srid, double simplify_m, in
                     std::cerr << "[WMM] buildWMMBands band " << (i + 1) << "/" << n_bands
                               << " error: " << e.what() << "\n";
                 }
+                progress_cb_(bands_done.fetch_add(1, std::memory_order_relaxed) + 1, n_bands);
             }
         } catch (const std::exception& e) {
             std::lock_guard lk(io_mu);

@@ -49,6 +49,21 @@ MAJOR_AIRPORT_IDENTS = [
     "OMDB",  # Dubai
     "CYYZ",  # Toronto Pearson
     "FAOR",  # Johannesburg O.R. Tambo
+    # Added for elevation-based GOLDEN_FACTS below -- notable/extreme-elevation
+    # airports with well-documented, independently-verified public figures.
+    "KDEN",  # Denver Intl
+    "SLLP",  # El Alto Intl, La Paz -- highest international airport in the world
+    "ZULS",  # Lhasa Gonggar -- one of the highest airports in the world
+    "KLXV",  # Leadville, CO -- highest public-use airport in North America
+    "KTEX",  # Telluride, CO -- highest commercial airport in North America
+    "MMMX",  # Mexico City
+    "SEQM",  # Quito
+    "KASE",  # Aspen/Pitkin County
+    "VNKT",  # Kathmandu Tribhuvan
+    "ZUBD",  # Qamdo Bangda -- one of the highest airports in the world
+    "KL06",  # Furnace Creek, Death Valley -- lowest airport in North America
+    "KMSY",  # New Orleans
+    "EHAM",  # Amsterdam Schiphol -- below sea level
 ]
 
 LANDMARKS = [
@@ -99,11 +114,22 @@ def rough_region(lat, lon):
 
 # Stable, independently-verifiable public facts to check the live DB
 # against on every run. These don't change over time, so a mismatch here
-# is a real signal of a data problem, not just a note. Sources are the
-# comments beside each value, not this codebase. Both rely on FAA obstacle
-# data, so (like the obstacles check generally) these are inherently
-# US-specific -- there's no equivalent global obstacle dataset to check
-# against elsewhere.
+# is a real signal of a data problem, not just a note. Every public_value
+# below was checked against current published sources (not just recalled
+# from memory) rather than trusted as "probably right" -- airport
+# elevations especially are precise, low-tolerance numbers where a wrong
+# guess would be worse than no check at all. Tolerances are wider where
+# independent sources genuinely disagree by more than a few feet (e.g.
+# Lhasa, Quito, La Paz -- all extreme/remote high-altitude airports with
+# more citation variance than a sea-level city airport), not just as a
+# blanket safety margin.
+#
+# The two obstacle-height facts are inherently US-specific (FAA Digital
+# Obstacle File has no global equivalent -- see the obstacles check
+# generally). Airport elevations and the runway-length fact are globally
+# sourced. The last two facts hit elevation_at_point_ft() directly (see
+# TerrainLoader.cpp) rather than the airports table, so they're the only
+# ones exercising the terrain raster itself.
 GOLDEN_FACTS = [
     {
         "title": "KVLY-TV mast, Blanchard ND",
@@ -119,11 +145,184 @@ GOLDEN_FACTS = [
         "unit": "ft AGL",
         "tolerance": 30,  # antenna/lighting apparatus can sit a bit above the cited architectural height
     },
+    {
+        "title": "Denver Intl (KDEN) elevation",
+        "check": lambda pts: pts["KDEN"]["nearest_airport"]["elevation_ft"],
+        "public_value": 5433,  # FAA AIP
+        "unit": "ft",
+        "tolerance": 15,
+    },
+    {
+        "title": "El Alto Intl, La Paz (SLLP) elevation -- highest international airport in the world",
+        "check": lambda pts: pts["SLLP"]["nearest_airport"]["elevation_ft"],
+        "public_value": 13325,  # Wikipedia/public record; some source variance at this altitude
+        "unit": "ft",
+        "tolerance": 40,
+    },
+    {
+        "title": "Lhasa Gonggar (ZULS) elevation",
+        "check": lambda pts: pts["ZULS"]["nearest_airport"]["elevation_ft"],
+        "public_value": 11713,  # public sources range ~11713-11800ft for this one
+        "unit": "ft",
+        "tolerance": 100,
+    },
+    {
+        "title": "Leadville/Lake County (KLXV) elevation -- highest public-use airport in North America",
+        "check": lambda pts: pts["KLXV"]["nearest_airport"]["elevation_ft"],
+        "public_value": 9934,
+        "unit": "ft",
+        "tolerance": 15,
+    },
+    {
+        "title": "Telluride Regional (KTEX) elevation -- highest commercial airport in North America",
+        "check": lambda pts: pts["KTEX"]["nearest_airport"]["elevation_ft"],
+        "public_value": 9078,
+        "unit": "ft",
+        "tolerance": 15,
+    },
+    {
+        "title": "Mexico City Benito Juarez (MMMX) elevation",
+        "check": lambda pts: pts["MMMX"]["nearest_airport"]["elevation_ft"],
+        "public_value": 7316,
+        "unit": "ft",
+        "tolerance": 15,
+    },
+    {
+        "title": "Quito Mariscal Sucre (SEQM) elevation",
+        "check": lambda pts: pts["SEQM"]["nearest_airport"]["elevation_ft"],
+        "public_value": 7841,  # public sources range ~7841-7910ft
+        "unit": "ft",
+        "tolerance": 40,
+    },
+    {
+        "title": "Amsterdam Schiphol (EHAM) elevation -- below sea level",
+        "check": lambda pts: pts["EHAM"]["nearest_airport"]["elevation_ft"],
+        "public_value": -11,
+        "unit": "ft",
+        "tolerance": 5,
+    },
+    {
+        "title": "New Orleans Louis Armstrong (KMSY) elevation",
+        "check": lambda pts: pts["KMSY"]["nearest_airport"]["elevation_ft"],
+        "public_value": 4,
+        "unit": "ft",
+        "tolerance": 5,
+    },
+    {
+        "title": "Aspen/Pitkin County (KASE) elevation",
+        "check": lambda pts: pts["KASE"]["nearest_airport"]["elevation_ft"],
+        "public_value": 7820,
+        "unit": "ft",
+        "tolerance": 15,
+    },
+    {
+        "title": "Kathmandu Tribhuvan (VNKT) elevation",
+        "check": lambda pts: pts["VNKT"]["nearest_airport"]["elevation_ft"],
+        "public_value": 4390,
+        "unit": "ft",
+        "tolerance": 15,
+    },
+    {
+        "title": "Qamdo Bangda (ZUBD) elevation -- one of the highest airports in the world",
+        "check": lambda pts: pts["ZUBD"]["nearest_airport"]["elevation_ft"],
+        "public_value": 14219,
+        "unit": "ft",
+        "tolerance": 20,
+    },
+    {
+        "title": "Furnace Creek, Death Valley (KL06) elevation -- lowest airport in North America",
+        "check": lambda pts: pts["KL06"]["nearest_airport"]["elevation_ft"],
+        "public_value": -210,
+        "unit": "ft",
+        "tolerance": 10,
+    },
+    {
+        "title": "Toronto Pearson (CYYZ) elevation",
+        "check": lambda pts: pts["CYYZ"]["nearest_airport"]["elevation_ft"],
+        "public_value": 569,
+        "unit": "ft",
+        "tolerance": 15,
+    },
+    {
+        "title": "London Heathrow (EGLL) elevation",
+        "check": lambda pts: pts["EGLL"]["nearest_airport"]["elevation_ft"],
+        "public_value": 83,
+        "unit": "ft",
+        "tolerance": 15,
+    },
+    {
+        "title": "Johannesburg O.R. Tambo (FAOR) elevation",
+        "check": lambda pts: pts["FAOR"]["nearest_airport"]["elevation_ft"],
+        "public_value": 5558,
+        "unit": "ft",
+        "tolerance": 15,
+    },
+    {
+        "title": "Atlanta Hartsfield-Jackson (KATL) elevation -- world's busiest airport",
+        "check": lambda pts: pts["KATL"]["nearest_airport"]["elevation_ft"],
+        "public_value": 1026,
+        "unit": "ft",
+        "tolerance": 15,
+    },
+    {
+        "title": "Paris Charles de Gaulle (LFPG) elevation",
+        "check": lambda pts: pts["LFPG"]["nearest_airport"]["elevation_ft"],
+        "public_value": 392,
+        "unit": "ft",
+        "tolerance": 15,
+    },
+    {
+        "title": "Dubai Intl (OMDB) elevation",
+        "check": lambda pts: pts["OMDB"]["nearest_airport"]["elevation_ft"],
+        "public_value": 62,
+        "unit": "ft",
+        "tolerance": 15,
+    },
+    {
+        "title": "Denver Intl (KDEN) runway 16R/34L length -- longest public-use runway in North America",
+        "check": lambda pts: pts["kden_16r34l"]["length_ft"],
+        "public_value": 16000,
+        "unit": "ft",
+        "tolerance": 5,
+    },
+    {
+        "title": "Lowest point in the Netherlands, Nieuwerkerk aan den IJssel (terrain raster)",
+        "check": lambda pts: pts["nl_lowest"]["elevation_ft"],
+        "public_value": -22,  # 6.67m below NAP (~mean sea level)
+        "unit": "ft",
+        # Wider tolerance than the airport facts: this checks a 30m-resolution
+        # DEM pixel against a specific surveyed polder-bottom marker, not an
+        # airport's own official reference elevation.
+        "tolerance": 25,
+    },
+    {
+        "title": "Mexico City historic center / Zocalo (terrain raster)",
+        "check": lambda pts: pts["cdmx_zocalo"]["elevation_ft"],
+        "public_value": 7349,
+        "unit": "ft",
+        # Wide tolerance: cited city elevation genuinely varies ~7316-7350ft
+        # across different sources/neighborhoods, not just DEM imprecision.
+        "tolerance": 50,
+    },
 ]
 
 
 def declination(gm, year, lat, lon):
     return gm.calculate(glat=lat, glon=lon, alt=0, time=year).d
+
+
+def angle_diff(a, b):
+    """Smallest angular difference between two bearings, wrapped to [0, 180].
+
+    A plain abs(a - b) is wrong near the +/-180 deg seam: two nearly-identical
+    bearings like -179.97 and 179.68 are ~0.36 deg apart on a compass, not the
+    ~359.6 deg a naive subtraction gives. Declination legitimately sits near
+    +/-180 close to the magnetic poles (confirmed by a genuine Antarctica
+    sample point), so without wrapping this shows up as a false ~360 deg
+    "discrepancy" between two models that actually agree closely.
+    """
+    d = abs(a - b) % 360
+    return min(d, 360 - d)
 
 
 def _sample_lat(rng, min_lat, max_lat):
@@ -198,7 +397,7 @@ def query_point(cur, gm, year, lat, lon):
 
     cur.execute(
         """
-        SELECT ident, name, type,
+        SELECT ident, name, type, elevation_ft,
                ST_Distance(ST_SetSRID(geog,3857), ST_Transform(ST_SetSRID(ST_MakePoint(%s,%s),4326),3857)) AS d
         FROM airports
         ORDER BY ST_SetSRID(geog,3857) <-> ST_Transform(ST_SetSRID(ST_MakePoint(%s,%s),4326),3857)
@@ -207,7 +406,10 @@ def query_point(cur, gm, year, lat, lon):
         (lon, lat, lon, lat),
     )
     r = cur.fetchone()
-    row["nearest_airport"] = {"ident": r[0], "name": r[1], "type": r[2], "dist_km": round(r[3] / 1000, 2)} if r else None
+    row["nearest_airport"] = (
+        {"ident": r[0], "name": r[1], "type": r[2], "elevation_ft": r[3], "dist_km": round(r[4] / 1000, 2)}
+        if r else None
+    )
 
     # FAA Digital Obstacle File is US + territories only -- zero results
     # elsewhere reflects lack of source data, not a data quality problem.
@@ -268,7 +470,7 @@ def query_point(cur, gm, year, lat, lon):
     row["wmm"] = {
         "db_declination": round(db_decl, 3) if db_decl is not None else None,
         "model_declination": round(model_decl, 3),
-        "diff": round(abs(db_decl - model_decl), 3) if db_decl is not None else None,
+        "diff": round(angle_diff(db_decl, model_decl), 3) if db_decl is not None else None,
     }
 
     cur.execute(
@@ -628,7 +830,34 @@ def main():
 
     kvly = next(r for r in results if "KVLY" in r["label"])
     wtc_area = next(r for r in results if "Statue of Liberty" in r["label"])
+    # Every major_airport point's label is "IDENT Name", so any airport in
+    # MAJOR_AIRPORT_IDENTS is reachable by ident for a GOLDEN_FACTS check
+    # without needing a dedicated next(...) lookup per airport.
     pts_by_key = {"kvly": kvly, "wtc_area": wtc_area}
+    for r in results:
+        if r["kind"] == "major_airport":
+            pts_by_key[r["label"].split(" ", 1)[0]] = r
+
+    # A few golden facts need data outside the standard per-point query
+    # (run once here rather than adding a runway lookup / raster call to
+    # every one of the thousands of sampled points above).
+    cur.execute("SELECT length_ft FROM runways WHERE airport_ident='KDEN' AND le_ident='16R' AND he_ident='34L'")
+    r = cur.fetchone()
+    pts_by_key["kden_16r34l"] = {"length_ft": r[0] if r else None}
+
+    # Direct raster elevation lookups -- exercises elevation_at_point_ft()
+    # (see TerrainLoader.cpp) independently of the airport/obstacle
+    # point-sampling above, at well-documented, DEM-friendly (flat, stable,
+    # not an extreme peak) ground elevations. Death Valley/Denver were the
+    # first choice here (see GOLDEN_FACTS below) but terrain coverage turns
+    # out to have a real gap over the CONUS interior -- confirmed via a
+    # direct raster query (zero rows in a Colorado bounding box) rather than
+    # assumed, so these two points were picked specifically because they're
+    # in regions already loaded (Mexico, Europe).
+    cur.execute("SELECT elevation_at_point_ft(%s, %s)", (4.6317, 51.9858))
+    pts_by_key["nl_lowest"] = {"elevation_ft": cur.fetchone()[0]}
+    cur.execute("SELECT elevation_at_point_ft(%s, %s)", (-99.13316, 19.43263))
+    pts_by_key["cdmx_zocalo"] = {"elevation_ft": cur.fetchone()[0]}
 
     golden_results = []
     all_golden_pass = True

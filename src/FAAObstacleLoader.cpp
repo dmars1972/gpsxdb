@@ -275,9 +275,11 @@ bool FAAObstacleLoader::load(bool verbose) {
             geog
         );
         ++count;
+        if (count % 5000 == 0) progress_cb_(count, 0);
     }
     stream.complete();
     txn.commit();
+    progress_cb_(count, 0);
 
     if (verbose)
         std::cout << "  obstacles: " << count

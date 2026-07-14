@@ -51,7 +51,6 @@ extracts.
 | `area_tags` | Key/value tags for areas |
 | `road_tags` | Key/value tags for roads |
 | `relation_tags` | Key/value tags for relations |
-| `osm_replication_state` | Tracks last applied replication sequence number |
 
 ### OurAirports tables
 
@@ -77,9 +76,15 @@ All geometry columns use PostGIS `geometry` type. The default SRID is EPSG:3857 
 
 | Table | Description |
 |---|---|
-| `terrain` | USGS 3DEP elevation data as PostGIS `raster` tiles (US-only). Query point elevation via `ST_Value(rast, point)`. |
-| `terrain_tiles` | Tracks which 1-degree tiles have been loaded, for idempotent/incremental loading. |
-| `terrain_bands` | Elevation-band area polygons (`band_min_ft`, `band_max_ft`, `geog`) derived from `terrain` — a color-tint layer suited to a sectional-chart-style terrain display, much smaller than the raw raster. Rebuilt from scratch each time `terrain_load` runs (unless `--no-bands`). |
+| `terrain` | Elevation data (USGS 3DEP for the US, Copernicus DEM GLO-30 elsewhere) as PostGIS `raster` tiles. Query directly via `ST_Value(rast, point)`, or use the `elevation_at_point_ft`/`elevation_along_bearing_ft` SQL functions below. |
+| `terrain_tiles` | Tracks which tiles have been loaded, for idempotent/incremental loading. |
+
+`terrain_load` also (re)creates two SQL functions on every run, for the point/corridor elevation lookups the consuming GPS application needs:
+
+| Function | Description |
+|---|---|
+| `elevation_at_point_ft(lon, lat)` | Elevation in feet at a single point, sampled directly from `terrain`. |
+| `elevation_along_bearing_ft(lon, lat, bearing_deg, distance_km, interval_m)` | Elevation samples every `interval_m` meters along a geodesic bearing out to `distance_km`, for terrain-ahead lookahead profiles. |
 
 Loaded separately via the standalone `terrain_load` tool — see below.
 
@@ -89,7 +94,7 @@ Loaded separately via the standalone `terrain_load` tool — see below.
 |---|---|
 | `wmm` | Magnetic declination as PostGIS `raster` tiles, one 10-degree cell per row, always EPSG:4326 regardless of the destination SRID used elsewhere. Query point declination via `ST_Value(rast, point)`. |
 | `wmm_cells` | Tracks which 10-degree cells have been computed, for idempotent/incremental (re)loading. |
-| `wmm_bands` | Declination-band area polygons (`band_min_deg`, `band_max_deg`, `geog`) derived from `wmm` — analogous to `terrain_bands`. Rebuilt from scratch each time `wmm_load` runs (unless `--no-bands`). |
+| `wmm_bands` | Declination-band area polygons (`band_min_deg`, `band_max_deg`, `geog`) derived from `wmm` — a color-tint layer suited to a sectional-chart-style display. Rebuilt from scratch each time `wmm_load` runs (unless `--no-bands`). |
 
 Loaded separately via the standalone `wmm_load` tool — see below.
 
@@ -383,25 +388,14 @@ overlapping or expanded bbox only fetches what's new.
   --bbox -109,37,-102,41 -4
 ```
 
-After loading tiles, `terrain_load` also (re)builds `terrain_bands` — elevation-band
-area polygons derived from the whole `terrain` raster (not just newly-loaded tiles),
-so a feature spanning multiple tiles comes out as one seamless shape. This is a
-full rebuild each run (cost grows with total coverage, not just what's new), split
-across a worker-thread pool (same pattern as the main import's node/way pools —
-each thread owns its own connection, no shared-lock contention since bands are
-disjoint). Each polygon is simplified before *and* after the cross-tile union —
-simplifying only the final huge unioned shape can pathologically hang over rugged
-terrain (thousands of tiny raster-pixel-aligned fragments), so small per-chunk
-fragments are smoothed first, which also cuts total storage substantially.
+After loading tiles, `terrain_load` (re)creates the `elevation_at_point_ft`/
+`elevation_along_bearing_ft` SQL functions (see the Terrain tables section
+above) so they stay current against the newly-loaded raster.
 
 ```bash
-# Override the 500ft default band width, simplification tolerance, or thread count
+# Override the thread count
 ./build/terrain_load -s <your_db_server> -d <your_db> -u <your_user_id> \
-  --bbox -109,37,-102,41 --band-ft 1000 --simplify-m 100 --threads 8
-
-# Skip band generation entirely (raw raster only)
-./build/terrain_load -s <your_db_server> -d <your_db> -u <your_user_id> \
-  --bbox -109,37,-102,41 --no-bands
+  --bbox -109,37,-102,41 --threads 8
 ```
 
 3DEP is US-only; pass `--source copernicus` to load Copernicus DEM GLO-30
@@ -418,8 +412,6 @@ call — the same regions previously split across the (now superseded)
 `load_copernicus_final.sh` scripts. Deliberately excludes the continental
 US (3DEP is authoritative there — run a separate `--source 3dep` pass) and
 Antarctica (minimal Copernicus coverage, no permanent civil GA population).
-Band generation is suppressed per-region and runs once at the very end
-instead of 19 times over; pass `--no-bands` to skip it entirely.
 
 ### WMM (magnetic declination) loader
 
@@ -534,7 +526,7 @@ During import, a status line is printed to stdout once per second:
 | `[Loading FAA Obstacles]` | Downloading and loading FAA Digital Obstacle File |
 | `[Loading WMM Declination]` | Computing and loading World Magnetic Model declination, globally |
 | `[Loading Airspace]` | Downloading and loading FAA Class/Special Use Airspace + OpenAIP international airspace |
-| `[Loading Terrain]` | Downloading and loading 3DEP (US) + Copernicus DEM GLO-30 (rest of world) elevation, plus `terrain_bands` |
+| `[Loading Terrain]` | Downloading and loading 3DEP (US) + Copernicus DEM GLO-30 (rest of world) elevation |
 | `[Vacuuming]` | Running `VACUUM ANALYZE` on all tables |
 | `[Done]` | Import complete |
 

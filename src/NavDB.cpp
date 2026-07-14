@@ -4,6 +4,7 @@
 #include <stdexcept>
 #include <cctype>
 #include <string>
+#include <unordered_set>
 
 #include <pqxx/pqxx>
 #include "Log.h"
@@ -93,8 +94,69 @@ NavDB::~NavDB() {
 
 // ---- tag helpers ----
 
+// Keys/prefixes with high row-volume but no relevance to an aviation
+// moving-map: address/geocoding detail and raw building metadata used for
+// ground cadastral purposes, plus OSM's own import-provenance tags. Cuts
+// straight into the largest contributors to *_tags row counts (addr:* in
+// particular is on nearly every OSM building). Bare "building"/"amenity"
+// are NOT excluded — still needed by the area/linear classifier — only
+// their colon-suffixed sub-tags (building:levels, building:material, etc.)
+// are dropped.
+static bool isExcludedTagKey(const std::string& key) {
+    static const std::unordered_set<std::string> exact = {
+        "source", "created_by", "attribution",
+    };
+    if (exact.count(key)) return true;
+
+    static const std::vector<std::string> prefixes = {
+        // tiger:* is leftover metadata from the original 2007 US Census
+        // TIGER/Line import (tiger:cfcc, tiger:county, tiger:reviewed,
+        // etc.) -- long-standing OSM-wide convention that it's import
+        // provenance, not real data, same category as source/created_by.
+        "addr:", "building:", "source:", "tiger:",
+    };
+    for (const auto& p : prefixes)
+        if (key.compare(0, p.size(), p) == 0) return true;
+
+    return false;
+}
+
+// Generic building=* values (yes, house, garage, residential, shed,
+// apartments, industrial, commercial, retail, roof, etc.) carry no
+// information beyond "there's a building here" -- not useful on their own
+// for an aviation moving map, and by far the single biggest contributor to
+// areas/area_tags size (roughly half of all areas are a bare building tag
+// and nothing else). A handful of aviation-relevant values are kept as the
+// exception. Only affects whether `building` alone is enough to keep an
+// entity (see hasSurvivingTag) -- if the entity is kept for some other
+// reason (amenity, name, historic, ...), building=<anything> is still
+// stored as a tag like normal.
+static bool isAviationRelevantBuildingValue(const std::string& value) {
+    static const std::unordered_set<std::string> keep = {
+        "hangar", "terminal", "control_tower",
+    };
+    return keep.count(value) != 0;
+}
+
+// True if at least one tag would actually survive isExcludedTagKey +
+// sanitizeTag filtering (and, for a bare `building` tag, isn't just a
+// generic building value -- see above). Used to skip inserting the entity
+// itself (not just its tag rows) when nothing it had is worth keeping --
+// e.g. a "building" whose only tags were building:*/addr:* (or just a
+// generic building=yes) becomes a meaningless bare geometry.
+static bool hasSurvivingTag(const Tags& tags) {
+    for (const auto& [k, v] : tags) {
+        if (isExcludedTagKey(k)) continue;
+        if (k == "building" && !isAviationRelevantBuildingValue(v)) continue;
+        if (sanitizeTag(k).empty() || sanitizeTag(v).empty()) continue;
+        return true;
+    }
+    return false;
+}
+
 void NavDB::addTags(int64_t id, const Tags& tags) {
     for (const auto& [k, v] : tags) {
+        if (isExcludedTagKey(k)) continue;
         std::string ck = sanitizeTag(k), cv = sanitizeTag(v);
         if (ck.empty() || cv.empty()) continue;
         tag_buf_.push_back({id, std::move(ck), std::move(cv)});
@@ -103,6 +165,7 @@ void NavDB::addTags(int64_t id, const Tags& tags) {
 
 void NavDB::addWayTags(int64_t id, const Tags& tags) {
     for (const auto& [k, v] : tags) {
+        if (isExcludedTagKey(k)) continue;
         std::string ck = sanitizeTag(k), cv = sanitizeTag(v);
         if (ck.empty() || cv.empty()) continue;
         way_tag_buf_.push_back({id, std::move(ck), std::move(cv)});
@@ -111,6 +174,7 @@ void NavDB::addWayTags(int64_t id, const Tags& tags) {
 
 void NavDB::addAreaTags(int64_t id, const Tags& tags) {
     for (const auto& [k, v] : tags) {
+        if (isExcludedTagKey(k)) continue;
         std::string ck = sanitizeTag(k), cv = sanitizeTag(v);
         if (ck.empty() || cv.empty()) continue;
         area_tag_buf_.push_back({id, std::move(ck), std::move(cv)});
@@ -122,7 +186,7 @@ void NavDB::addAreaTags(int64_t id, const Tags& tags) {
 void NavDB::insertNode(int64_t id, const std::string& name,
                        double lon_m, double lat_m,
                        const Tags& tags, const std::string& geog) {
-    if (tags.empty()) return;
+    if (!hasSurvivingTag(tags)) return;
     addTags(id, tags);
     node_buf_.push_back({id, name, geog, lon_m, lat_m});
     if (static_cast<int>(node_buf_.size()) >= NODE_BUFFER_SIZE)
@@ -131,6 +195,7 @@ void NavDB::insertNode(int64_t id, const std::string& name,
 
 void NavDB::insertWay(int64_t id, const std::string& name,
                       const Tags& tags, const std::string& geog) {
+    if (!hasSurvivingTag(tags)) return;
     addWayTags(id, tags);
     way_buf_.push_back({id, name, geog});
     if (static_cast<int>(way_buf_.size()) >= way_buffer_size_)
@@ -139,6 +204,7 @@ void NavDB::insertWay(int64_t id, const std::string& name,
 
 void NavDB::insertArea(int64_t id, const std::string& name,
                        const Tags& tags, const std::string& geog) {
+    if (!hasSurvivingTag(tags)) return;
     addAreaTags(id, tags);
     area_buf_.push_back({id, name, geog});
     if (static_cast<int>(area_buf_.size()) > way_buffer_size_)
@@ -427,6 +493,11 @@ static void diffTags(pqxx::work& txn, int64_t id,
     for (const auto& r : rows) existing[r[0].c_str()] = r[1].c_str();
 
     for (auto& [k, v] : tags) {
+        // Excluded keys are simply skipped (not erased from `existing`), so
+        // any leftover row from before this filter existed gets swept up by
+        // the DELETE loop below — replication updates progressively clean
+        // up excluded tags on any entity they happen to touch.
+        if (isExcludedTagKey(k)) continue;
         auto it = existing.find(k);
         if (it == existing.end())
         {
@@ -448,11 +519,17 @@ void NavDB::updateNode(int64_t id, const std::string& name,
                        const Tags& tags, const std::string& geog) {
     try {
         pqxx::work txn(conn_);
-        txn.exec(
-            "INSERT INTO nodes(id, name, longitude_m, latitude_m, geog) VALUES ($1,$2,$3,$4,$5) "
-            "ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, longitude_m=EXCLUDED.longitude_m, "
-            "latitude_m=EXCLUDED.latitude_m, geog=EXCLUDED.geog",
-            pqxx::params{id, name, lon_m, lat_m, geog});
+        if (hasSurvivingTag(tags)) {
+            txn.exec(
+                "INSERT INTO nodes(id, name, longitude_m, latitude_m, geog) VALUES ($1,$2,$3,$4,$5) "
+                "ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, longitude_m=EXCLUDED.longitude_m, "
+                "latitude_m=EXCLUDED.latitude_m, geog=EXCLUDED.geog",
+                pqxx::params{id, name, lon_m, lat_m, geog});
+        } else {
+            // Every tag this node has (post-edit) is excluded noise -- drop
+            // the bare geometry too, same as insertNode on the initial load.
+            txn.exec("DELETE FROM nodes WHERE id=$1", pqxx::params{id});
+        }
         diffTags(txn, id, "node_tags", tags);
         txn.commit();
     } catch (const std::exception& e) {
@@ -464,10 +541,14 @@ void NavDB::updateWay(int64_t id, const std::string& name,
                       const Tags& tags, const std::string& geog) {
     try {
         pqxx::work txn(conn_);
-        txn.exec(
-            "INSERT INTO ways(id, name, geog) VALUES ($1,$2,$3) "
-            "ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, geog=EXCLUDED.geog",
-            pqxx::params{id, name, geog});
+        if (hasSurvivingTag(tags)) {
+            txn.exec(
+                "INSERT INTO ways(id, name, geog) VALUES ($1,$2,$3) "
+                "ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, geog=EXCLUDED.geog",
+                pqxx::params{id, name, geog});
+        } else {
+            txn.exec("DELETE FROM ways WHERE id=$1", pqxx::params{id});
+        }
         diffTags(txn, id, "way_tags", tags);
         txn.commit();
     } catch (const std::exception& e) {
@@ -479,10 +560,14 @@ void NavDB::updateArea(int64_t id, const std::string& name,
                        const Tags& tags, const std::string& geog) {
     try {
         pqxx::work txn(conn_);
-        txn.exec(
-            "INSERT INTO areas(id, name, geog) VALUES ($1,$2,$3) "
-            "ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, geog=EXCLUDED.geog",
-            pqxx::params{id, name, geog});
+        if (hasSurvivingTag(tags)) {
+            txn.exec(
+                "INSERT INTO areas(id, name, geog) VALUES ($1,$2,$3) "
+                "ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, geog=EXCLUDED.geog",
+                pqxx::params{id, name, geog});
+        } else {
+            txn.exec("DELETE FROM areas WHERE id=$1", pqxx::params{id});
+        }
         diffTags(txn, id, "area_tags", tags);
         txn.commit();
     } catch (const std::exception& e) {
@@ -494,11 +579,15 @@ void NavDB::updateRelation(int64_t id, const std::string& name,
                            const Tags& tags, const std::string& geog) {
     try {
         pqxx::work txn(conn_);
-        std::optional<std::string> g = geog.empty() ? std::nullopt : std::make_optional(geog);
-        txn.exec(
-            "INSERT INTO relations(id, name, geog) VALUES ($1,$2,$3) "
-            "ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, geog=EXCLUDED.geog",
-            pqxx::params{id, name, g});
+        if (hasSurvivingTag(tags)) {
+            std::optional<std::string> g = geog.empty() ? std::nullopt : std::make_optional(geog);
+            txn.exec(
+                "INSERT INTO relations(id, name, geog) VALUES ($1,$2,$3) "
+                "ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, geog=EXCLUDED.geog",
+                pqxx::params{id, name, g});
+        } else {
+            txn.exec("DELETE FROM relations WHERE id=$1", pqxx::params{id});
+        }
         diffTags(txn, id, "relation_tags", tags);
         txn.commit();
     } catch (const std::exception& e) {
@@ -510,10 +599,14 @@ void NavDB::updateRoad(int64_t id, const std::string& name,
                        const Tags& tags, const std::string& geog) {
     try {
         pqxx::work txn(conn_);
-        txn.exec(
-            "INSERT INTO roads(id, name, geog) VALUES ($1,$2,$3) "
-            "ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, geog=EXCLUDED.geog",
-            pqxx::params{id, name, geog});
+        if (hasSurvivingTag(tags)) {
+            txn.exec(
+                "INSERT INTO roads(id, name, geog) VALUES ($1,$2,$3) "
+                "ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, geog=EXCLUDED.geog",
+                pqxx::params{id, name, geog});
+        } else {
+            txn.exec("DELETE FROM roads WHERE id=$1", pqxx::params{id});
+        }
         diffTags(txn, id, "road_tags", tags);
         txn.commit();
     } catch (const std::exception& e) {
@@ -550,36 +643,23 @@ void NavDB::deleteEntity(int64_t id, const std::string& type) {
     }
 }
 
+// osm_replication_state used to be its own single-row table; folded into
+// external_data_state (keyed "osm") since both were just "last known state
+// of an external thing" with the same shape (one bigint value + when it
+// was last checked/updated) -- no reason to have two tables for it.
 int64_t NavDB::getReplicationSequence() {
-    try {
-        pqxx::work txn(conn_);
-        auto r = txn.exec("SELECT sequence FROM osm_replication_state LIMIT 1");
-        txn.commit();
-        if (r.empty()) return -1;
-        return r[0][0].as<int64_t>();
-    } catch (...) {
-        return -1;
-    }
+    return getExternalDataTimestamp("osm");
 }
 
 void NavDB::setReplicationSequence(int64_t seq) {
-    try {
-        pqxx::work txn(conn_);
-        txn.exec(
-            "INSERT INTO osm_replication_state(sequence) VALUES($1) "
-            "ON CONFLICT (id) DO UPDATE SET sequence=$1",
-            pqxx::params{seq});
-        txn.commit();
-    } catch (const std::exception& e) {
-        std::cerr << "[NavDB] setReplicationSequence error: " << e.what() << "\n"; throw;
-    }
+    setExternalDataTimestamp("osm", seq);
 }
 
 int64_t NavDB::getExternalDataTimestamp(const std::string& name) {
     try {
         pqxx::work txn(conn_);
         auto r = txn.exec(
-            "SELECT last_modified FROM external_data_state WHERE name=$1",
+            "SELECT value FROM external_data_state WHERE name=$1",
             pqxx::params{name});
         txn.commit();
         if (r.empty()) return -1;
@@ -593,8 +673,8 @@ void NavDB::setExternalDataTimestamp(const std::string& name, int64_t epoch_seco
     try {
         pqxx::work txn(conn_);
         txn.exec(
-            "INSERT INTO external_data_state(name, last_modified) VALUES($1, $2) "
-            "ON CONFLICT (name) DO UPDATE SET last_modified=$2, checked_at=now()",
+            "INSERT INTO external_data_state(name, value) VALUES($1, $2) "
+            "ON CONFLICT (name) DO UPDATE SET value=$2, checked_at=now()",
             pqxx::params{name, epoch_seconds});
         txn.commit();
     } catch (const std::exception& e) {
@@ -735,14 +815,17 @@ void NavDB::initializeSchema() {
         "CREATE TABLE public.relation_tags ("
         "  id bigint NOT NULL, key_name varchar(256), key_value varchar(256))",
 
-        "CREATE TABLE public.osm_replication_state ("
-        "  id integer PRIMARY KEY DEFAULT 1 CHECK (id = 1),"
-        "  sequence bigint NOT NULL)",
-
+        // Generic "last known state of an external thing" table, one row
+        // per tracked source, keyed by name -- e.g. "osm" (replication
+        // sequence number), "airports"/"faa_obstacles" (upstream
+        // Last-Modified epoch), "wmm"/"airspace" (last refresh epoch).
+        // `value` holds whichever bigint quantity that source's tracking
+        // scheme uses; only checked_at's meaning ("when we last touched
+        // this row") is truly universal across all of them.
         "CREATE TABLE public.external_data_state ("
-        "  name          varchar(32) PRIMARY KEY,"
-        "  last_modified bigint NOT NULL,"
-        "  checked_at    timestamptz NOT NULL DEFAULT now())",
+        "  name       varchar(32) PRIMARY KEY,"
+        "  value      bigint NOT NULL,"
+        "  checked_at timestamptz NOT NULL DEFAULT now())",
 
         "CREATE INDEX node_tags_idx     ON public.node_tags     (id)",
         "CREATE INDEX way_tags_idx      ON public.way_tags      (id)",
@@ -945,8 +1028,23 @@ void NavDB::initializeSchema() {
         "CREATE EXTENSION IF NOT EXISTS postgis_raster",
         "DROP TABLE IF EXISTS public.terrain",
         "DROP TABLE IF EXISTS public.terrain_tiles",
+        // Elevation-band polygons (terrain_bands) and their staging tables
+        // are a retired feature — dropped here too so a clean -I reset also
+        // clears out any leftovers on a database predating the removal.
         "DROP TABLE IF EXISTS public.terrain_bands",
+        "DROP TABLE IF EXISTS public.terrain_bands_build_state",
         "DROP TABLE IF EXISTS public.terrain_frags_staging",
+        "DROP TABLE IF EXISTS public.terrain_frags_staging_progress",
+        "DROP TABLE IF EXISTS public.terrain_region_staging",
+        "DROP TABLE IF EXISTS public.terrain_region_staging_progress",
+
+        // ---- WMM (World Magnetic Model declination raster) ----
+        // Same rationale as terrain just above: dropped only, not
+        // recreated — the wmm_load tool (re)creates wmm/wmm_cells/
+        // wmm_bands as needed on its next run.
+        "DROP TABLE IF EXISTS public.wmm",
+        "DROP TABLE IF EXISTS public.wmm_cells",
+        "DROP TABLE IF EXISTS public.wmm_bands",
     };
 
     for (const char* sql : statements) {

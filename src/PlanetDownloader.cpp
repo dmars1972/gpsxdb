@@ -5,13 +5,16 @@
 #include <fstream>
 #include <cstdio>
 #include <cctype>
+#include <ctime>
 #include <sys/statvfs.h>
 #include <filesystem>
+#include <curl/curl.h>
 
 namespace {
 
 constexpr const char* kPlanetUrl    = "https://planet.openstreetmap.org/pbf/planet-latest.osm.pbf";
 constexpr const char* kPlanetMd5Url = "https://planet.openstreetmap.org/pbf/planet-latest.osm.pbf.md5";
+constexpr const char* kMinuteStateUrl = "https://planet.openstreetmap.org/replication/minute/state.txt";
 
 // Runs cmd, returning its stdout with trailing whitespace trimmed (empty on
 // failure to launch). Used for small, fast commands only (HEAD request,
@@ -39,6 +42,62 @@ long long remoteFileSize(const std::string& url) {
     if (pos == std::string::npos) return -1;
     try { return std::stoll(line.substr(pos + 1)); }
     catch (...) { return -1; }
+}
+
+// HEAD request for the remote Last-Modified time (Unix epoch seconds).
+// Returns -1 if the server doesn't report one or the request fails.
+long remoteLastModifiedEpoch(const std::string& url) {
+    CURL* curl = curl_easy_init();
+    if (!curl) return -1;
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
+    curl_easy_setopt(curl, CURLOPT_FILETIME, 1L);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+    CURLcode res = curl_easy_perform(curl);
+    long filetime = -1;
+    if (res == CURLE_OK) curl_easy_getinfo(curl, CURLINFO_FILETIME, &filetime);
+    curl_easy_cleanup(curl);
+    return filetime;
+}
+
+// Downloads and parses a replication state.txt (osmosis .properties
+// format: "sequenceNumber=N" and "timestamp=2026-07-14T23\:02\:22Z", with
+// ':' escaped as '\:' since it's the .properties key/value separator).
+// Returns false if either field can't be found/parsed.
+bool fetchReplicationState(const std::string& url, int64_t& seq_out, time_t& time_out) {
+    std::string tmp = "/tmp/osm_state_probe.txt";
+    std::string cmd = "curl -fsL -o " + tmp + " \"" + url + "\"";
+    if (system(cmd.c_str()) != 0) return false;
+
+    std::ifstream f(tmp);
+    std::string line, timestamp_raw;
+    int64_t seq = -1;
+    while (std::getline(f, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.rfind("sequenceNumber=", 0) == 0) {
+            try { seq = std::stoll(line.substr(15)); } catch (...) { return false; }
+        } else if (line.rfind("timestamp=", 0) == 0) {
+            timestamp_raw = line.substr(10);
+        }
+    }
+    std::remove(tmp.c_str());
+    if (seq < 0 || timestamp_raw.empty()) return false;
+
+    std::string ts;
+    for (size_t i = 0; i < timestamp_raw.size(); ++i) {
+        if (timestamp_raw[i] == '\\' && i + 1 < timestamp_raw.size() && timestamp_raw[i + 1] == ':') {
+            ts += ':'; ++i;
+        } else {
+            ts += timestamp_raw[i];
+        }
+    }
+
+    struct tm tmv{};
+    if (!strptime(ts.c_str(), "%Y-%m-%dT%H:%M:%SZ", &tmv)) return false;
+    time_out = timegm(&tmv);
+    seq_out = seq;
+    return true;
 }
 
 } // namespace
@@ -120,4 +179,28 @@ bool downloadLatestPlanet(const std::string& dest_path, bool verbose) {
 
     if (verbose) std::cout << "[Planet] checksum verified OK (" << actual_md5 << ")\n";
     return true;
+}
+
+int64_t estimatePlanetReplicationSequence() {
+    long dump_mtime = remoteLastModifiedEpoch(kPlanetUrl);
+    if (dump_mtime <= 0) {
+        std::cerr << "[Planet] could not determine planet-latest.osm.pbf's Last-Modified time\n";
+        return -1;
+    }
+
+    int64_t tip_seq;
+    time_t tip_time;
+    if (!fetchReplicationState(kMinuteStateUrl, tip_seq, tip_time)) {
+        std::cerr << "[Planet] could not fetch/parse " << kMinuteStateUrl << "\n";
+        return -1;
+    }
+
+    constexpr int64_t kSecondsPerSequence = 60;             // minute granularity
+    constexpr int64_t kSafetyMarginSeconds = 3LL * 24 * 3600; // 3 days, err early not late
+
+    int64_t seconds_back = (static_cast<int64_t>(tip_time) - dump_mtime) + kSafetyMarginSeconds;
+    if (seconds_back < 0) seconds_back = 0;
+    int64_t seq_back = seconds_back / kSecondsPerSequence;
+    int64_t estimated = tip_seq - seq_back;
+    return estimated > 0 ? estimated : 0;
 }
