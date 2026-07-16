@@ -456,6 +456,23 @@ std::optional<std::pair<double,double>> OSMMMap::select(int64_t id) const {
     return std::make_pair(ptr[0], ptr[1]);
 }
 
+void OSMMMap::forEachPopulated(const std::function<void(int64_t, double, double)>& fn) const {
+    const uint8_t* bm = static_cast<const uint8_t*>(merged_bm_map_);
+    const uint8_t* data = static_cast<const uint8_t*>(merged_map_);
+    for (size_t byte = 0; byte < merged_bm_size_; ++byte) {
+        uint8_t b = bm[byte];
+        if (b == 0) continue;  // whole byte (8 ids) unpopulated — skip fast
+        for (int bit = 0; bit < 8; ++bit) {
+            if (!((b >> bit) & 1u)) continue;
+            int64_t id = static_cast<int64_t>(byte) * 8 + bit;
+            size_t offset = static_cast<size_t>(id) * REC_SIZE;
+            if (offset + REC_SIZE > merged_size_) continue;
+            const double* ptr = reinterpret_cast<const double*>(data + offset);
+            fn(id, ptr[0], ptr[1]);
+        }
+    }
+}
+
 void OSMMMap::flush() {
     for (auto& s : shards_)
         if (s.bm_map) msync(s.bm_map, s.bm_size, MS_ASYNC);

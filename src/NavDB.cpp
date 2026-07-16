@@ -1059,6 +1059,277 @@ void NavDB::initializeSchema() {
     std::cout << "[NavDB] schema initialized\n";
 }
 
+void NavDB::ensureSchema() {
+    // Mirrors initializeSchema()'s CREATE statements with IF NOT EXISTS
+    // added and every DROP removed — see NavDB.h for why public.terrain is
+    // deliberately absent from this list.
+    static const char* statements[] = {
+        "CREATE TABLE IF NOT EXISTS public.nodes ("
+        "  id          bigint NOT NULL,"
+        "  name        varchar(256),"
+        "  longitude_m double precision,"
+        "  latitude_m  double precision,"
+        "  geog        public.geometry,"
+        "  CONSTRAINT nodes_pkey PRIMARY KEY (id))",
+
+        "CREATE TABLE IF NOT EXISTS public.ways ("
+        "  id   bigint NOT NULL,"
+        "  name varchar(256),"
+        "  geog public.geometry,"
+        "  CONSTRAINT ways_pkey PRIMARY KEY (id))",
+
+        "CREATE TABLE IF NOT EXISTS public.areas ("
+        "  id   bigint NOT NULL,"
+        "  name varchar(256),"
+        "  geog public.geometry,"
+        "  CONSTRAINT areas_pkey PRIMARY KEY (id))",
+
+        "CREATE TABLE IF NOT EXISTS public.roads ("
+        "  id   bigint NOT NULL,"
+        "  name varchar(256),"
+        "  geog public.geometry,"
+        "  CONSTRAINT roads_pkey PRIMARY KEY (id))",
+
+        "CREATE TABLE IF NOT EXISTS public.relations ("
+        "  id   bigint NOT NULL,"
+        "  name varchar(256),"
+        "  geog public.geometry,"
+        "  CONSTRAINT relations_pkey PRIMARY KEY (id))",
+
+        "CREATE TABLE IF NOT EXISTS public.node_tags ("
+        "  id bigint NOT NULL, key_name varchar(256), key_value varchar(256))",
+
+        "CREATE TABLE IF NOT EXISTS public.way_tags ("
+        "  id bigint NOT NULL, key_name varchar(256), key_value varchar(256))",
+
+        "CREATE TABLE IF NOT EXISTS public.area_tags ("
+        "  id bigint NOT NULL, key_name varchar(256), key_value varchar(256))",
+
+        "CREATE TABLE IF NOT EXISTS public.road_tags ("
+        "  id bigint NOT NULL, key_name varchar(256), key_value varchar(256))",
+
+        "CREATE TABLE IF NOT EXISTS public.relation_tags ("
+        "  id bigint NOT NULL, key_name varchar(256), key_value varchar(256))",
+
+        "CREATE TABLE IF NOT EXISTS public.external_data_state ("
+        "  name       varchar(32) PRIMARY KEY,"
+        "  value      bigint NOT NULL,"
+        "  checked_at timestamptz NOT NULL DEFAULT now())",
+
+        "CREATE INDEX IF NOT EXISTS node_tags_idx     ON public.node_tags     (id)",
+        "CREATE INDEX IF NOT EXISTS way_tags_idx      ON public.way_tags      (id)",
+        "CREATE INDEX IF NOT EXISTS area_tags_idx     ON public.area_tags     (id)",
+        "CREATE INDEX IF NOT EXISTS road_tags_idx     ON public.road_tags     (id)",
+        "CREATE INDEX IF NOT EXISTS relation_tags_idx ON public.relation_tags (id)",
+
+        // ---- OurAirports tables ----
+        "CREATE TABLE IF NOT EXISTS public.countries ("
+        "  id integer PRIMARY KEY, code varchar(2) NOT NULL,"
+        "  name varchar(256), continent varchar(2))",
+
+        "CREATE TABLE IF NOT EXISTS public.regions ("
+        "  id integer PRIMARY KEY, code varchar(16) NOT NULL,"
+        "  local_code varchar(16), name varchar(256),"
+        "  continent varchar(2), iso_country varchar(2))",
+
+        "CREATE TABLE IF NOT EXISTS public.airports ("
+        "  id integer PRIMARY KEY, ident varchar(16) NOT NULL,"
+        "  type varchar(32), name varchar(256),"
+        "  latitude_m double precision, longitude_m double precision,"
+        "  elevation_ft integer, continent varchar(2),"
+        "  iso_country varchar(2), iso_region varchar(16),"
+        "  municipality varchar(256), scheduled_service boolean,"
+        "  icao_code varchar(8), iata_code varchar(8),"
+        "  gps_code varchar(8), local_code varchar(16),"
+        "  geog public.geometry)",
+
+        "CREATE TABLE IF NOT EXISTS public.tags ("
+        "  airport_ident varchar(16) NOT NULL, entity_type varchar(16) NOT NULL,"
+        "  key_name varchar(256) NOT NULL, key_value varchar(256))",
+
+        "CREATE TABLE IF NOT EXISTS public.frequencies ("
+        "  id integer PRIMARY KEY, airport_ref integer NOT NULL,"
+        "  airport_ident varchar(16), type varchar(16),"
+        "  description varchar(256), frequency_mhz double precision)",
+
+        "CREATE TABLE IF NOT EXISTS public.runways ("
+        "  id integer PRIMARY KEY, airport_ref integer NOT NULL,"
+        "  airport_ident varchar(16), length_ft integer, width_ft integer,"
+        "  surface varchar(64), lighted boolean, closed boolean,"
+        "  le_ident varchar(8), le_latitude_m double precision,"
+        "  le_longitude_m double precision, le_elevation_ft integer,"
+        "  le_heading_degT double precision, le_displaced_threshold_ft integer,"
+        "  le_geog public.geometry,"
+        "  he_ident varchar(8), he_latitude_m double precision,"
+        "  he_longitude_m double precision, he_elevation_ft integer,"
+        "  he_heading_degT double precision, he_displaced_threshold_ft integer,"
+        "  he_geog public.geometry)",
+
+        "CREATE TABLE IF NOT EXISTS public.navaids ("
+        "  id integer PRIMARY KEY, ident varchar(16), name varchar(256),"
+        "  type varchar(16), frequency_khz double precision,"
+        "  latitude_m double precision, longitude_m double precision,"
+        "  elevation_ft integer, iso_country varchar(2),"
+        "  dme_frequency_khz double precision, dme_channel varchar(16),"
+        "  dme_latitude_m double precision, dme_longitude_m double precision,"
+        "  dme_elevation_ft integer, slaved_variation_deg double precision,"
+        "  magnetic_variation_deg double precision, usage_type varchar(16),"
+        "  power varchar(16), associated_airport varchar(16),"
+        "  geog public.geometry)",
+
+        "CREATE INDEX IF NOT EXISTS airports_geog_idx    ON public.airports  USING GIST (geog)",
+        "CREATE INDEX IF NOT EXISTS airports_ident_idx   ON public.airports  (ident)",
+        "CREATE INDEX IF NOT EXISTS airports_icao_idx    ON public.airports  (icao_code)",
+        "CREATE INDEX IF NOT EXISTS airports_iata_idx    ON public.airports  (iata_code)",
+        "CREATE INDEX IF NOT EXISTS airports_country_idx ON public.airports  (iso_country)",
+        "CREATE INDEX IF NOT EXISTS airports_region_idx  ON public.airports  (iso_region)",
+        "CREATE INDEX IF NOT EXISTS airports_type_idx    ON public.airports  (type)",
+        "CREATE INDEX IF NOT EXISTS freq_airport_idx     ON public.frequencies (airport_ref)",
+        "CREATE INDEX IF NOT EXISTS freq_ident_idx       ON public.frequencies (airport_ident)",
+        "CREATE INDEX IF NOT EXISTS runways_airport_idx  ON public.runways (airport_ref)",
+        "CREATE INDEX IF NOT EXISTS runways_le_geog_idx  ON public.runways USING GIST (le_geog)",
+        "CREATE INDEX IF NOT EXISTS runways_he_geog_idx  ON public.runways USING GIST (he_geog)",
+        "CREATE INDEX IF NOT EXISTS navaids_geog_idx     ON public.navaids  USING GIST (geog)",
+        "CREATE INDEX IF NOT EXISTS navaids_ident_idx    ON public.navaids  (ident)",
+        "CREATE INDEX IF NOT EXISTS navaids_type_idx     ON public.navaids  (type)",
+        "CREATE INDEX IF NOT EXISTS navaids_country_idx  ON public.navaids  (iso_country)",
+        "CREATE INDEX IF NOT EXISTS navaids_airport_idx  ON public.navaids  (associated_airport)",
+        "CREATE INDEX IF NOT EXISTS tags_ident_idx       ON public.tags (airport_ident)",
+        "CREATE INDEX IF NOT EXISTS tags_type_idx        ON public.tags (airport_ident, entity_type)",
+        "CREATE INDEX IF NOT EXISTS regions_country_idx  ON public.regions  (iso_country)",
+        "CREATE INDEX IF NOT EXISTS regions_code_idx     ON public.regions  (code)",
+
+        // ---- FAA Digital Obstacle File ----
+        "CREATE TABLE IF NOT EXISTS public.faa_obstacles ("
+        "  id              serial PRIMARY KEY,"
+        "  oas_number      varchar(9)  NOT NULL,"
+        "  verified        boolean     NOT NULL,"
+        "  country         varchar(2),"
+        "  state           varchar(2),"
+        "  city            varchar(16),"
+        "  latitude        double precision NOT NULL,"
+        "  longitude       double precision NOT NULL,"
+        "  obstacle_type   varchar(18),"
+        "  quantity        integer,"
+        "  agl_ht          integer,"
+        "  amsl_ht         integer,"
+        "  lighting        varchar(1),"
+        "  horiz_accuracy  varchar(1),"
+        "  vert_accuracy   varchar(1),"
+        "  marking         varchar(1),"
+        "  faa_study_no    varchar(14),"
+        "  action          varchar(1),"
+        "  julian_date     varchar(7),"
+        "  geog            public.geometry)",
+        "CREATE INDEX IF NOT EXISTS faa_obstacles_geog_idx  ON public.faa_obstacles USING GIST (geog)",
+        "CREATE INDEX IF NOT EXISTS faa_obstacles_type_idx  ON public.faa_obstacles (obstacle_type)",
+        "CREATE INDEX IF NOT EXISTS faa_obstacles_state_idx ON public.faa_obstacles (state)",
+        "CREATE INDEX IF NOT EXISTS faa_obstacles_amsl_idx  ON public.faa_obstacles (amsl_ht)",
+        "CREATE INDEX IF NOT EXISTS faa_obstacles_agl_idx   ON public.faa_obstacles (agl_ht)",
+
+        // ---- FAA Class Airspace / Special Use Airspace ----
+        "CREATE TABLE IF NOT EXISTS public.class_airspace ("
+        "  id          serial PRIMARY KEY,"
+        "  ident       varchar(8),"
+        "  icao_id     varchar(8),"
+        "  name        text,"
+        "  class       varchar(8),"
+        "  type_code   varchar(16),"
+        "  local_type  varchar(32),"
+        "  lower_val   double precision,"
+        "  lower_uom   varchar(4),"
+        "  lower_code  varchar(8),"
+        "  upper_val   double precision,"
+        "  upper_uom   varchar(4),"
+        "  upper_code  varchar(8),"
+        "  city        text,"
+        "  state       text,"
+        "  country     text,"
+        "  geog        public.geometry)",
+        "CREATE INDEX IF NOT EXISTS class_airspace_geog_idx  ON public.class_airspace USING GIST (geog)",
+        "CREATE INDEX IF NOT EXISTS class_airspace_class_idx ON public.class_airspace (class)",
+        "CREATE INDEX IF NOT EXISTS class_airspace_state_idx ON public.class_airspace (state)",
+
+        "CREATE TABLE IF NOT EXISTS public.special_use_airspace ("
+        "  id            serial PRIMARY KEY,"
+        "  name          text,"
+        "  type_code     varchar(8),"
+        "  class         varchar(8),"
+        "  lower_val     double precision,"
+        "  lower_uom     varchar(4),"
+        "  lower_code    varchar(8),"
+        "  upper_val     double precision,"
+        "  upper_uom     varchar(4),"
+        "  upper_code    varchar(8),"
+        "  city          text,"
+        "  state         text,"
+        "  country       text,"
+        "  times_of_use  text,"
+        "  remarks       text,"
+        "  geog          public.geometry)",
+        "CREATE INDEX IF NOT EXISTS special_use_airspace_geog_idx  ON public.special_use_airspace USING GIST (geog)",
+        "CREATE INDEX IF NOT EXISTS special_use_airspace_type_idx  ON public.special_use_airspace (type_code)",
+        "CREATE INDEX IF NOT EXISTS special_use_airspace_state_idx ON public.special_use_airspace (state)",
+
+        // ---- International (non-US) airspace, from OpenAIP ----
+        "CREATE TABLE IF NOT EXISTS public.international_airspace ("
+        "  id          serial PRIMARY KEY,"
+        "  openaip_id  varchar(32),"
+        "  name        text,"
+        "  type        integer,"
+        "  icao_class  integer,"
+        "  country     varchar(4),"
+        "  lower_val   double precision,"
+        "  lower_unit  integer,"
+        "  lower_ref   integer,"
+        "  upper_val   double precision,"
+        "  upper_unit  integer,"
+        "  upper_ref   integer,"
+        "  activity    integer,"
+        "  on_demand   boolean,"
+        "  on_request  boolean,"
+        "  by_notam    boolean,"
+        "  updated_at  timestamptz,"
+        "  geog        public.geometry)",
+        "CREATE INDEX IF NOT EXISTS international_airspace_geog_idx    ON public.international_airspace USING GIST (geog)",
+        "CREATE INDEX IF NOT EXISTS international_airspace_country_idx ON public.international_airspace (country)",
+        "CREATE INDEX IF NOT EXISTS international_airspace_type_idx    ON public.international_airspace (type)",
+
+        "CREATE EXTENSION IF NOT EXISTS postgis_raster",
+        "CREATE TABLE IF NOT EXISTS public.terrain_tiles ("
+        "  tile_name text PRIMARY KEY,"
+        "  source text NOT NULL DEFAULT '3dep',"
+        "  loaded_at timestamptz NOT NULL DEFAULT now())",
+
+        // ---- WMM (World Magnetic Model declination) ----
+        // wmm (raster) has fixed DDL, unlike terrain — WMMLoader always
+        // creates it as (rid serial, rast raster), no source-data-dependent
+        // constraints, so it's safe to include here.
+        "CREATE TABLE IF NOT EXISTS public.wmm (rid serial PRIMARY KEY, rast public.raster)",
+        "CREATE INDEX IF NOT EXISTS wmm_rast_gist ON public.wmm USING GIST (ST_ConvexHull(rast))",
+        "CREATE TABLE IF NOT EXISTS public.wmm_cells ("
+        "  cell_name text PRIMARY KEY,"
+        "  loaded_at timestamptz NOT NULL DEFAULT now())",
+        "CREATE TABLE IF NOT EXISTS public.wmm_bands ("
+        "  id serial PRIMARY KEY,"
+        "  band_min_deg double precision NOT NULL,"
+        "  band_max_deg double precision NOT NULL,"
+        "  geog public.geometry)",
+        "CREATE INDEX IF NOT EXISTS wmm_bands_geog_idx ON public.wmm_bands USING GIST (geog)",
+    };
+
+    for (const char* sql : statements) {
+        try {
+            pqxx::nontransaction txn(conn_);
+            txn.exec(sql);
+        } catch (const std::exception& e) {
+            throw std::runtime_error(
+                std::string("ensureSchema failed on: ") + sql + "\n  " + e.what());
+        }
+    }
+    std::cout << "[NavDB] schema ensured (idempotent)\n";
+}
+
 std::vector<std::pair<double,double>> NavDB::getWayCoords(int64_t id) {
     std::vector<std::pair<double,double>> coords;
     try {

@@ -7,6 +7,7 @@
 #include <vector>
 #include <cstdio>
 #include <atomic>
+#include <functional>
 
 /**
  * Node coordinate store with per-thread LZ4-compressed shard files.
@@ -54,6 +55,13 @@ public:
 
     // Called during way phase — flat mmap random access, no locking
     std::optional<std::pair<double,double>> select(int64_t id) const;
+
+    // Walk the bitmap sequentially and invoke fn(id, lon_m, lat_m) for every
+    // populated record, in ascending id order. Cost is proportional to the
+    // bitmap size (max_id/8 bytes) plus one record read per populated id —
+    // does not require loading the whole sparse file into memory. Read-only,
+    // safe to call concurrently with select() (but not with insert()/merge()).
+    void forEachPopulated(const std::function<void(int64_t id, double lon_m, double lat_m)>& fn) const;
 
     // Zero out a node entry (used by delta deletes)
     void remove(int64_t id);

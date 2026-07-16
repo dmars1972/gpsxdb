@@ -159,6 +159,84 @@ target_link_libraries(terrain_load PRIVATE
 target_compile_options(terrain_load PRIVATE -O2 -Wall -Wextra -Wno-psabi)
 target_compile_features(terrain_load PRIVATE cxx_std_20)
 
+# ---- regional_export ----
+# Single-pass export of per-region node coordinate slices (nodes.dat ->
+# <region>.nodes.dat) for the regional installer.
+
+add_executable(regional_export
+    src/regional_export.cpp
+    src/OSMMMap.cpp
+    src/RegionalNodeMap.cpp
+    src/GeoUtils.cpp
+)
+
+target_include_directories(regional_export PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${PROJ_INCLUDE_DIRS}
+    ${LZ4_INCLUDE}
+)
+
+target_link_libraries(regional_export PRIVATE
+    ${LZ4_LIB}
+    ${PROJ_LIBRARIES}
+)
+
+target_compile_options(regional_export PRIVATE -O2 -g -Wall -Wextra -Wno-psabi ${PROJ_CFLAGS_OTHER})
+target_compile_features(regional_export PRIVATE cxx_std_20)
+
+# ---- regional_db_export ----
+# Per-region binary-COPY table dumps (paired with regional_export's
+# nodes.dat output) for the regional installer bundle. Shells out to
+# `psql \copy` for the actual data movement (see regional_db_export.cpp
+# top-of-file comment for why) so only needs pqxx for control-plane
+# queries (SRID lookups).
+
+add_executable(regional_db_export
+    src/regional_db_export.cpp
+)
+
+target_include_directories(regional_db_export PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${PQXX_INCLUDE_DIRS}
+    ${PQ_INCLUDE}
+)
+
+target_link_libraries(regional_db_export PRIVATE
+    ${PQXX_LIBRARIES}
+    ${PQ_LIB}
+)
+
+target_compile_options(regional_db_export PRIVATE -O2 -g -Wall -Wextra -Wno-psabi ${PQXX_CFLAGS_OTHER})
+target_compile_features(regional_db_export PRIVATE cxx_std_20)
+
+# ---- regional_install ----
+# Installs a <region>.gpsxdb.tar.gz bundle (regional_export + regional_db_export
+# output, tarred/gzipped) into a target database, deduping against any
+# previously-installed regions, and merges the region's node coordinates
+# into the target's local nodes.dat. Shells out to `psql -f` for the actual
+# staged-load script (needs a single session for TEMP TABLEs + \copy to
+# share scope) and reuses NavDB::ensureSchema() for idempotent schema setup.
+
+add_executable(regional_install
+    src/regional_install.cpp
+    src/NavDB.cpp
+    src/RegionalNodeMap.cpp
+)
+
+target_include_directories(regional_install PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${PQXX_INCLUDE_DIRS}
+    ${PQ_INCLUDE}
+)
+
+target_link_libraries(regional_install PRIVATE
+    ${PQXX_LIBRARIES}
+    ${PQ_LIB}
+)
+
+target_compile_options(regional_install PRIVATE -O2 -g -Wall -Wextra -Wno-psabi ${PQXX_CFLAGS_OTHER})
+target_compile_features(regional_install PRIVATE cxx_std_20)
+
 # ---- wmm_load ----
 # Computes World Magnetic Model declination directly (no external tile
 # source, no GDAL/raster2pgsql — the raster is built via plain PostGIS
