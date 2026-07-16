@@ -162,7 +162,7 @@ private:
     struct RelationRecord { int64_t id; std::string name; std::optional<std::string> geog; };
     struct TagRecord  { int64_t id; std::string key, value; };
 
-    void addTags(int64_t id, const Tags& tags);
+    void addTags(int64_t id, const Tags& tags, bool is_node = false);
     void addWayTags(int64_t id, const Tags& tags);
     void addAreaTags(int64_t id, const Tags& tags);
     void flushNodes();

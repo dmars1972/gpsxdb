@@ -138,25 +138,76 @@ static bool isAviationRelevantBuildingValue(const std::string& value) {
     return keep.count(value) != 0;
 }
 
+// Node-only point clutter: traffic signs, intersection-control markers, and
+// physical barriers carry no useful information for an aviation moving map
+// beyond "something is here" -- always dropped, no exception. Applied only
+// to nodes (see isNodeOnlyDroppableValue) since these are always point
+// features in real-world OSM tagging; ways/areas/relations never carry
+// these key/value combinations as their own defining tag.
+static bool isSignOrBarrierValue(const std::string& key, const std::string& value) {
+    if (key == "traffic_sign") return true;  // any value
+    static const std::unordered_set<std::string> highway_drop = {
+        "stop", "give_way", "traffic_signals", "milestone", "crossing",
+        "turning_circle", "turning_loop", "motorway_junction",
+        "street_lamp", "bus_stop",
+    };
+    if (key == "highway" && highway_drop.count(value)) return true;
+    static const std::unordered_set<std::string> barrier_drop = {
+        "gate", "bollard", "kerb", "lift_gate", "block",
+        "cycle_barrier", "swing_gate", "stile",
+    };
+    if (key == "barrier" && barrier_drop.count(value)) return true;
+    return false;
+}
+
+// natural=tree/shrub/rock nodes: dropped unless the node also carries a
+// height=* or ele=* tag, in which case it's a potential real obstacle
+// (a tall tree) rather than unactionable background clutter. Only applies
+// to natural= as a node tag -- natural=wood etc. as an area/way polygon is
+// untouched.
+static bool isDroppableNatureValue(const std::string& key, const std::string& value) {
+    static const std::unordered_set<std::string> drop = {"tree", "shrub", "rock"};
+    return key == "natural" && drop.count(value) != 0;
+}
+
+static bool hasElevationTag(const Tags& tags) {
+    auto has = [&](const char* key) {
+        auto it = tags.find(key);
+        return it != tags.end() && !it->second.empty();
+    };
+    return has("height") || has("ele");
+}
+
 // True if at least one tag would actually survive isExcludedTagKey +
 // sanitizeTag filtering (and, for a bare `building` tag, isn't just a
 // generic building value -- see above). Used to skip inserting the entity
 // itself (not just its tag rows) when nothing it had is worth keeping --
 // e.g. a "building" whose only tags were building:*/addr:* (or just a
 // generic building=yes) becomes a meaningless bare geometry.
-static bool hasSurvivingTag(const Tags& tags) {
+//
+// is_node additionally drops sign/barrier point clutter and bare
+// natural=tree/shrub/rock (unless height/ele is present) -- see the checks
+// above. Only insertNode/updateNode set this; way/area/relation/road
+// callers leave it false.
+static bool hasSurvivingTag(const Tags& tags, bool is_node = false) {
+    bool has_elevation = is_node && hasElevationTag(tags);
     for (const auto& [k, v] : tags) {
         if (isExcludedTagKey(k)) continue;
         if (k == "building" && !isAviationRelevantBuildingValue(v)) continue;
+        if (is_node && isSignOrBarrierValue(k, v)) continue;
+        if (is_node && isDroppableNatureValue(k, v) && !has_elevation) continue;
         if (sanitizeTag(k).empty() || sanitizeTag(v).empty()) continue;
         return true;
     }
     return false;
 }
 
-void NavDB::addTags(int64_t id, const Tags& tags) {
+void NavDB::addTags(int64_t id, const Tags& tags, bool is_node) {
+    bool has_elevation = is_node && hasElevationTag(tags);
     for (const auto& [k, v] : tags) {
         if (isExcludedTagKey(k)) continue;
+        if (is_node && isSignOrBarrierValue(k, v)) continue;
+        if (is_node && isDroppableNatureValue(k, v) && !has_elevation) continue;
         std::string ck = sanitizeTag(k), cv = sanitizeTag(v);
         if (ck.empty() || cv.empty()) continue;
         tag_buf_.push_back({id, std::move(ck), std::move(cv)});
@@ -186,8 +237,8 @@ void NavDB::addAreaTags(int64_t id, const Tags& tags) {
 void NavDB::insertNode(int64_t id, const std::string& name,
                        double lon_m, double lat_m,
                        const Tags& tags, const std::string& geog) {
-    if (!hasSurvivingTag(tags)) return;
-    addTags(id, tags);
+    if (!hasSurvivingTag(tags, /*is_node=*/true)) return;
+    addTags(id, tags, /*is_node=*/true);
     node_buf_.push_back({id, name, geog, lon_m, lat_m});
     if (static_cast<int>(node_buf_.size()) >= NODE_BUFFER_SIZE)
         flushNodes();
@@ -492,12 +543,16 @@ static void diffTags(pqxx::work& txn, int64_t id,
     std::unordered_map<std::string,std::string> existing;
     for (const auto& r : rows) existing[r[0].c_str()] = r[1].c_str();
 
+    bool is_node = (tag_table == "node_tags");
+    bool has_elevation = is_node && hasElevationTag(tags);
     for (auto& [k, v] : tags) {
         // Excluded keys are simply skipped (not erased from `existing`), so
         // any leftover row from before this filter existed gets swept up by
         // the DELETE loop below — replication updates progressively clean
         // up excluded tags on any entity they happen to touch.
         if (isExcludedTagKey(k)) continue;
+        if (is_node && isSignOrBarrierValue(k, v)) continue;
+        if (is_node && isDroppableNatureValue(k, v) && !has_elevation) continue;
         auto it = existing.find(k);
         if (it == existing.end())
         {
@@ -519,7 +574,7 @@ void NavDB::updateNode(int64_t id, const std::string& name,
                        const Tags& tags, const std::string& geog) {
     try {
         pqxx::work txn(conn_);
-        if (hasSurvivingTag(tags)) {
+        if (hasSurvivingTag(tags, /*is_node=*/true)) {
             txn.exec(
                 "INSERT INTO nodes(id, name, longitude_m, latitude_m, geog) VALUES ($1,$2,$3,$4,$5) "
                 "ON CONFLICT (id) DO UPDATE SET name=EXCLUDED.name, longitude_m=EXCLUDED.longitude_m, "
