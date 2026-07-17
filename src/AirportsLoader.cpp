@@ -45,10 +45,20 @@ static std::pair<double,double> toMercatorAP(double lon, double lat) {
 
 // ---- WKB point ----
 
+// Embeds SRID 3857 (toMercatorAP always reprojects to EPSG:3857, regardless
+// of any global -L/--wgs84 flag) via the SRID-flagged WKB point type
+// (0x20000001), matching GeoUtils.cpp's shared pointWKB(). Previously this
+// omitted the SRID flag entirely (plain 0x00000001 point), leaving every
+// airports/navaids/runways geog column stored with SRID 0 despite holding
+// real Mercator-meter coordinates -- harmless until something ran an
+// SRID-aware operation (ST_Transform, mixing with a properly-tagged
+// geometry) against them, which is how this was caught.
 static std::string pointWKBAP(double lon_m, double lat_m) {
     std::vector<uint8_t> b;
-    b.push_back(1);
-    b.push_back(1); b.push_back(0); b.push_back(0); b.push_back(0);
+    b.push_back(1);                                            // little-endian byte order
+    b.push_back(0x01); b.push_back(0x00); b.push_back(0x00); b.push_back(0x20); // POINT with SRID flag
+    uint32_t srid = 3857;
+    uint8_t sb[4]; memcpy(sb, &srid, 4); for (auto c : sb) b.push_back(c);
     uint8_t buf[8];
     memcpy(buf, &lon_m, 8); for (auto c : buf) b.push_back(c);
     memcpy(buf, &lat_m, 8); for (auto c : buf) b.push_back(c);
