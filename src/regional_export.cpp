@@ -22,6 +22,7 @@
 #include <chrono>
 #include <algorithm>
 #include <sys/stat.h>
+#include <unistd.h>
 
 // GeoUtils.h declares this extern — defined once per executable. Unused
 // here (regional_export never builds WKB geometry) but required to link.
@@ -71,13 +72,13 @@ int main(int argc, char** argv) {
                          "<out-dir>/<region>.nodes.dat per region (see include/Regions.h\n"
                          "for the region list). -n must match the max-id nodes.dat was\n"
                          "created with (see nodes.dat's companion .bmp size).\n";
-            return 0;
+            _exit(0);  // avoid pqxx/PROJ static-destructor double-free on normal return
         }
     }
 
     if (!dirExists(out_dir)) {
         std::cerr << "Error: --out-dir " << out_dir << " does not exist\n";
-        return 1;
+        _exit(1);
     }
 
     std::vector<RegionTarget> targets;
@@ -100,7 +101,7 @@ int main(int argc, char** argv) {
 
     if (targets.empty()) {
         std::cerr << "Error: no matching regions (check --regions names against include/Regions.h)\n";
-        return 1;
+        _exit(1);
     }
 
     if (verbose) {
@@ -138,5 +139,6 @@ int main(int argc, char** argv) {
 
     std::cout << "[regional_export] done — " << scanned << " nodes scanned, "
               << targets.size() << " region file(s) written to " << out_dir << "\n";
-    return 0;
+    std::cout.flush();
+    _exit(0);  // avoid pqxx/PROJ static-destructor double-free on normal return
 }

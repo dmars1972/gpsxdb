@@ -57,6 +57,24 @@ bool dirExists(const std::string& path) {
     return stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
 }
 
+std::string readManifestField(const std::string& manifest_path, const std::string& key) {
+    std::ifstream f(manifest_path);
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.rfind(key + "=", 0) == 0) return line.substr(key.size() + 1);
+    }
+    return "";
+}
+
+// regional_db_export records "table.<name>.format=binary|text" per table
+// (raster columns -- terrain, wmm -- have no binary send/recv function, so
+// those two are dumped as text). Defaults to binary if the manifest predates
+// this field or doesn't mention the table.
+std::string tableFormat(const std::string& region_dir, const std::string& table_name) {
+    std::string v = readManifestField(region_dir + "/manifest.txt", "table." + table_name + ".format");
+    return v.empty() ? "binary" : v;
+}
+
 // A parent table with a real PK, optionally feeding a "new ids" temp table
 // that child groups filter against.
 struct ParentGroup {
@@ -118,7 +136,7 @@ void appendParentGroup(std::ostringstream& sql, const std::string& region_dir,
 
     std::string staging = "staging_" + g.table;
     sql << "CREATE TEMP TABLE " << staging << " (LIKE public." << g.table << " INCLUDING ALL) ON COMMIT DROP;\n";
-    sql << "\\copy " << staging << " FROM '" << bin_path << "' WITH (FORMAT binary)\n";
+    sql << "\\copy " << staging << " FROM '" << bin_path << "' WITH (FORMAT " << tableFormat(region_dir, g.table) << ")\n";
     if (!g.new_ids_temp.empty()) {
         sql << "CREATE TEMP TABLE " << g.new_ids_temp << " AS "
             << "SELECT s." << g.pk_col << " AS id"
@@ -138,7 +156,7 @@ void appendChildGroup(std::ostringstream& sql, const std::string& region_dir,
 
     std::string staging = "staging_" + g.table;
     sql << "CREATE TEMP TABLE " << staging << " (LIKE public." << g.table << " INCLUDING ALL) ON COMMIT DROP;\n";
-    sql << "\\copy " << staging << " FROM '" << bin_path << "' WITH (FORMAT binary)\n";
+    sql << "\\copy " << staging << " FROM '" << bin_path << "' WITH (FORMAT " << tableFormat(region_dir, g.table) << ")\n";
     sql << "INSERT INTO public." << g.table << " "
         << "SELECT c.* FROM " << staging << " c "
         << "JOIN " << g.new_ids_temp << " n ON n.id = c." << g.join_col << ";\n\n";
@@ -150,7 +168,7 @@ void appendAirportTags(std::ostringstream& sql, const std::string& region_dir) {
     std::string bin_path = region_dir + "/airport_tags.bin";
     if (!fileExists(bin_path)) return;
     sql << "CREATE TEMP TABLE staging_airport_tags (LIKE public.tags INCLUDING ALL) ON COMMIT DROP;\n";
-    sql << "\\copy staging_airport_tags FROM '" << bin_path << "' WITH (FORMAT binary)\n";
+    sql << "\\copy staging_airport_tags FROM '" << bin_path << "' WITH (FORMAT " << tableFormat(region_dir, "airport_tags") << ")\n";
     sql << "INSERT INTO public.tags "
            "SELECT c.* FROM staging_airport_tags c "
            "JOIN new_airport_ids n ON n.ident = c.airport_ident;\n\n";
@@ -189,14 +207,6 @@ bool tableExists(pqxx::connection& conn, const std::string& table) {
     return r[0][0].as<bool>();
 }
 
-std::string readManifestField(const std::string& manifest_path, const std::string& key) {
-    std::ifstream f(manifest_path);
-    std::string line;
-    while (std::getline(f, line)) {
-        if (line.rfind(key + "=", 0) == 0) return line.substr(key.size() + 1);
-    }
-    return "";
-}
 
 } // namespace
 
@@ -218,18 +228,18 @@ int main(int argc, char** argv) {
                          "Idempotent: safe to install multiple (even overlapping) regions into\n"
                          "the same target -- see regional_install.cpp's top-of-file comment for\n"
                          "the dedup strategy. Requires ~/.pgpass for authentication.\n";
-            return 0;
+            _exit(0);  // avoid pqxx static-destructor double-free on normal return
         }
         else if (arg[0] != '-') bundle_path = arg;
     }
 
     if (bundle_path.empty() || host.empty() || db.empty() || user.empty() || nodes_file.empty()) {
         std::cerr << "Error: bundle path, -s, -d, -u, --nodes-file are all required\n";
-        return 1;
+        _exit(1);
     }
     if (!fileExists(bundle_path)) {
         std::cerr << "Error: bundle not found: " << bundle_path << "\n";
-        return 1;
+        _exit(1);
     }
 
     // Extract to a private temp dir.
@@ -237,7 +247,7 @@ int main(int argc, char** argv) {
     char* tmp_dir_c = mkdtemp(tmpl);
     if (!tmp_dir_c) {
         std::cerr << "Error: mkdtemp failed\n";
-        return 1;
+        _exit(1);
     }
     std::string tmp_dir = tmp_dir_c;
 
@@ -245,7 +255,7 @@ int main(int argc, char** argv) {
     std::string extract_cmd = "tar xzf '" + bundle_path + "' -C '" + tmp_dir + "'";
     if (system(extract_cmd.c_str()) != 0) {
         std::cerr << "Error: failed to extract " << bundle_path << "\n";
-        return 1;
+        _exit(1);
     }
 
     // regional_db_export writes one subdirectory per region under its
@@ -265,7 +275,7 @@ int main(int argc, char** argv) {
     }
     if (region_dir.empty() || !dirExists(region_dir)) {
         std::cerr << "Error: could not find a region directory (manifest.txt) inside " << bundle_path << "\n";
-        return 1;
+        _exit(1);
     }
 
     std::string region_name = readManifestField(region_dir + "/manifest.txt", "region");
@@ -315,7 +325,7 @@ int main(int argc, char** argv) {
     if (!runScript(host, user, db, script_path, verbose)) {
         std::cerr << "[regional_install] DB load failed -- nodes.dat NOT modified, "
                      "temp files left at " << tmp_dir << " for inspection\n";
-        return 1;
+        _exit(1);
     }
     std::cout << "[regional_install] DB tables installed\n";
 
@@ -328,19 +338,19 @@ int main(int argc, char** argv) {
         std::string cp_cmd = "cp '" + region_nodes_path + "' '" + nodes_file + "'";
         if (system(cp_cmd.c_str()) != 0) {
             std::cerr << "[regional_install] ERROR: failed to install initial " << nodes_file << "\n";
-            return 1;
+            _exit(1);
         }
         std::cout << "[regional_install] installed initial " << nodes_file << "\n";
     } else {
         std::string merged_path = nodes_file + ".merging";
         if (!RegionalNodeMap::merge(nodes_file, region_nodes_path, merged_path)) {
             std::cerr << "[regional_install] ERROR: nodes.dat merge failed\n";
-            return 1;
+            _exit(1);
         }
         if (rename(merged_path.c_str(), nodes_file.c_str()) != 0) {
             std::cerr << "[regional_install] ERROR: failed to replace " << nodes_file << " with merged result "
                       << "(merged file left at " << merged_path << ")\n";
-            return 1;
+            _exit(1);
         }
         std::cout << "[regional_install] merged region nodes into " << nodes_file << "\n";
     }
@@ -349,5 +359,6 @@ int main(int argc, char** argv) {
     system(cleanup_cmd.c_str());
 
     std::cout << "[regional_install] done -- region '" << region_name << "' installed\n";
-    return 0;
+    std::cout.flush();
+    _exit(0);  // avoid pqxx static-destructor double-free on normal return
 }

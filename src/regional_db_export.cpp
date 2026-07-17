@@ -33,6 +33,7 @@
 #include <algorithm>
 #include <sys/stat.h>
 #include <ctime>
+#include <unistd.h>
 
 namespace {
 
@@ -108,8 +109,13 @@ int lookupSrid(pqxx::connection& conn, const std::string& table, const std::stri
         "SELECT srid FROM geometry_columns WHERE f_table_schema='public' "
         "AND f_table_name=$1 AND f_geometry_column=$2",
         pqxx::params{table, column});
-    if (!r.empty()) return r[0][0].as<int>();
-    // Fallback: some geometry columns may not be registered — inspect a row.
+    // NavDB's DDL declares columns as untyped `public.geometry` (no SRID
+    // typmod), so geometry_columns reports srid=0 even though every stored
+    // value carries a real embedded SRID -- 0 isn't usable as an
+    // ST_Transform target, so treat it as "not found" too, not just an
+    // empty result set.
+    if (!r.empty() && r[0][0].as<int>() != 0) return r[0][0].as<int>();
+    // Fallback: inspect an actual row's embedded SRID directly.
     auto r2 = txn.exec("SELECT ST_SRID(" + column + ") FROM public." + table + " WHERE " + column + " IS NOT NULL LIMIT 1");
     return r2.empty() ? 3857 : r2[0][0].as<int>();
 }
@@ -121,14 +127,18 @@ std::string envelopeSql(const GlobalRegion& r, int srid) {
     return ss.str();
 }
 
-// Runs `psql \copy (<select_sql>) TO '<out_path>' WITH (FORMAT binary)`,
-// returns the row count psql reports ("COPY N"), or -1 on failure.
-int64_t copyOutBinary(const std::string& host, const std::string& user, const std::string& db,
-                      const std::string& select_sql, const std::string& out_path) {
+// Runs `psql \copy (<select_sql>) TO '<out_path>' WITH (FORMAT <format>)`,
+// returns the row count psql reports ("COPY N"), or -1 on failure. `format`
+// defaults to binary; raster columns (terrain/wmm) have no binary
+// send/recv function registered, so those two tables use "text" instead
+// (regional_install must load them the same way).
+int64_t copyOut(const std::string& host, const std::string& user, const std::string& db,
+                const std::string& select_sql, const std::string& out_path,
+                const std::string& format = "binary") {
     std::ostringstream cmd;
     cmd << "psql -h " << host << " -U " << user << " -d " << db
         << " -v ON_ERROR_STOP=1 -A -t -c \"\\copy (" << select_sql << ") TO '"
-        << out_path << "' WITH (FORMAT binary)\" 2>&1";
+        << out_path << "' WITH (FORMAT " << format << ")\" 2>&1";
 
     FILE* p = popen(cmd.str().c_str(), "r");
     if (!p) return -1;
@@ -177,17 +187,17 @@ int main(int argc, char** argv) {
                          "region-scoped table, plus <out-dir>/<region>/manifest.txt. Does not\n"
                          "bundle/compress -- pair with regional_export for nodes.dat, then tar.\n"
                          "Requires ~/.pgpass for authentication.\n";
-            return 0;
+            _exit(0);  // avoid pqxx static-destructor double-free on normal return
         }
     }
 
     if (host.empty() || db.empty() || user.empty()) {
         std::cerr << "Error: -s, -d, -u are required\n";
-        return 1;
+        _exit(1);
     }
     if (!dirExists(out_dir) && !mkdirP(out_dir)) {
         std::cerr << "Error: cannot create --out-dir " << out_dir << "\n";
-        return 1;
+        _exit(1);
     }
 
     pqxx::connection conn("host=" + host + " dbname=" + db + " user=" + user);
@@ -245,21 +255,25 @@ int main(int argc, char** argv) {
             auto pos = sql.find("{ENVELOPE}");
             sql.replace(pos, std::string("{ENVELOPE}").size(), envelope);
 
+            // Raster columns (terrain, wmm) have no binary send/recv function.
+            std::string format = (t.name == "terrain" || t.name == "wmm") ? "text" : "binary";
             std::string out_path = region_dir + "/" + t.name + ".bin";
-            int64_t n = copyOutBinary(host, user, db, sql, out_path);
+            int64_t n = copyOut(host, user, db, sql, out_path, format);
             if (n < 0) {
                 std::cerr << "[regional_db_export] " << r.name << "/" << t.name << " FAILED\n";
                 manifest << "table." << t.name << ".rows=FAILED\n";
                 continue;
             }
             manifest << "table." << t.name << ".rows=" << n << "\n";
+            manifest << "table." << t.name << ".format=" << format << "\n";
             if (verbose) std::cout << "  " << t.name << ": " << n << " row(s)\n";
         }
 
         for (const auto& name : kGlobalTables) {
             std::string out_path = region_dir + "/" + name + ".bin";
-            int64_t n = copyOutBinary(host, user, db, "SELECT * FROM public." + name, out_path);
+            int64_t n = copyOut(host, user, db, "SELECT * FROM public." + name, out_path);
             manifest << "table." << name << ".rows=" << (n < 0 ? "FAILED" : std::to_string(n)) << "\n";
+            manifest << "table." << name << ".format=binary\n";
             if (verbose) std::cout << "  " << name << " (global): " << n << " row(s)\n";
         }
 
@@ -269,5 +283,6 @@ int main(int argc, char** argv) {
     }
 
     std::cout << "[regional_db_export] done\n";
-    return 0;
+    std::cout.flush();
+    _exit(0);  // avoid pqxx static-destructor double-free on normal return
 }
