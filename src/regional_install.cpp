@@ -135,7 +135,15 @@ void appendParentGroup(std::ostringstream& sql, const std::string& region_dir,
     if (!fileExists(bin_path)) return;
 
     std::string staging = "staging_" + g.table;
-    sql << "CREATE TEMP TABLE " << staging << " (LIKE public." << g.table << " INCLUDING ALL) ON COMMIT DROP;\n";
+    // Bare columns only -- no indexes/constraints (in particular, no GIST
+    // spatial index). Staging never needs its own index: the "new ids"
+    // anti-join uses the real table's existing PK index regardless, and
+    // building the real table's own GIST index once (on the final INSERT)
+    // is unavoidable, but duplicating that same expensive incremental
+    // index-maintenance work onto a throwaway staging table during \copy
+    // was pure waste -- and, at multi-million-row scale, expensive enough
+    // to have visibly hung the whole box.
+    sql << "CREATE TEMP TABLE " << staging << " (LIKE public." << g.table << ") ON COMMIT DROP;\n";
     sql << "\\copy " << staging << " FROM '" << bin_path << "' WITH (FORMAT " << tableFormat(region_dir, g.table) << ")\n";
     if (!g.new_ids_temp.empty()) {
         sql << "CREATE TEMP TABLE " << g.new_ids_temp << " AS "
@@ -155,7 +163,15 @@ void appendChildGroup(std::ostringstream& sql, const std::string& region_dir,
     if (!fileExists(bin_path)) return;
 
     std::string staging = "staging_" + g.table;
-    sql << "CREATE TEMP TABLE " << staging << " (LIKE public." << g.table << " INCLUDING ALL) ON COMMIT DROP;\n";
+    // Bare columns only -- no indexes/constraints (in particular, no GIST
+    // spatial index). Staging never needs its own index: the "new ids"
+    // anti-join uses the real table's existing PK index regardless, and
+    // building the real table's own GIST index once (on the final INSERT)
+    // is unavoidable, but duplicating that same expensive incremental
+    // index-maintenance work onto a throwaway staging table during \copy
+    // was pure waste -- and, at multi-million-row scale, expensive enough
+    // to have visibly hung the whole box.
+    sql << "CREATE TEMP TABLE " << staging << " (LIKE public." << g.table << ") ON COMMIT DROP;\n";
     sql << "\\copy " << staging << " FROM '" << bin_path << "' WITH (FORMAT " << tableFormat(region_dir, g.table) << ")\n";
     sql << "INSERT INTO public." << g.table << " "
         << "SELECT c.* FROM " << staging << " c "
@@ -167,7 +183,7 @@ void appendChildGroup(std::ostringstream& sql, const std::string& region_dir,
 void appendAirportTags(std::ostringstream& sql, const std::string& region_dir) {
     std::string bin_path = region_dir + "/airport_tags.bin";
     if (!fileExists(bin_path)) return;
-    sql << "CREATE TEMP TABLE staging_airport_tags (LIKE public.tags INCLUDING ALL) ON COMMIT DROP;\n";
+    sql << "CREATE TEMP TABLE staging_airport_tags (LIKE public.tags) ON COMMIT DROP;\n";
     sql << "\\copy staging_airport_tags FROM '" << bin_path << "' WITH (FORMAT " << tableFormat(region_dir, "airport_tags") << ")\n";
     sql << "INSERT INTO public.tags "
            "SELECT c.* FROM staging_airport_tags c "
@@ -212,6 +228,7 @@ bool tableExists(pqxx::connection& conn, const std::string& table) {
 
 int main(int argc, char** argv) {
     std::string bundle_path, host, db, user, nodes_file;
+    std::string work_dir = "/tmp";
     bool verbose = false;
 
     for (int i = 1; i < argc; ++i) {
@@ -220,10 +237,16 @@ int main(int argc, char** argv) {
         else if ((arg == "-d") && i+1 < argc) db   = argv[++i];
         else if ((arg == "-u") && i+1 < argc) user = argv[++i];
         else if ((arg == "--nodes-file") && i+1 < argc) nodes_file = argv[++i];
+        else if ((arg == "--work-dir") && i+1 < argc) work_dir = argv[++i];
         else if (arg == "-v" || arg == "--verbose") verbose = true;
         else if (arg == "-h" || arg == "--help") {
             std::cout << "Usage: regional_install <bundle.gpsxdb.tar.gz> -s <host> -d <db> -u <user>\n"
-                         "                         --nodes-file <target nodes.dat path> [-v]\n"
+                         "                         --nodes-file <target nodes.dat path>\n"
+                         "                         [--work-dir <dir>, default /tmp] [-v]\n"
+                         "\n"
+                         "--work-dir is where the bundle is extracted -- a multi-GB region bundle\n"
+                         "can exceed a tmpfs /tmp's size or quota, so point this at plain disk\n"
+                         "(e.g. alongside nodes.dat) if that happens.\n"
                          "\n"
                          "Idempotent: safe to install multiple (even overlapping) regions into\n"
                          "the same target -- see regional_install.cpp's top-of-file comment for\n"
@@ -242,11 +265,16 @@ int main(int argc, char** argv) {
         _exit(1);
     }
 
-    // Extract to a private temp dir.
-    char tmpl[] = "/tmp/regional_install.XXXXXX";
-    char* tmp_dir_c = mkdtemp(tmpl);
+    // Extract to a private temp dir under work_dir (plain /tmp by default,
+    // but a multi-GB bundle can exceed a tmpfs /tmp's size or quota -- see
+    // --work-dir above).
+    system(("mkdir -p '" + work_dir + "'").c_str());
+    std::string tmpl_str = work_dir + "/regional_install.XXXXXX";
+    std::vector<char> tmpl(tmpl_str.begin(), tmpl_str.end());
+    tmpl.push_back('\0');
+    char* tmp_dir_c = mkdtemp(tmpl.data());
     if (!tmp_dir_c) {
-        std::cerr << "Error: mkdtemp failed\n";
+        std::cerr << "Error: mkdtemp failed under " << work_dir << "\n";
         _exit(1);
     }
     std::string tmp_dir = tmp_dir_c;
