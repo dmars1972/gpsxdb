@@ -21,12 +21,15 @@
 #include <fstream>
 #include "OSCReader.h"
 #include "DeltaApplier.h"
+#include "RegionalDeltaApplier.h"
 #include "Replicator.h"
+#include <boost/geometry.hpp>
 #include "AirportsLoader.h"
 #include "FAAObstacleLoader.h"
 #include "WMMLoader.h"
 #include "AirspaceLoader.h"
 #include "TerrainLoader.h"
+#include "Regions.h"
 #include "PlanetDownloader.h"
 #include <stdexcept>
 #include <algorithm>
@@ -227,14 +230,22 @@ struct Args {
     bool        download_planet = false;  // -i acts as the destination path
     bool        use_mercator   = true;  // false = store as WGS84 (EPSG:4326)
     int         queue_size     = 10000;
-    int         node_threads   = 1;  // RPi5-safe default; see README for tuning
-    int         way_threads    = 6;  // RPi5-safe default; see README for tuning
+    int         node_threads   = 1;  // conservative default; see README for tuning
+    int         way_threads    = 6;  // conservative default; see README for tuning
     // Delta mode
     Mode        mode           = Mode::Import;
     std::string osc_file;                         // for -m delta
     std::string replication    = "minute";         // minute|hour|day
     int64_t     sequence       = -1;               // starting sequence
     int         poll_interval  = 60;               // seconds
+    // Region-aware delta/poll (task #35) has no CLI knob -- runDelta()
+    // auto-detects by querying NavDB::loadInstalledRegions() against
+    // -d/--database. Any rows there (populated by regional_install.cpp)
+    // switch to RegionalDeltaApplier, with -f/--nodes-file then read as a
+    // RegionalNodeMap (this install's own node coordinate store) rather
+    // than an OSMMMap, and DB writes filtered to whichever region(s) are
+    // actually installed there -- naturally covering every region in a
+    // database with more than one installed, from a single poll process.
     // Resume support
     Phase       resume_phase   = Phase::Nodes;     // -R: start at this phase
 };
@@ -318,20 +329,24 @@ static Args parseArgs(int argc, char** argv) {
                 "                       Web Mercator (EPSG:3857). Default is Mercator.\n"
                 "    -h                 Show this help and exit\n"
                 "  Import mode (default):\n"
-                "    -i <file.osm.pbf>  Input PBF file\n"
+                "    -i <file.osm.pbf>  Input PBF file. If omitted, the latest\n"
+                "                       planet-latest.osm.pbf is downloaded automatically to\n"
+                "                       ./planet-latest.osm.pbf (equivalent to passing\n"
+                "                       --download-planet with no -i).\n"
                 "    --download-planet  Download the latest planet-latest.osm.pbf from\n"
                 "                       planet.openstreetmap.org before importing, saving it\n"
-                "                       to the -i path (default ./planet-latest.osm.pbf if -i\n"
-                "                       omitted). Resumable (safe to re-run after an\n"
-                "                       interruption) and checksum-verified. The file is ~100GB\n"
-                "                       and takes hours to download -- make sure the -i path is\n"
-                "                       on a volume with enough free space.\n"
+                "                       to the -i path. Only needed explicitly if you want to\n"
+                "                       download to a specific -i path other than the default\n"
+                "                       above. Resumable (safe to re-run after an interruption)\n"
+                "                       and checksum-verified. The file is ~100GB and takes\n"
+                "                       hours to download -- make sure the -i path is on a\n"
+                "                       volume with enough free space.\n"
                 "    -t node_threads    (default 1, see README for tuning)\n"
                 "    -w way_threads     (default 6, see README for tuning)\n"
                 "    NOTE: watch Q: (queue depth) in the status line to tune\n"
                 "          threads — Q:0 means producer-bound (reduce threads),\n"
                 "          Q:max means consumer-bound (increase threads).\n"
-                "          On RPi5, reduce threads if system crashes under load.\n"
+                "          Reduce threads if the system crashes under load.\n"
                 "    -q queue_size      (default 10000)\n"
                 "    -f nodes_file      (default nodes.dat)\n"
                 "    -n max_node_id     (default 20000000000)\n"
@@ -351,7 +366,15 @@ static Args parseArgs(int argc, char** argv) {
                 "    -Q sequence        Starting sequence (default: from DB)\n"
                 "    -p poll_interval   Seconds between checks (default 60)\n"
                 "    -f nodes_file      Existing nodes.dat from initial import\n"
-                "    -n max_node_id     Must match initial import\n";
+                "    -n max_node_id     Must match initial import\n"
+                "  Region-aware delta/poll (-m delta or -m poll):\n"
+                "    Auto-detected -- no flag needed. If -d/--database has any rows in\n"
+                "    public.installed_regions (populated by regional_install.cpp), -f/\n"
+                "    --nodes-file is read as that install's RegionalNodeMap instead of the\n"
+                "    master nodes.dat (-n/--max-node-id is unused in this case), and DB\n"
+                "    writes are filtered to whichever region(s) are installed there --\n"
+                "    naturally covering more than one region from a single poll process.\n"
+                "    Otherwise behaves exactly as before (global, against the master DB).\n";
             std::cout.flush();
             _exit(0);
         } else {
@@ -361,8 +384,15 @@ static Args parseArgs(int argc, char** argv) {
         std::cerr << "Error: -s, -d, -u are required\n"; std::cerr.flush(); _exit(1);
     }
     if (a.mode == Mode::Import && a.infile.empty()) {
-        if (a.download_planet) a.infile = "./planet-latest.osm.pbf";
-        else { std::cerr << "Error: -i <file.osm.pbf> required for import mode\n"; std::cerr.flush(); _exit(1); }
+        // Omitting -i entirely now means "download the latest planet file"
+        // -- --download-planet no longer needs to be passed explicitly just
+        // to get that default; it's still accepted (and still required if
+        // you want to download to some other explicit -i path instead of
+        // ./planet-latest.osm.pbf).
+        a.download_planet = true;
+        a.infile = "./planet-latest.osm.pbf";
+        std::cout << "No -i given -- will download the latest planet file to "
+                  << a.infile << "\n";
     }
     if (a.mode == Mode::Delta && a.osc_file.empty()) {
         std::cerr << "Error: -o <file.osc.gz> required for delta mode\n"; std::cerr.flush(); _exit(1);
@@ -841,20 +871,13 @@ void statusThread(const Status& s, std::atomic<bool>& done,
 
 // ---- Delta / Poll entry point ----
 
-static int runDelta(const Args& args) {
-    // Open existing merged mmap read-only — delta mode only needs select()
-    // for node coordinate lookups, never writes to shards.
-    // open_shards_for_write=false skips shard file open/creation entirely.
-    OSMMMap osmmap(args.nodes_file, args.max_node_id, 1, args.shard_dir,
-                   /*open_shards_for_write=*/false);
-    osmmap.setRandomAccessHint();
-
-    std::mutex db_flush_mu;
-    NavDB db(0, args.server, args.user, args.database, db_flush_mu);
-    DeltaApplier applier(osmmap, db);
-
+// Shared by both the global and region-aware paths below — drives applier
+// through either a single local OSC file (-m delta) or continuous
+// replication polling (-m poll) via Replicator, which is written once
+// against IDeltaApplier and doesn't care which concrete applier it's
+// driving (see Replicator.h).
+static void runDeltaOrPoll(const Args& args, IDeltaApplier& applier, NavDB& db) {
     if (args.mode == Mode::Delta) {
-        // Apply a single OSC file
         OSCReader reader(args.osc_file);
         int64_t n = reader.parse([&](OSCChange&& c) {
             applier.apply(std::move(c));
@@ -865,7 +888,6 @@ static int runDelta(const Args& args) {
                   << " modified=" << applier.modified()
                   << " deleted=" << applier.deleted() << ")\n";
     } else {
-        // Poll mode
         ReplicationGranularity gran = ReplicationGranularity::Minute;
         if (args.replication == "hour") gran = ReplicationGranularity::Hour;
         if (args.replication == "day")  gran = ReplicationGranularity::Day;
@@ -877,6 +899,59 @@ static int runDelta(const Args& args) {
             replicator.setSequence(args.sequence);
 
         replicator.poll(args.poll_interval);
+    }
+}
+
+static int runDelta(const Args& args) {
+    std::mutex db_flush_mu;
+    NavDB db(0, args.server, args.user, args.database, db_flush_mu);
+
+    std::vector<NavDB::InstalledRegion> installed = db.loadInstalledRegions();
+
+    if (!installed.empty()) {
+        // Region-aware: RegionalNodeMap (this install's own widened node
+        // coordinate store — see RegionalDeltaApplier's top-of-file
+        // comment) instead of the master OSMMMap, and every installed
+        // region's own polygon (same RegionIndex/RegionPolygons infra
+        // regional_export.cpp and regional_table_export.cpp use, parsed
+        // from the DB's own WKT text rather than a data/regions/*.wkt
+        // file) for DB-write filtering. A database with more than one
+        // region installed is handled by one applier testing against all
+        // of them, not one poll process per region.
+        RegionalNodeMap node_map(args.nodes_file);
+
+        std::vector<RegionIndex::Entry> regions;
+        regions.reserve(installed.size());
+        for (const auto& ir : installed) {
+            RegionPolygons::MultiPolygon polygon_mercator = RegionPolygons::parse(ir.wkt, ir.name);
+            boost::geometry::for_each_point(polygon_mercator, [](RegionPolygons::Point& p) {
+                auto [x, y] = toMercator(p.x(), p.y());
+                p.x(x); p.y(y);
+            });
+            auto [min_x, min_y] = toMercator(ir.min_lon, ir.min_lat);
+            auto [max_x, max_y] = toMercator(ir.max_lon, ir.max_lat);
+            regions.push_back(RegionIndex::build(ir.name, min_x, min_y, max_x, max_y,
+                                                  std::move(polygon_mercator)));
+        }
+
+        if (args.verbose) {
+            std::cout << "[runDelta] region-aware mode: " << regions.size() << " region(s) installed (";
+            for (size_t i = 0; i < installed.size(); ++i) std::cout << (i ? ", " : "") << installed[i].name;
+            std::cout << ")\n";
+        }
+
+        RegionalDeltaApplier applier(node_map, db, regions);
+        runDeltaOrPoll(args, applier, db);
+    } else {
+        // Open existing merged mmap read-only — delta mode only needs
+        // select() for node coordinate lookups, never writes to shards.
+        // open_shards_for_write=false skips shard file open/creation entirely.
+        OSMMMap osmmap(args.nodes_file, args.max_node_id, 1, args.shard_dir,
+                       /*open_shards_for_write=*/false);
+        osmmap.setRandomAccessHint();
+
+        DeltaApplier applier(osmmap, db);
+        runDeltaOrPoll(args, applier, db);
     }
 
     std::cout.flush();
@@ -1015,7 +1090,8 @@ int main(int argc, char** argv) {
             LOGI(-1, "resume: loading terrain elevation data");
             {
                 TerrainLoader terrain(args.server, args.user, args.database);
-                terrain.load(-125, 24, -66, 50, TerrainSource::USGS3DEP, 3857, 4, false);
+                terrain.load(kConusBbox.min_lon, kConusBbox.min_lat, kConusBbox.max_lon, kConusBbox.max_lat,
+                             TerrainSource::USGS3DEP, 3857, 4, false);
                 terrain.loadGlobal(3857, 4, false);
             }
             LOGI(-1, "terrain elevation data loaded");
@@ -1332,7 +1408,8 @@ int main(int argc, char** argv) {
     {
         TerrainLoader terrain(args.server, args.user, args.database);
         terrain.setProgressCallback(reportProgress);
-        terrain.load(-125, 24, -66, 50, TerrainSource::USGS3DEP, 3857, 4, false);
+        terrain.load(kConusBbox.min_lon, kConusBbox.min_lat, kConusBbox.max_lon, kConusBbox.max_lat,
+                     TerrainSource::USGS3DEP, 3857, 4, false);
         terrain.loadGlobal(3857, 4, false);
     }
     LOGI(-1, "terrain elevation data loaded");

@@ -29,6 +29,7 @@ add_executable(osm_import
     src/NavDB.cpp
     src/OSCReader.cpp
     src/DeltaApplier.cpp
+    src/RegionalDeltaApplier.cpp
     src/Replicator.cpp
     src/AirportsLoader.cpp
     src/FAAObstacleLoader.cpp
@@ -37,6 +38,10 @@ add_executable(osm_import
     src/TerrainLoader.cpp
     src/PlanetDownloader.cpp
     src/GeoUtils.cpp
+    src/RegionalNodeMap.cpp
+    src/RegionPolygons.cpp
+    src/RegionIndex.cpp
+    src/WkbDecode.cpp
     proto/fileformat.proto
     proto/osmformat.proto
 )
@@ -167,6 +172,9 @@ add_executable(regional_export
     src/regional_export.cpp
     src/OSMMMap.cpp
     src/RegionalNodeMap.cpp
+    src/RegionPolygons.cpp
+    src/RegionIndex.cpp
+    src/WkbDecode.cpp
     src/GeoUtils.cpp
 )
 
@@ -208,6 +216,37 @@ target_link_libraries(regional_db_export PRIVATE
 
 target_compile_options(regional_db_export PRIVATE -O2 -g -Wall -Wextra -Wno-psabi ${PQXX_CFLAGS_OTHER})
 target_compile_features(regional_db_export PRIVATE cxx_std_20)
+
+# ---- regional_table_export ----
+# Single client-side pass over the 5 big parent+child table pairs (see
+# src/regional_table_export.cpp top-of-file comment) -- run before
+# regional_db_export, which handles the remaining smaller tables and
+# appends to the same manifest.txt this tool starts.
+
+add_executable(regional_table_export
+    src/regional_table_export.cpp
+    src/RegionPolygons.cpp
+    src/RegionIndex.cpp
+    src/WkbDecode.cpp
+    src/PgCopyBinary.cpp
+    src/GeoUtils.cpp
+)
+
+target_include_directories(regional_table_export PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+    ${PQXX_INCLUDE_DIRS}
+    ${PQ_INCLUDE}
+    ${PROJ_INCLUDE_DIRS}
+)
+
+target_link_libraries(regional_table_export PRIVATE
+    ${PQXX_LIBRARIES}
+    ${PQ_LIB}
+    ${PROJ_LIBRARIES}
+)
+
+target_compile_options(regional_table_export PRIVATE -O2 -g -Wall -Wextra -Wno-psabi ${PQXX_CFLAGS_OTHER} ${PROJ_CFLAGS_OTHER})
+target_compile_features(regional_table_export PRIVATE cxx_std_20)
 
 # ---- regional_install ----
 # Installs a <region>.gpsxdb.tar.gz bundle (regional_export + regional_db_export

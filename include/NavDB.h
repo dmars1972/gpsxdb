@@ -56,6 +56,17 @@ public:
     void disableIndexes();   // call before way phase
     void enableIndexes();    // call before relation phase
     void createGistIndexes(); // call after all phases complete
+    // Counterpart to createGistIndexes() for regional_install.cpp: unlike
+    // the primary keys (needed throughout for INSERT ... ON CONFLICT (id)
+    // dedup, so never dropped there), the GiST spatial indexes aren't
+    // needed for correctness during a region's load -- dropping them
+    // first (safe no-op if they don't exist yet) and recreating with
+    // createGistIndexes() afterward gives every regional_install run the
+    // same efficient one-pass bulk index build createGistIndexes() already
+    // gives the bulk importer, rather than paying incremental per-row GiST
+    // maintenance on a second/third region installed into an
+    // already-indexed table.
+    void dropGistIndexes();
 
     // ---- Finalizers ----
     void finalize_nodes();
@@ -114,6 +125,20 @@ public:
     // Replication sequence tracking
     int64_t getReplicationSequence();
     void    setReplicationSequence(int64_t seq);
+
+    // public.installed_regions bookkeeping (see ensureSchema()'s DDL for
+    // why this exists and isn't the OurAirports public.regions table).
+    // wkt is WGS84-degree text, same format as data/regions/<name>.wkt.
+    struct InstalledRegion {
+        std::string name, wkt;
+        double min_lon, min_lat, max_lon, max_lat;
+    };
+    // Idempotent — installing the same region twice just updates its row
+    // (matches regional_install.cpp's own "safe to run more than once"
+    // contract for the rest of a region's data).
+    void registerInstalledRegion(const std::string& name, const std::string& wkt,
+                                  double min_lon, double min_lat, double max_lon, double max_lat);
+    std::vector<InstalledRegion> loadInstalledRegions();
 
     // Last-known remote modification time (Unix epoch seconds) for an
     // external dataset (e.g. "airports", "faa_obstacles"), used to detect

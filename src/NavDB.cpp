@@ -479,6 +479,14 @@ static const char* CREATE_GIST_INDEXES = R"SQL(
     CREATE INDEX IF NOT EXISTS relations_geog_idx ON public.relations USING GIST (geog);
 )SQL";
 
+static const char* DROP_GIST_INDEXES = R"SQL(
+    DROP INDEX IF EXISTS nodes_geog_idx;
+    DROP INDEX IF EXISTS ways_geog_idx;
+    DROP INDEX IF EXISTS areas_geog_idx;
+    DROP INDEX IF EXISTS roads_geog_idx;
+    DROP INDEX IF EXISTS relations_geog_idx;
+)SQL";
+
 void NavDB::disableIndexes() {
     LOGI(thread_id_, "disabling indexes");
     try {
@@ -516,6 +524,19 @@ void NavDB::createGistIndexes() {
         throw;
     }
     LOGI(thread_id_, "GiST indexes created");
+}
+
+void NavDB::dropGistIndexes() {
+    LOGI(thread_id_, "dropping GiST spatial indexes");
+    try {
+        pqxx::work txn(conn_);
+        txn.exec(DROP_GIST_INDEXES);
+        txn.commit();
+    } catch (const std::exception& e) {
+        std::cerr << "[NavDB] dropGistIndexes error: " << e.what() << "\n";
+        throw;
+    }
+    LOGI(thread_id_, "GiST indexes dropped");
 }
 
 // ---- query ----
@@ -710,6 +731,45 @@ void NavDB::setReplicationSequence(int64_t seq) {
     setExternalDataTimestamp("osm", seq);
 }
 
+void NavDB::registerInstalledRegion(const std::string& name, const std::string& wkt,
+                                     double min_lon, double min_lat, double max_lon, double max_lat) {
+    try {
+        pqxx::work txn(conn_);
+        txn.exec(
+            "INSERT INTO installed_regions(name, wkt, min_lon, min_lat, max_lon, max_lat) "
+            "VALUES ($1, $2, $3, $4, $5, $6) "
+            "ON CONFLICT (name) DO UPDATE SET wkt=$2, min_lon=$3, min_lat=$4, max_lon=$5, max_lat=$6, "
+            "installed_at=now()",
+            pqxx::params{name, wkt, min_lon, min_lat, max_lon, max_lat});
+        txn.commit();
+    } catch (const std::exception& e) {
+        std::cerr << "[NavDB] registerInstalledRegion error: " << e.what() << "\n"; throw;
+    }
+}
+
+std::vector<NavDB::InstalledRegion> NavDB::loadInstalledRegions() {
+    // Tolerant of a missing table, unlike this file's other queries — a
+    // database created via initializeSchema() before installed_regions was
+    // added (the live production master DB, notably) won't have it, and
+    // that must mean "no regions installed" (global mode), not a hard
+    // error that would break every existing deployment's poll process.
+    try {
+        std::vector<InstalledRegion> out;
+        pqxx::work txn(conn_);
+        auto r = txn.exec("SELECT name, wkt, min_lon, min_lat, max_lon, max_lat FROM installed_regions");
+        txn.commit();
+        out.reserve(r.size());
+        for (const auto& row : r) {
+            out.push_back({row[0].as<std::string>(), row[1].as<std::string>(),
+                            row[2].as<double>(), row[3].as<double>(),
+                            row[4].as<double>(), row[5].as<double>()});
+        }
+        return out;
+    } catch (const std::exception&) {
+        return {};
+    }
+}
+
 int64_t NavDB::getExternalDataTimestamp(const std::string& name) {
     try {
         pqxx::work txn(conn_);
@@ -822,6 +882,7 @@ void NavDB::initializeSchema() {
         "DROP TABLE IF EXISTS public.relations",
         "DROP TABLE IF EXISTS public.osm_replication_state",
         "DROP TABLE IF EXISTS public.external_data_state",
+        "DROP TABLE IF EXISTS public.installed_regions",
 
         "CREATE TABLE public.nodes ("
         "  id          bigint NOT NULL,"
@@ -881,6 +942,20 @@ void NavDB::initializeSchema() {
         "  name       varchar(32) PRIMARY KEY,"
         "  value      bigint NOT NULL,"
         "  checked_at timestamptz NOT NULL DEFAULT now())",
+
+        // See ensureSchema()'s copy of this DDL for the full rationale.
+        // Empty (and irrelevant) on a fresh master-DB import — only
+        // regional_install.cpp ever populates it — but created here too so
+        // the schema is identical either way and NavDB::loadInstalledRegions()
+        // never needs to special-case which schema-creation path was used.
+        "CREATE TABLE public.installed_regions ("
+        "  name         varchar(64) PRIMARY KEY,"
+        "  wkt          text NOT NULL,"
+        "  min_lon      double precision NOT NULL,"
+        "  min_lat      double precision NOT NULL,"
+        "  max_lon      double precision NOT NULL,"
+        "  max_lat      double precision NOT NULL,"
+        "  installed_at timestamptz NOT NULL DEFAULT now())",
 
         "CREATE INDEX node_tags_idx     ON public.node_tags     (id)",
         "CREATE INDEX way_tags_idx      ON public.way_tags      (id)",
@@ -1170,6 +1245,29 @@ void NavDB::ensureSchema() {
         "  name       varchar(32) PRIMARY KEY,"
         "  value      bigint NOT NULL,"
         "  checked_at timestamptz NOT NULL DEFAULT now())",
+
+        // Which export region(s) regional_install.cpp has loaded into this
+        // database -- not the OurAirports public.regions table (states/
+        // provinces) above, an unrelated pre-existing name. Lets a
+        // region-aware poll process (RegionalDeltaApplier) auto-detect
+        // which polygon(s) to filter DB writes against by querying this
+        // table at startup, rather than being told via a CLI flag -- a
+        // single poll process then naturally covers every region installed
+        // in this database (one download of each replication diff, not one
+        // per region) and there's no "which --region do I pass" ambiguity
+        // for a database with more than one region installed. wkt is plain
+        // WGS84-degree text (the same format as data/regions/<name>.wkt,
+        // parseable with boost::geometry::read_wkt directly) rather than a
+        // PostGIS geometry column, so loading it back client-side needs no
+        // WKB round-trip.
+        "CREATE TABLE IF NOT EXISTS public.installed_regions ("
+        "  name         varchar(64) PRIMARY KEY,"
+        "  wkt          text NOT NULL,"
+        "  min_lon      double precision NOT NULL,"
+        "  min_lat      double precision NOT NULL,"
+        "  max_lon      double precision NOT NULL,"
+        "  max_lat      double precision NOT NULL,"
+        "  installed_at timestamptz NOT NULL DEFAULT now())",
 
         "CREATE INDEX IF NOT EXISTS node_tags_idx     ON public.node_tags     (id)",
         "CREATE INDEX IF NOT EXISTS way_tags_idx      ON public.way_tags      (id)",

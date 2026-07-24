@@ -1,20 +1,50 @@
 #!/bin/bash
-# Builds <region>.gpsxdb.tar.gz installer bundles: runs regional_export
-# (nodes.dat slice) + regional_db_export (table dumps + manifest) for each
-# region, stages both into one directory per region, then tars+gzips.
+# Builds <region>.gpsxdb.tar.gz installer bundles: runs regional_table_export
+# (the 5 big parent+child table pairs, single client-side pass -- see its
+# top-of-file comment -- also writes each region's extra_vertices.bin),
+# then regional_export (one pass over nodes.dat covers every requested
+# region -- cheap, not the disk-space concern; folds in extra_vertices.bin
+# to widen each region's node file with border-crossing way/area/road
+# vertices -- see that tool's top-of-file comment for why), then runs
+# regional_db_export (remaining, smaller tables) + bundling ONE REGION AT A
+# TIME, deleting each region's uncompressed staging data immediately after
+# its bundle is written.
+#
+# regional_table_export must run BEFORE regional_export now (reversed from
+# this script's original order) so extra_vertices.bin exists when
+# regional_export needs it.
+#
+# regional_db_export's per-region loop bounds peak disk usage to roughly
+# one region's worth of uncompressed table dumps (still large for e.g.
+# Europe) rather than the whole planet's uncompressed data at once -- an
+# earlier all-regions-then-bundle version of this script blew through
+# 1.4TB of free disk partway through Africa, before a single bundle had
+# been written. regional_table_export's single-pass design reintroduces
+# that same all-regions-at-once exposure for the 5 big tables specifically
+# (its whole point is one pass covering every requested region, so all of
+# them land on disk before the per-region bundle/cleanup loop can start
+# touching any of it) -- --region-batch-size is the safety valve for that:
+# it splits the region list into batches and runs regional_table_export
+# once per batch instead of once for everything, trading some of the
+# single-pass win (each batch re-scans the 5 big tables) for bounded disk
+# usage. Measure actual aggregate big-table output size for a
+# representative region subset before trusting a full unbatched run; if
+# it's uncomfortably close to available disk, use this flag.
 #
 # Usage: ./build_regional_bundles.sh -s <host> -d <db> -u <user> \
 #            -f <master nodes.dat path> -n <max_id> --out-dir <dir> \
-#            [--regions name1,name2,...] [-v]
+#            [--regions name1,name2,...] [--region-batch-size N] [-v]
 #
 # Requires ~/.pgpass for authentication. Output: <out-dir>/<region>.gpsxdb.tar.gz
-# for each region, plus <out-dir>/staging/<region>/ left in place for
-# inspection (not cleaned up automatically -- delete manually once the
-# tarballs are verified).
+# per region. Per-region staging data is deleted right after each bundle is
+# written; only the small shared terrain.schema.sql (re-fetched per region,
+# harmless), any not-yet-processed regions' .nodes.dat slices, and (with
+# --region-batch-size) not-yet-bundled batches' big-table dumps remain
+# under <out-dir>/staging while the run is in progress.
 set -euo pipefail
 
 HOST=""; DB=""; USER_=""; NODES_FILE=""; MAX_ID="20000000000"
-OUT_DIR="."; REGIONS=""; VERBOSE=""
+OUT_DIR="."; REGIONS=""; VERBOSE=""; REGION_BATCH_SIZE=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -25,9 +55,10 @@ while [[ $# -gt 0 ]]; do
         -n) MAX_ID="$2"; shift 2 ;;
         --out-dir) OUT_DIR="$2"; shift 2 ;;
         --regions) REGIONS="$2"; shift 2 ;;
+        --region-batch-size) REGION_BATCH_SIZE="$2"; shift 2 ;;
         -v|--verbose) VERBOSE="-v"; shift ;;
         -h|--help)
-            echo "Usage: $0 -s <host> -d <db> -u <user> -f <nodes.dat> -n <max_id> --out-dir <dir> [--regions n1,n2,...] [-v]"
+            echo "Usage: $0 -s <host> -d <db> -u <user> -f <nodes.dat> -n <max_id> --out-dir <dir> [--regions n1,n2,...] [--region-batch-size N] [-v]"
             exit 0 ;;
         *) echo "Unknown argument: $1" >&2; exit 1 ;;
     esac
@@ -45,17 +76,58 @@ mkdir -p "$STAGING_DIR"
 REGION_ARGS=()
 [[ -n "$REGIONS" ]] && REGION_ARGS=(--regions "$REGIONS")
 
-echo "[build_regional_bundles] running regional_export (nodes.dat slices)..."
-"$BIN_DIR/regional_export" -f "$NODES_FILE" -n "$MAX_ID" --out-dir "$STAGING_DIR" $VERBOSE "${REGION_ARGS[@]}"
+# Needed before regional_table_export can even be invoked (batching below,
+# and the final per-region loop) -- previously derived post-hoc from
+# regional_export's own *.nodes.dat output, but regional_table_export now
+# runs FIRST, so this can no longer depend on regional_export having run.
+# data/regions/*.wkt is the same source of truth RegionPolygons::load()
+# reads (see include/RegionPolygons.h), so this matches "all regions"
+# exactly when --regions wasn't given.
+region_list=()
+if [[ -n "$REGIONS" ]]; then
+    IFS=',' read -ra region_list <<< "$REGIONS"
+else
+    shopt -s nullglob
+    for f in data/regions/*.wkt; do
+        region_list+=("$(basename "$f" .wkt)")
+    done
+    shopt -u nullglob
+fi
 
-echo "[build_regional_bundles] running regional_db_export (table dumps)..."
-"$BIN_DIR/regional_db_export" -s "$HOST" -d "$DB" -u "$USER_" --out-dir "$STAGING_DIR" $VERBOSE "${REGION_ARGS[@]}"
+echo "[build_regional_bundles] running regional_table_export (5 big table pairs + extra_vertices.bin, single pass)..."
+if [[ -z "$REGION_BATCH_SIZE" ]]; then
+    "$BIN_DIR/regional_table_export" -s "$HOST" -d "$DB" -u "$USER_" --out-dir "$STAGING_DIR" $VERBOSE "${REGION_ARGS[@]}"
+else
+    batch=()
+    for region in "${region_list[@]}"; do
+        batch+=("$region")
+        if [[ ${#batch[@]} -ge $REGION_BATCH_SIZE ]]; then
+            batch_csv="$(IFS=,; echo "${batch[*]}")"
+            echo "[build_regional_bundles] regional_table_export batch: $batch_csv"
+            "$BIN_DIR/regional_table_export" -s "$HOST" -d "$DB" -u "$USER_" --out-dir "$STAGING_DIR" $VERBOSE --regions "$batch_csv"
+            batch=()
+        fi
+    done
+    if [[ ${#batch[@]} -gt 0 ]]; then
+        batch_csv="$(IFS=,; echo "${batch[*]}")"
+        echo "[build_regional_bundles] regional_table_export batch: $batch_csv"
+        "$BIN_DIR/regional_table_export" -s "$HOST" -d "$DB" -u "$USER_" --out-dir "$STAGING_DIR" $VERBOSE --regions "$batch_csv"
+    fi
+fi
 
-# regional_export writes <staging>/<region>.nodes.dat; regional_db_export
-# writes <staging>/<region>/*.bin + manifest.txt. Move the former into the
-# latter so each region's directory is self-contained before tarring.
-for region_dir in "$STAGING_DIR"/*/; do
-    region="$(basename "$region_dir")"
+# extra_vertices.bin exists for every region now, so regional_export can
+# fold border-crossing way/area/road vertices into each region's node file.
+# One pass over nodes.dat still covers every requested region regardless of
+# how regional_table_export was batched above.
+echo "[build_regional_bundles] running regional_export (nodes.dat slices, one pass for all regions)..."
+"$BIN_DIR/regional_export" -f "$NODES_FILE" -n "$MAX_ID" --out-dir "$STAGING_DIR" --extra-vertices-dir "$STAGING_DIR" $VERBOSE "${REGION_ARGS[@]}"
+
+echo "[build_regional_bundles] processing ${#region_list[@]} region(s) one at a time..."
+for region in "${region_list[@]}"; do
+    echo "[build_regional_bundles] === $region ==="
+    "$BIN_DIR/regional_db_export" -s "$HOST" -d "$DB" -u "$USER_" --out-dir "$STAGING_DIR" $VERBOSE --regions "$region"
+
+    region_dir="$STAGING_DIR/$region"
     nodes_src="$STAGING_DIR/$region.nodes.dat"
     if [[ -f "$nodes_src" ]]; then
         mv "$nodes_src" "$region_dir/"
@@ -63,9 +135,23 @@ for region_dir in "$STAGING_DIR"/*/; do
         echo "[build_regional_bundles] WARNING: no nodes.dat slice found for region '$region' -- bundle will be missing node coordinates" >&2
     fi
 
+    # Embed this region's WKT polygon so regional_install.cpp can register
+    # it in public.installed_regions without depending on a local
+    # data/regions/ directory matching this export -- see regional_install's
+    # --help. Older bundles without this file fall back to --regions-dir.
+    wkt_src="data/regions/$region.wkt"
+    if [[ -f "$wkt_src" ]]; then
+        cp "$wkt_src" "$region_dir/$region.wkt"
+    else
+        echo "[build_regional_bundles] WARNING: no $wkt_src found -- bundle won't self-register in installed_regions" >&2
+    fi
+
     bundle="$OUT_DIR/$region.gpsxdb.tar.gz"
     echo "[build_regional_bundles] bundling $bundle"
     tar czf "$bundle" -C "$STAGING_DIR" "$region"
+
+    echo "[build_regional_bundles] cleaning up staging data for $region"
+    rm -rf "$region_dir"
 done
 
-echo "[build_regional_bundles] done -- bundles in $OUT_DIR, staging left at $STAGING_DIR"
+echo "[build_regional_bundles] done -- bundles in $OUT_DIR"

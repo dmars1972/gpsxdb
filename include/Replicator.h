@@ -1,5 +1,6 @@
 #pragma once
-#include "DeltaApplier.h"
+#include "IDeltaApplier.h"
+#include "NavDB.h"
 #include <string>
 #include <cstdint>
 
@@ -12,7 +13,11 @@ class Replicator {
 public:
     // server/user/database are only needed to reload OurAirports / FAA
     // obstacle data when checkExternalData() detects an upstream update.
-    Replicator(DeltaApplier& applier, NavDB& db,
+    // applier is IDeltaApplier&, not DeltaApplier&, so this same class
+    // drives both the global poll (DeltaApplier) and the region-aware poll
+    // (RegionalDeltaApplier) — everything here (sequence tracking,
+    // download, external-data refresh cadence) is identical either way.
+    Replicator(IDeltaApplier& applier, NavDB& db,
                ReplicationGranularity granularity,
                std::string server, std::string user,
                std::string database);
@@ -29,7 +34,7 @@ public:
     void    setSequence(int64_t seq);
 
 private:
-    DeltaApplier&          applier_;
+    IDeltaApplier&         applier_;
     NavDB&                 db_;
     ReplicationGranularity granularity_;
     std::string            server_, user_, database_;

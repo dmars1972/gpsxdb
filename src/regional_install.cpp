@@ -52,6 +52,24 @@ bool fileExists(const std::string& path) {
     return stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode);
 }
 
+// terrain/wmm's text-format dumps get gzip-compressed at export (see
+// regional_db_export.cpp -- hex-encoded raster bytes are ~2x bloat from
+// the encoding alone). binOrGzExists/copyFromClause detect the .gz variant
+// here and decompress via `\copy ... FROM PROGRAM 'gunzip -c ...'` rather
+// than requiring a separate temp-file decompression step in this program.
+// The manifest's format= field (read by tableFormat()) stays a plain valid
+// COPY format ("text"/"binary") either way -- compression is purely a
+// file-existence question, not tracked as separate manifest bookkeeping.
+bool binOrGzExists(const std::string& bin_path) {
+    return fileExists(bin_path) || fileExists(bin_path + ".gz");
+}
+
+std::string copyFromClause(const std::string& bin_path) {
+    if (fileExists(bin_path + ".gz"))
+        return "PROGRAM 'gunzip -c \"" + bin_path + ".gz\"'";
+    return "'" + bin_path + "'";
+}
+
 bool dirExists(const std::string& path) {
     struct stat st;
     return stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
@@ -132,7 +150,7 @@ const std::vector<ChildGroup> kChildren = {
 void appendParentGroup(std::ostringstream& sql, const std::string& region_dir,
                        const ParentGroup& g) {
     std::string bin_path = region_dir + "/" + g.table + ".bin";
-    if (!fileExists(bin_path)) return;
+    if (!binOrGzExists(bin_path)) return;
 
     std::string staging = "staging_" + g.table;
     // Bare columns only -- no indexes/constraints (in particular, no GIST
@@ -144,7 +162,7 @@ void appendParentGroup(std::ostringstream& sql, const std::string& region_dir,
     // was pure waste -- and, at multi-million-row scale, expensive enough
     // to have visibly hung the whole box.
     sql << "CREATE TEMP TABLE " << staging << " (LIKE public." << g.table << ") ON COMMIT DROP;\n";
-    sql << "\\copy " << staging << " FROM '" << bin_path << "' WITH (FORMAT " << tableFormat(region_dir, g.table) << ")\n";
+    sql << "\\copy " << staging << " FROM " << copyFromClause(bin_path) << " WITH (FORMAT " << tableFormat(region_dir, g.table) << ")\n";
     if (!g.new_ids_temp.empty()) {
         sql << "CREATE TEMP TABLE " << g.new_ids_temp << " AS "
             << "SELECT s." << g.pk_col << " AS id"
@@ -160,7 +178,7 @@ void appendParentGroup(std::ostringstream& sql, const std::string& region_dir,
 void appendChildGroup(std::ostringstream& sql, const std::string& region_dir,
                       const ChildGroup& g) {
     std::string bin_path = region_dir + "/" + g.table + ".bin";
-    if (!fileExists(bin_path)) return;
+    if (!binOrGzExists(bin_path)) return;
 
     std::string staging = "staging_" + g.table;
     // Bare columns only -- no indexes/constraints (in particular, no GIST
@@ -172,7 +190,7 @@ void appendChildGroup(std::ostringstream& sql, const std::string& region_dir,
     // was pure waste -- and, at multi-million-row scale, expensive enough
     // to have visibly hung the whole box.
     sql << "CREATE TEMP TABLE " << staging << " (LIKE public." << g.table << ") ON COMMIT DROP;\n";
-    sql << "\\copy " << staging << " FROM '" << bin_path << "' WITH (FORMAT " << tableFormat(region_dir, g.table) << ")\n";
+    sql << "\\copy " << staging << " FROM " << copyFromClause(bin_path) << " WITH (FORMAT " << tableFormat(region_dir, g.table) << ")\n";
     sql << "INSERT INTO public." << g.table << " "
         << "SELECT c.* FROM " << staging << " c "
         << "JOIN " << g.new_ids_temp << " n ON n.id = c." << g.join_col << ";\n\n";
@@ -182,9 +200,9 @@ void appendChildGroup(std::ostringstream& sql, const std::string& region_dir,
 // against new_airport_ids' ident column rather than an integer id.
 void appendAirportTags(std::ostringstream& sql, const std::string& region_dir) {
     std::string bin_path = region_dir + "/airport_tags.bin";
-    if (!fileExists(bin_path)) return;
+    if (!binOrGzExists(bin_path)) return;
     sql << "CREATE TEMP TABLE staging_airport_tags (LIKE public.tags) ON COMMIT DROP;\n";
-    sql << "\\copy staging_airport_tags FROM '" << bin_path << "' WITH (FORMAT " << tableFormat(region_dir, "airport_tags") << ")\n";
+    sql << "\\copy staging_airport_tags FROM " << copyFromClause(bin_path) << " WITH (FORMAT " << tableFormat(region_dir, "airport_tags") << ")\n";
     sql << "INSERT INTO public.tags "
            "SELECT c.* FROM staging_airport_tags c "
            "JOIN new_airport_ids n ON n.ident = c.airport_ident;\n\n";
@@ -229,6 +247,7 @@ bool tableExists(pqxx::connection& conn, const std::string& table) {
 int main(int argc, char** argv) {
     std::string bundle_path, host, db, user, nodes_file;
     std::string work_dir = "/tmp";
+    std::string regions_dir = "data/regions";
     bool verbose = false;
 
     for (int i = 1; i < argc; ++i) {
@@ -238,15 +257,23 @@ int main(int argc, char** argv) {
         else if ((arg == "-u") && i+1 < argc) user = argv[++i];
         else if ((arg == "--nodes-file") && i+1 < argc) nodes_file = argv[++i];
         else if ((arg == "--work-dir") && i+1 < argc) work_dir = argv[++i];
+        else if ((arg == "--regions-dir") && i+1 < argc) regions_dir = argv[++i];
         else if (arg == "-v" || arg == "--verbose") verbose = true;
         else if (arg == "-h" || arg == "--help") {
             std::cout << "Usage: regional_install <bundle.gpsxdb.tar.gz> -s <host> -d <db> -u <user>\n"
                          "                         --nodes-file <target nodes.dat path>\n"
-                         "                         [--work-dir <dir>, default /tmp] [-v]\n"
+                         "                         [--work-dir <dir>, default /tmp]\n"
+                         "                         [--regions-dir <dir>, default data/regions] [-v]\n"
                          "\n"
                          "--work-dir is where the bundle is extracted -- a multi-GB region bundle\n"
                          "can exceed a tmpfs /tmp's size or quota, so point this at plain disk\n"
                          "(e.g. alongside nodes.dat) if that happens.\n"
+                         "\n"
+                         "--regions-dir is a fallback only -- current bundles embed their own\n"
+                         "<region>.wkt (used to register this region in public.installed_regions,\n"
+                         "so a region-aware poll process can auto-detect which polygon(s) to\n"
+                         "filter against without a --region flag); this is only consulted for\n"
+                         "older bundles built before that was added.\n"
                          "\n"
                          "Idempotent: safe to install multiple (even overlapping) regions into\n"
                          "the same target -- see regional_install.cpp's top-of-file comment for\n"
@@ -314,12 +341,23 @@ int main(int argc, char** argv) {
         std::mutex dummy_mu;
         NavDB db_client(0, host, user, db, dummy_mu);
         db_client.ensureSchema();
+
+        // GiST spatial indexes aren't needed for correctness during the
+        // load (only the primary keys are, for INSERT ... ON CONFLICT (id)
+        // dedup below -- those are never dropped). Dropping them first
+        // (safe no-op on a fresh table, or one from a prior regional_install
+        // run that already dropped them) and recreating in step 6 gives
+        // every region's load the same efficient one-pass bulk index build
+        // the bulk importer already gets, instead of incremental per-row
+        // GiST maintenance on a second/third region installed into an
+        // already-indexed table.
+        db_client.dropGistIndexes();
     }
 
     // ---- 2. public.terrain's DDL (raster2pgsql-generated, not fixed) ----
     {
         pqxx::connection conn("host=" + host + " dbname=" + db + " user=" + user);
-        bool has_terrain_rows = fileExists(region_dir + "/terrain.bin");
+        bool has_terrain_rows = binOrGzExists(region_dir + "/terrain.bin");
         bool terrain_table_exists = tableExists(conn, "terrain");
         std::string schema_path = region_dir + "/terrain.schema.sql";
         if (has_terrain_rows && !terrain_table_exists) {
@@ -357,7 +395,15 @@ int main(int argc, char** argv) {
     }
     std::cout << "[regional_install] DB tables installed\n";
 
-    // ---- 4. Merge/install the region's node coordinates ----
+    // ---- 4. Recreate GiST spatial indexes (see step 1's drop) ----
+    {
+        std::mutex dummy_mu;
+        NavDB db_client(0, host, user, db, dummy_mu);
+        db_client.createGistIndexes();
+    }
+    std::cout << "[regional_install] GiST indexes rebuilt\n";
+
+    // ---- 5. Merge/install the region's node coordinates ----
     std::string region_nodes_path = region_dir + "/" + region_name + ".nodes.dat";
     if (!fileExists(region_nodes_path)) {
         std::cerr << "[regional_install] WARNING: no " << region_name
@@ -381,6 +427,37 @@ int main(int argc, char** argv) {
             _exit(1);
         }
         std::cout << "[regional_install] merged region nodes into " << nodes_file << "\n";
+    }
+
+    // ---- 6. Register in public.installed_regions ----
+    // Prefer the bundle's own embedded <region>.wkt (self-contained, no
+    // dependency on this machine's data/regions/ matching the bundle's
+    // source); fall back to --regions-dir for bundles built before this
+    // was added (see --help).
+    {
+        std::string wkt_path = region_dir + "/" + region_name + ".wkt";
+        if (!fileExists(wkt_path)) wkt_path = regions_dir + "/" + region_name + ".wkt";
+
+        std::string bbox = readManifestField(region_dir + "/manifest.txt", "bbox");
+        std::ifstream wkt_in(wkt_path);
+        if (!fileExists(wkt_path) || bbox.empty()) {
+            std::cerr << "[regional_install] WARNING: could not find " << region_name
+                      << ".wkt (checked bundle and --regions-dir " << regions_dir
+                      << ") or manifest bbox -- skipping installed_regions registration; "
+                         "a region-aware poll process won't auto-detect this region\n";
+        } else {
+            std::stringstream wkt_ss;
+            wkt_ss << wkt_in.rdbuf();
+            double min_lon, min_lat, max_lon, max_lat;
+            std::stringstream bbox_ss(bbox);
+            char comma;
+            bbox_ss >> min_lon >> comma >> min_lat >> comma >> max_lon >> comma >> max_lat;
+
+            std::mutex dummy_mu;
+            NavDB db_client(0, host, user, db, dummy_mu);
+            db_client.registerInstalledRegion(region_name, wkt_ss.str(), min_lon, min_lat, max_lon, max_lat);
+            std::cout << "[regional_install] registered '" << region_name << "' in installed_regions\n";
+        }
     }
 
     std::string cleanup_cmd = "rm -rf '" + tmp_dir + "'";

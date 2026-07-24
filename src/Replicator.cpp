@@ -51,7 +51,7 @@ static long remoteLastModified(const std::string& url) {
 
 // ---- Replicator ----
 
-Replicator::Replicator(DeltaApplier& applier, NavDB& db,
+Replicator::Replicator(IDeltaApplier& applier, NavDB& db,
                         ReplicationGranularity granularity,
                         std::string server, std::string user,
                         std::string database)
@@ -95,7 +95,13 @@ void Replicator::applyFile(const std::string& path) {
 
 int64_t Replicator::remoteSequence() {
     std::string url  = baseUrl() + "/state.txt";
-    std::string tmp  = "/tmp/osm_state.txt";
+    // Keyed by target database, not a fixed shared path -- this poll
+    // process is one of potentially several running concurrently on the
+    // same machine (the global poll plus any number of region-aware polls
+    // for different customer installs), each targeting its own database,
+    // and a shared path collides across them (whichever process's user
+    // owns the file blocks the others' overwrite).
+    std::string tmp  = "/tmp/osm_state_" + database_ + ".txt";
     if (!downloadFile(url, tmp))
         throw std::runtime_error("Failed to download " + url);
 
@@ -119,7 +125,10 @@ int64_t Replicator::remoteSequence() {
 bool Replicator::downloadAndApply(int64_t seq) {
     std::string path = sequenceToPath(seq);
     std::string url  = baseUrl() + "/" + path + ".osc.gz";
-    std::string tmp  = "/tmp/osm_delta_" + std::to_string(seq) + ".osc.gz";
+    // Same rationale as remoteSequence()'s tmp path: keyed by database so
+    // concurrent poll processes (global + N regional) never collide, even
+    // if they happen to be downloading the same sequence number at once.
+    std::string tmp  = "/tmp/osm_delta_" + database_ + "_" + std::to_string(seq) + ".osc.gz";
 
     std::cout << "Downloading sequence " << seq << " (" << url << ")\n";
 

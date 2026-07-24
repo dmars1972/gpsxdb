@@ -1,4 +1,5 @@
 #pragma once
+#include "IDeltaApplier.h"
 #include "OSCReader.h"
 #include "OSMMMap.h"
 #include "NavDB.h"
@@ -7,20 +8,23 @@
 
 // Applies a parsed OSC change to the database and mmap node store.
 // Single-threaded — delta files are small enough not to need parallelism.
+// See RegionalDeltaApplier for the region-scoped counterpart (RegionalNodeMap
+// instead of OSMMMap, plus region-membership DB-write filtering) — both
+// implement IDeltaApplier so Replicator can drive either one.
 
-class DeltaApplier {
+class DeltaApplier : public IDeltaApplier {
 public:
     DeltaApplier(OSMMMap& osmmap, NavDB& db);
 
-    void apply(OSCChange&& change);
+    void apply(OSCChange&& change) override;
 
     // Flush any buffered writes
-    void flush();
+    void flush() override;
 
     // Stats
-    int64_t created()  const { return created_; }
-    int64_t modified() const { return modified_; }
-    int64_t deleted()  const { return deleted_; }
+    int64_t created()  const override { return created_; }
+    int64_t modified() const override { return modified_; }
+    int64_t deleted()  const override { return deleted_; }
 
 private:
     OSMMMap& osmmap_;

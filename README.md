@@ -32,6 +32,7 @@ extracts.
 - **Charted airspace** — FAA Class Airspace and Special Use Airspace (US), plus OpenAIP international airspace (rest of world)
 - **Post-import data quality check** — spot-checks a sample of points against public records (real airport/obstacle facts, an independent WMM implementation) after each import
 - **GiST spatial indexes** — built after all data is loaded, not during import, for maximum efficiency
+- **Regional bundles** — export any subset of the planet as a self-contained, installable `.gpsxdb.tar.gz`, with a region-aware poll process that stays current afterward without depending on the source database — see [Regional bundles](#regional-bundles)
 
 ---
 
@@ -215,18 +216,19 @@ osmium fileinfo -e planet-latest.osm.pbf | grep "Max ID"
   -v -l osm.log
 ```
 
-Don't already have `planet-latest.osm.pbf`? Pass `--download-planet` to have
-`osm_import` fetch the latest one from planet.openstreetmap.org before
-importing (saved to the `-i` path, `./planet-latest.osm.pbf` if `-i` is
-omitted). The file is on the order of 100GB, so this takes hours — the
-download is resumable (safe to re-run after an interruption or crash) and
+Don't already have `planet-latest.osm.pbf`? Just omit `-i` and `osm_import`
+fetches the latest one from planet.openstreetmap.org before importing,
+saving it to `./planet-latest.osm.pbf` (equivalent to passing
+`--download-planet` with no `-i`; pass `--download-planet` explicitly
+alongside `-i <path>` instead if you want it saved somewhere else). The
+file is on the order of 100GB, so this takes hours — the download is
+resumable (safe to re-run after an interruption or crash) and
 checksum-verified against upstream's published MD5 before the import
 proceeds, and it happens before `-I` touches the database, so a failed
 download never leaves you with a wiped schema and nothing to import:
 
 ```bash
 ./build/osm_import \
-  -i planet-latest.osm.pbf --download-planet \
   -s <your_db_server> -d <your_db> -u <your_user_id> \
   -I \
   -n 20000000000 \
@@ -239,9 +241,11 @@ to running `create.sql` and `create_airports.sql` manually. Safe to use on
 a fresh database or when reimporting from scratch. **Do not use `-I` with
 `-R` resume flags** — it will wipe data from phases already completed.
 
-The defaults (`-t 1 -w 6`) are tuned conservatively for low-power hardware
-such as a Raspberry Pi. On a proper desktop/server, increase both for much
-higher throughput — see [Hardware notes](#hardware-notes) below.
+The defaults (`-t 1 -w 6`) are conservative. On a proper x86_64
+desktop/server, increase both for much higher throughput — see
+[Hardware notes](#hardware-notes) below (bulk import needs that kind of
+hardware regardless — see that section for why Raspberry Pi 5 isn't
+supported for this specific mode).
 
 ### Options
 
@@ -342,6 +346,26 @@ fixed-interval instead. The last-seen timestamp for each is tracked in the
 
 Replication granularities: `minute` | `hour` | `day`
 
+#### Region-aware poll
+
+Delta and poll mode both auto-detect whether they're pointed at a regional
+install — no separate flag needed. If `-d`/`--database` has any rows in
+`public.installed_regions` (populated by `regional_install`, see
+[Regional bundles](#regional-bundles) below), `-f`/`--nodes-file` is read as
+that install's own (much smaller) node coordinate store instead of the
+master `nodes.dat`, and every DB write is filtered to whichever region(s)
+are actually installed there. A database with more than one region
+installed is handled by a single poll process covering all of them — one
+download of each replication diff, not one per region. Otherwise (the
+master database, or any database with no `installed_regions` rows), poll
+mode behaves exactly as documented above.
+
+```bash
+./build/osm_import -m poll -r minute \
+  -s <your_db_server> -d <your_regional_db> -u <your_user_id> \
+  -f <region>.nodes.dat
+```
+
 ### FAA Obstacles standalone loader
 
 ```bash
@@ -406,12 +430,16 @@ once, pass `--global` instead of `--bbox`:
 ./build/terrain_load -s <your_db_server> -d <your_db> -u <your_user_id> --global --threads 10
 ```
 
-This loads Copernicus DEM GLO-30 for all 19 populated non-US regions in one
-call — the same regions previously split across the (now superseded)
-`load_copernicus_regions.sh`/`load_copernicus_global_rest.sh`/
-`load_copernicus_final.sh` scripts. Deliberately excludes the continental
-US (3DEP is authoritative there — run a separate `--source 3dep` pass) and
-Antarctica (minimal Copernicus coverage, no permanent civil GA population).
+This loads Copernicus DEM GLO-30 for all 9 populated non-US regions in one
+call (10 natural-boundary regions total — coastlines + physical divides,
+not administrative borders, see `include/Regions.h` and
+`tools/prepare_regions.py` — minus `north_america`, which still needs its
+continental-US portion covered separately). Deliberately excludes the
+continental US (3DEP is authoritative there — run a separate `--source
+3dep` pass; the `north_america` region's Copernicus sweep skips just the
+CONUS tile cells, not the whole region, since it also covers Canada/Mexico/
+Central America/Caribbean/Alaska/Greenland) and Antarctica (minimal
+Copernicus coverage, no permanent civil GA population).
 
 ### WMM (magnetic declination) loader
 
@@ -448,6 +476,67 @@ read from `~/.openaip_api_key` by default, never committed to the repo).
 # Skip international airspace (e.g. no API key available)
 ./build/airspace_load -s <your_db_server> -d <your_db> -u <your_user_id> --no-intl
 ```
+
+---
+
+## Regional bundles
+
+Exports any subset of the planet's data (see `include/Regions.h` for the
+region list — 10 natural continents plus border corridors for regions that
+straddle a continent boundary) as a single self-contained
+`<region>.gpsxdb.tar.gz`, installable into a fresh database without needing
+the source database again afterward. Built for customers/deployments that
+only want their own region's data (e.g. a single-region install on a
+Raspberry Pi 5 — see [Hardware notes](#hardware-notes)) rather than the
+full planet.
+
+### Building bundles
+
+```bash
+./build_regional_bundles.sh -s <host> -d <db> -u <user> \
+  -f <master nodes.dat path> -n 20000000000 --out-dir <dir> \
+  [--regions name1,name2,...] [--region-batch-size N] [-v]
+```
+
+This runs three tools in sequence for every requested region (all of them
+if `--regions` is omitted), then bundles the result:
+- `regional_export` — one pass over the master `nodes.dat` producing each
+  region's own node coordinate slice, widened to include every vertex of
+  any way/area/road included in that region (not just nodes whose own
+  coordinate falls inside the region polygon — needed so a region-aware
+  poll process can always resolve a border-crossing way's full geometry
+  locally, see below).
+- `regional_table_export` — single client-side pass over the 5 big
+  parent+child table pairs (ways/areas/roads/relations/nodes and their
+  `_tags` children), classifying each row against every region's real
+  polygon in one read instead of one `ST_Intersects` query per region.
+- `regional_db_export` — the remaining, smaller tables (airports, WMM,
+  terrain, airspace, etc.), one per region.
+- `--region-batch-size` bounds peak disk usage for `regional_table_export`
+  (all requested regions' big-table output otherwise lands on disk
+  simultaneously) by splitting the region list into batches.
+
+### Installing a bundle
+
+```bash
+./build/regional_install <region>.gpsxdb.tar.gz -s <host> -d <db> -u <user> \
+  --nodes-file <target nodes.dat path> [--work-dir <dir>] [-v]
+```
+
+Idempotent and safe to run more than once against the same target,
+including with different or overlapping regions — every row is deduped via
+`INSERT ... ON CONFLICT (id) DO NOTHING`, and `--nodes-file` is merged
+(not overwritten) if it already exists from a prior install. Installing a
+second region into an already-populated database:
+- drops the GiST spatial indexes first (not needed for the dedup above,
+  only the primary keys are) and rebuilds them once at the end, so every
+  install gets the same efficient one-pass bulk index build the main
+  importer uses, rather than incremental per-row index maintenance;
+- registers the region in `public.installed_regions`, which is what lets
+  poll mode auto-detect which polygon(s) to filter against afterward (see
+  [Region-aware poll](#region-aware-poll)) — no `--region` flag needed
+  anywhere, and a database with several regions installed is fully
+  represented, not just the first one.
 
 ---
 
@@ -588,16 +677,13 @@ For a full planet import, `nodes.dat` is sized at `max_node_id × 16 bytes` (a s
 
 ## Performance
 
-Tested on Raspberry Pi 5 (16GB RAM, dual NVMe via PCIe 2.0) running Ubuntu 26.04,
-with conservative thread settings (`-t 1 -w 6`) required for stability:
-
-- **Node phase**: ~500K nodes/sec
-- **Way phase**: throughput primarily I/O-bound on node coordinate lookups from `nodes.dat`
-- **Full planet import**: ~20 hours end-to-end
-- **Full North America import**: ~3-4 hours end-to-end
-
-On a proper desktop/server with PCIe 3.0/4.0 NVMe, significantly higher throughput
-is expected — see [Hardware notes](#hardware-notes) for guidance on scaling up.
+The bulk importer (`-m import`) is I/O-bound, not CPU-bound: the node phase
+is dominated by mmap write throughput, and the ways/relations phase by
+random node-coordinate lookups from `nodes.dat`. It requires a proper
+x86_64 desktop/server with real NVMe — see [Hardware notes](#hardware-notes)
+for recommended specs and a known incompatibility with Raspberry Pi 5.
+Delta/poll mode's much lighter, occasional I/O pattern isn't subject to
+this — see that section for details.
 
 #
 ## Tuning thread counts
@@ -618,11 +704,10 @@ thread does Mercator projection, mmap writes, and COPY buffering.
 | Consistently at max (10000) | Node threads are the bottleneck — they can't keep up with the producer. | Increase `-t` if the system can handle the extra I/O load |
 | Fluctuates 0–max | Roughly balanced — this is ideal | Leave as-is |
 
-On an RPi5, `-t 1` is recommended. With a single node thread, `Q:` will
-typically sit at 0 (producer-bound), meaning the PBF parser is the ceiling
-— adding threads won't improve throughput but will increase I/O pressure and
-risk system instability. On a desktop/server, try `-t 3` or higher and watch
-whether `Q:` rises.
+The default `-t 1` is conservative — a single node thread typically leaves
+`Q:` sitting at 0 (producer-bound), meaning the PBF parser is the ceiling
+and adding threads won't improve throughput. On capable desktop/server
+hardware, try `-t 3` or higher and watch whether `Q:` rises.
 
 ### Ways/Relations phase — tuning `-w`
 
@@ -637,11 +722,10 @@ building, and PostgreSQL COPY.
 | Consistently at max (10000) | Way threads are the bottleneck — they can't process fast enough. | Increase `-w` if the system is stable |
 | Fluctuates 0–max | Balanced — ideal | Leave as-is |
 
-On an RPi5, `-w 6` has been found to be a reasonable balance between
-throughput and system stability. Higher values (`-w 12`) increase random I/O
-concurrency and can trigger kernel-level instability on this platform even
-though the queue appears to have room. On desktop hardware with a fast NVMe,
-`-w 12` or higher should be stable and beneficial.
+The default `-w 6` is a conservative starting point. Higher values (`-w 12`)
+increase random I/O concurrency against `nodes.dat` — on desktop hardware
+with a fast NVMe, `-w 12` or higher should be stable and beneficial; watch
+`Q:` to confirm the increase is actually helping.
 
 ### General rule of thumb
 
@@ -652,7 +736,7 @@ though the queue appears to have room. On desktop hardware with a fast NVMe,
 - **System instability (lockups/crashes)** → reduce thread count regardless
   of queue depth; the I/O pressure from concurrent threads, not just
   throughput, is what triggers hardware/driver instability on constrained
-  platforms like the RPi5
+  platforms — see [Hardware notes](#hardware-notes)
 
 ## Tuning recommendations
 
@@ -663,12 +747,12 @@ though the queue appears to have room. On desktop hardware with a fast NVMe,
 
 ### Known issue: kernel lockups on Raspberry Pi with kernel 7.0.0-1011-raspi
 
-A kernel regression in `7.0.0-1011-raspi` (Ubuntu 26.04) causes full system lockups under sustained heavy mmap write workloads. Workarounds applied in this codebase:
+A kernel regression in `7.0.0-1011-raspi` (Ubuntu 26.04) causes full system lockups under sustained heavy mmap write workloads during bulk import. These mitigations are in the codebase and are harmless/beneficial in general, but — see [Hardware notes](#hardware-notes) — did **not** fully resolve the issue, which is why bulk import on Raspberry Pi 5 remains unsupported:
 
 - `CHUNK_SIZE` reduced from 16MB to 4MB to limit write burst size
 - Periodic `fsync`/`msync` every 64 chunks to bound dirty page accumulation
 - `MADV_RANDOM` hint on the merged node file is applied **after** merge completes rather than at construction time (applying it early on a large sparse mapping triggers the lockup)
-- Default thread counts (`-t 1 -w 6`) are tuned conservatively for RPi5 stability
+- Conservative default thread counts (`-t 1 -w 6`)
 
 If you experience lockups during the node phase on other platforms, try reducing `CHUNK_SIZE` further in `OSMMMap.cpp`.
 
@@ -677,17 +761,26 @@ If you experience lockups during the node phase on other platforms, try reducing
 
 ## Hardware notes
 
-This importer was originally developed and tuned on a **Raspberry Pi 5**
-with dual NVMe drives attached via PCIe 2.0. That combination turned out to
-be a poor fit for this workload — not because of anything in the import
+**Bulk import (`-m import`) is not supported on Raspberry Pi 5.** It was
+tried there — dual NVMe drives attached via PCIe 2.0 — and found to be a
+poor fit for this specific workload: not because of anything in the import
 logic itself, but because **sustained heavy I/O (large concurrent writes
 during the node phase, large concurrent random reads during ways/relations)
 reliably triggered full system lockups** requiring a hard power cycle. This
 happened across many different phases and code paths, which pointed at a
 platform-level reliability issue (kernel/driver/PCIe-adapter related) rather
-than an application bug.
+than an application bug. Use a proper x86_64 desktop/server (see
+[Recommended hardware](#recommended-hardware)) for bulk import.
 
-### What helped on the Pi
+**Delta/poll mode (`-m delta`/`-m poll`) and `regional_install` are a
+different story** — their I/O pattern is occasional and small (one diff at
+a time, or one region bundle load), nowhere near the sustained heavy
+concurrent I/O that triggers the lockup above, and both are intended to run
+on a deployed Raspberry Pi 5 unit (with an NVMe SSD attached) as part of a
+regional install. Only the initial bulk import that *produces* a region's
+data needs the hardware described below.
+
+### What helped on the Pi (for bulk import)
 
 - Reducing `CHUNK_SIZE` for the LZ4 shard writer (16MB → 4MB) and adding
   periodic `fsync`/`msync` calls bounded dirty-page accumulation and fixed
@@ -746,4 +839,4 @@ MIT License — see [LICENSE](LICENSE)
 
 ## Contributing
 
-Issues and pull requests welcome. The codebase targets C++20 and is tested on aarch64 (Raspberry Pi 5) and x86_64 Linux.
+Issues and pull requests welcome. The codebase targets C++20 and builds on both aarch64 (Raspberry Pi 5) and x86_64 Linux — see [Hardware notes](#hardware-notes) for which modes are actually supported on which platform.
