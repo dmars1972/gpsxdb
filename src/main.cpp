@@ -1091,8 +1091,8 @@ int main(int argc, char** argv) {
             {
                 TerrainLoader terrain(args.server, args.user, args.database);
                 terrain.load(kConusBbox.min_lon, kConusBbox.min_lat, kConusBbox.max_lon, kConusBbox.max_lat,
-                             TerrainSource::USGS3DEP, 3857, 4, false);
-                terrain.loadGlobal(3857, 4, false);
+                             TerrainSource::USGS3DEP, 3857, args.way_threads, false);
+                terrain.loadGlobal(3857, args.way_threads, false);
             }
             LOGI(-1, "terrain elevation data loaded");
         }
@@ -1409,8 +1409,8 @@ int main(int argc, char** argv) {
         TerrainLoader terrain(args.server, args.user, args.database);
         terrain.setProgressCallback(reportProgress);
         terrain.load(kConusBbox.min_lon, kConusBbox.min_lat, kConusBbox.max_lon, kConusBbox.max_lat,
-                     TerrainSource::USGS3DEP, 3857, 4, false);
-        terrain.loadGlobal(3857, 4, false);
+                     TerrainSource::USGS3DEP, 3857, args.way_threads, false);
+        terrain.loadGlobal(3857, args.way_threads, false);
     }
     LOGI(-1, "terrain elevation data loaded");
 

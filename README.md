@@ -184,15 +184,36 @@ to connect.
 
 ### PostgreSQL tuning (recommended for import)
 
-Add to `postgresql.conf` and restart **before** starting the import:
+Add to `postgresql.conf` and restart **before** starting the import. These
+scale with your machine's actual RAM/CPU rather than being fixed values —
+plug in your own numbers using the formulas below:
+
+| Setting | Formula | Why |
+|---|---|---|
+| `shared_buffers` | 15–25% of total RAM | Standard baseline for a dedicated DB server — but lean toward the low end here specifically: `nodes.dat` is memory-mapped and benefits far more from OS page cache than from Postgres's own buffer pool, so over-allocating this just takes RAM away from that. |
+| `effective_cache_size` | 50–75% of total RAM | Tells the query planner how much RAM is realistically available for caching (OS page cache + shared_buffers combined) — doesn't allocate anything itself, safe to set generously. |
+| `work_mem` | total RAM ÷ (2 × thread count, i.e. `-t` + `-w`) | Import uses one DB connection per thread, not the hundreds a typical multi-user OLTP setting has to divide RAM across, so this can be much more generous. |
+| `maintenance_work_mem` | 1–2GB, more if RAM allows | Speeds up the primary-key/GiST index builds at the end of the ways/relations phases and after `-I`. |
+| `max_wal_size` | 2–4GB on a fast NVMe, less on spinning disk | Larger reduces checkpoint frequency during bulk load; bounded by how much WAL churn your disk can actually absorb before a checkpoint has to catch up. |
+| `wal_buffers` | 64MB | Rarely needs to scale with machine size — Postgres's own auto-tuning (`-1`, the default) is also a reasonable choice. |
+
+Worked example for a 40GB RAM / 12-core machine running `-t 3 -w 12` (15
+import threads total):
 
 ```
-shared_buffers = 1GB
-wal_buffers = 16MB
-work_mem = 64MB
-max_wal_size = 1GB
+shared_buffers = 8GB              # ~20% of 40GB
+effective_cache_size = 24GB       # ~60% of 40GB
+work_mem = 256MB                  # 40GB / (2 * 15 threads), rounded down
+maintenance_work_mem = 2GB
+max_wal_size = 4GB
+wal_buffers = 64MB
 synchronous_commit = off
 ```
+
+`synchronous_commit = off` is a fixed recommendation regardless of hardware
+— it trades some durability (a crash can lose the last few commits) for
+significantly faster bulk-load throughput, which is an easy trade during a
+from-scratch import you can just re-run if interrupted.
 
 The importer automatically disables `autovacuum` at startup and re-enables
 it after `VACUUM ANALYZE` completes — you do not need to manage this manually.

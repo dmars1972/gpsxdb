@@ -63,6 +63,15 @@ public:
     // safe to call concurrently with select() (but not with insert()/merge()).
     void forEachPopulated(const std::function<void(int64_t id, double lon_m, double lat_m)>& fn) const;
 
+    // Same as forEachPopulated, but bounded to bitmap byte range
+    // [byte_start, byte_end) — i.e. id range [byte_start*8, byte_end*8).
+    // Lets independent threads each scan a disjoint slice concurrently
+    // (read-only mmap access, same thread-safety guarantee as
+    // forEachPopulated above); ids within each thread's slice are still
+    // visited in ascending order.
+    void forEachPopulatedRange(size_t byte_start, size_t byte_end,
+                               const std::function<void(int64_t id, double lon_m, double lat_m)>& fn) const;
+
     // Zero out a node entry (used by delta deletes)
     void remove(int64_t id);
 

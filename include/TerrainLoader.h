@@ -1,6 +1,7 @@
 #pragma once
 #include <string>
 #include "DbClient.h"
+#include "Regions.h"
 
 // USGS3DEP: US + territories only, 1 arc-second (~30m), NAD83 (EPSG:4269),
 // tiles named by NW corner (see the tile-naming comment in TerrainLoader.cpp).
@@ -38,6 +39,11 @@ public:
     // dest_srid: 3857 (Web Mercator, default) or 4326 (WGS84).
     // threads: worker-thread count for parallel tile download/load batches.
     // verbose: when true, prints download/load progress to stdout.
+    // skip_bbox: when non-null, any candidate tile cell falling entirely
+    // inside it is dropped before download (a simple bbox-vs-tile-cell
+    // check, not a polygon operation) — used by loadGlobal() to carve
+    // CONUS (kConusBbox, see Regions.h) out of the north_america region's
+    // Copernicus sweep, since 3DEP already covers it at higher accuracy.
     //
     // Returns false if no tile could be downloaded/loaded at all. Partial
     // coverage (some tiles missing, e.g. bbox extends past the source's edge)
@@ -47,19 +53,17 @@ public:
               TerrainSource source = TerrainSource::USGS3DEP,
               int dest_srid = 3857,
               int threads = 4,
-              bool verbose = true);
+              bool verbose = true,
+              const Bbox* skip_bbox = nullptr);
 
     // Loads Copernicus DEM GLO-30 for every populated non-US region on the
-    // planet, in one call — the same 19 named region bboxes previously split
-    // across load_copernicus_regions.sh (Canada/Mexico/Central America/
-    // Caribbean), load_copernicus_global_rest.sh (South America, Europe,
-    // Africa, Middle East, Asia, Russia, Oceania/Australia), and
-    // load_copernicus_final.sh (northern Canada, Alaska, Greenland, Svalbard/
-    // high-Arctic, Pacific islands crossing the antimeridian), now embedded
-    // directly rather than orchestrated via three separate shell scripts.
-    // Deliberately excludes the continental US (3DEP is authoritative there —
-    // load that separately with source USGS3DEP) and Antarctica (minimal
-    // Copernicus coverage, no permanent civil GA population).
+    // planet, in one call — the natural-boundary region list in Regions.h
+    // (see tools/prepare_regions.py for how it was derived). Deliberately
+    // excludes the continental US within the north_america region (3DEP is
+    // authoritative there — load that separately with source USGS3DEP; see
+    // kConusBbox in Regions.h, applied as load()'s skip_bbox for exactly the
+    // north_america entry) and Antarctica (minimal Copernicus coverage, no
+    // permanent civil GA population).
     //
     // Returns false only if every single region failed to load anything
     // (a fully-connected run will normally return true even if a handful of

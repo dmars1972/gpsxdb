@@ -54,9 +54,10 @@ int main(int argc, char** argv) {
                          "                     [--threads <n>, default 4]\n"
                          "\n"
                          "  --global loads Copernicus DEM GLO-30 for every populated non-US region\n"
-                         "  on the planet in one call (19 regions covering everywhere except the\n"
-                         "  continental US -- 3DEP is authoritative there, load separately with\n"
-                         "  --source 3dep -- and Antarctica). Ignores --bbox and --source.\n"
+                         "  on the planet in one call (natural-boundary regions, see Regions.h --\n"
+                         "  covers everywhere except the continental US -- 3DEP is authoritative\n"
+                         "  there, load separately with --source 3dep -- and Antarctica). Ignores\n"
+                         "  --bbox and --source.\n"
                          "\n"
                          "Requires ~/.pgpass for authentication.\n";
             std::cout.flush();

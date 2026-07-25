@@ -27,6 +27,10 @@ nohup.out
 # Scratch/temp directory
 /tmp/
 
+# One-time region polygon data-prep (venv + raw Natural Earth download)
+tools/.venv/
+tools/data_raw/
+
 # Editor artifacts
 .vscode/
 .idea/

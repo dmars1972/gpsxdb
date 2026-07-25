@@ -457,9 +457,15 @@ std::optional<std::pair<double,double>> OSMMMap::select(int64_t id) const {
 }
 
 void OSMMMap::forEachPopulated(const std::function<void(int64_t, double, double)>& fn) const {
+    forEachPopulatedRange(0, merged_bm_size_, fn);
+}
+
+void OSMMMap::forEachPopulatedRange(size_t byte_start, size_t byte_end,
+                                    const std::function<void(int64_t, double, double)>& fn) const {
     const uint8_t* bm = static_cast<const uint8_t*>(merged_bm_map_);
     const uint8_t* data = static_cast<const uint8_t*>(merged_map_);
-    for (size_t byte = 0; byte < merged_bm_size_; ++byte) {
+    byte_end = std::min(byte_end, merged_bm_size_);
+    for (size_t byte = byte_start; byte < byte_end; ++byte) {
         uint8_t b = bm[byte];
         if (b == 0) continue;  // whole byte (8 ids) unpopulated — skip fast
         for (int bit = 0; bit < 8; ++bit) {

@@ -104,8 +104,14 @@ constexpr double kFeetPerMeter = 3.28084;
 
 bool TerrainLoader::load(double min_lon, double min_lat, double max_lon, double max_lat,
                          TerrainSource source, int dest_srid,
-                         int threads, bool verbose) {
+                         int threads, bool verbose, const Bbox* skip_bbox) {
     auto tiles = tilesForBBox(source, min_lon, min_lat, max_lon, max_lat);
+    if (skip_bbox) {
+        tiles.erase(std::remove_if(tiles.begin(), tiles.end(), [&](const Tile& t) {
+            return t.lon >= skip_bbox->min_lon && t.lon + 1 <= skip_bbox->max_lon &&
+                   t.lat >= skip_bbox->min_lat && t.lat + 1 <= skip_bbox->max_lat;
+        }), tiles.end());
+    }
     if (tiles.empty()) {
         std::cerr << "[Terrain] bounding box produced no tiles\n";
         return false;
@@ -438,16 +444,18 @@ bool TerrainLoader::load(double min_lon, double min_lat, double max_lon, double 
 bool TerrainLoader::loadGlobal(int dest_srid, int threads, bool verbose) {
     bool any_loaded = false;
     for (const auto& r : kGlobalRegions) {
-        // 3DEP is authoritative for the continental US and is loaded
-        // separately (see main.cpp's dedicated TerrainSource::USGS3DEP
-        // call) — skip it here to avoid loading lower-accuracy Copernicus
-        // coverage over the same area.
-        if (std::string(r.name) == "united_states") continue;
+        // north_america now includes CONUS (folded in during the natural-
+        // boundary region consolidation) alongside Canada/Mexico/Central
+        // America/Caribbean/Alaska/Greenland, which still need Copernicus —
+        // so the old whole-region skip no longer works. Skip only the
+        // CONUS tile cells (kConusBbox, 3DEP is authoritative there) at the
+        // tile level instead, via load()'s skip_bbox.
+        const Bbox* skip = (std::string(r.name) == "north_america") ? &kConusBbox : nullptr;
         if (verbose)
             std::cout << "[Terrain] === " << r.name << " (" << r.min_lon << "," << r.min_lat
                       << "," << r.max_lon << "," << r.max_lat << ") ===\n";
         bool ok = load(r.min_lon, r.min_lat, r.max_lon, r.max_lat,
-                       TerrainSource::CopernicusGLO30, dest_srid, threads, verbose);
+                       TerrainSource::CopernicusGLO30, dest_srid, threads, verbose, skip);
         any_loaded = any_loaded || ok;
         if (verbose)
             std::cout << "[Terrain] " << r.name << ": " << (ok ? "OK" : "FAILED (no tiles loaded)") << "\n";

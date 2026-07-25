@@ -10,9 +10,11 @@ airspace (FAA class/special-use in the US, OpenAIP everywhere else), WMM
 magnetic declination, nearby roads (ways), and nearby land-use areas
 (areas). Cross-checks WMM declination against pygeomag (an independent
 NOAA WMM implementation, not this project's own WMMLoader.cpp) and a
-handful of stable, well-known public facts (see GOLDEN_FACTS below) so a
-future bad import/regression has a chance of being caught even without a
-human eyeballing the SQL results.
+handful of stable, well-known public facts (see GOLDEN_FACTS below) --
+including, for a couple of landmarks, that the *identity* of the nearest
+airport we report matches independent research (not just a numeric
+elevation/length tolerance check) -- so a future bad import/regression has
+a chance of being caught even without a human eyeballing the SQL results.
 
 Meant to be rerun occasionally after a fresh import (or on a schedule),
 not part of the build. Writes an HTML report; pass --json to also dump
@@ -304,7 +306,308 @@ GOLDEN_FACTS = [
         # across different sources/neighborhoods, not just DEM imprecision.
         "tolerance": 50,
     },
+    # ---- Nearest-airport identity checks ----
+    # nearest_airport (see query_point()) has no type filter -- it's the
+    # single closest row in the whole `airports` table by raw distance,
+    # heliports/seaplane bases and all, not "the airport you'd fly into for
+    # this city". That makes it genuinely easy to get wrong by memory or by
+    # trusting a generic travel-site "nearest airport" answer, which almost
+    # always means "nearest airport with scheduled service" instead -- e.g.
+    # a naive check would expect Paris Le Bourget (LFPB, ~16km) for the
+    # Eiffel Tower, but the actual closest OurAirports entry by distance is
+    # a heliport 3-4km away. Verified here via live web search against each
+    # candidate's own OurAirports listing (not recalled from memory), and
+    # deliberately narrower in scope than the numeric facts above -- only
+    # added for landmarks where the closest-by-raw-distance answer could be
+    # confirmed with real confidence. (Golden Gate Bridge and the Statue of
+    # Liberty were both considered and dropped: the former has a
+    # since-1974-closed former Army airfield nearby whose presence/type in
+    # OurAirports couldn't be confirmed, and the latter's nearest heliport
+    # candidate distance couldn't be pinned down precisely enough -- a
+    # wrong guess here would be worse than no check at all, same principle
+    # as the numeric facts above.)
+    {
+        "title": "Nearest airport to the Eiffel Tower (by raw distance, any type)",
+        "check": lambda pts: pts["Eiffel Tower, Paris"]["nearest_airport"]["ident"] if pts["Eiffel Tower, Paris"]["nearest_airport"] else None,
+        "kind": "ident",
+        # Paris Issy-les-Moulineaux Heliport -- an active, OurAirports-listed
+        # heliport ~3-4km from the tower, well inside Le Bourget's ~16km
+        # (the answer a naive "nearest major airport" search would give).
+        "public_value": "LFPI",
+    },
+    {
+        "title": "Nearest airport to the Sydney Opera House (by raw distance, any type)",
+        "check": lambda pts: pts["Sydney Opera House"]["nearest_airport"]["ident"] if pts["Sydney Opera House"]["nearest_airport"] else None,
+        "kind": "ident",
+        # Rose Bay Seaplane Base -- an active, OurAirports-listed water
+        # aerodrome a few km from the Opera House, well inside Sydney
+        # Kingsford Smith's (SYD) ~9.8km (the "obvious" airport-code answer).
+        "public_value": "RSE",
+    },
 ]
+
+# ---- Structural / referential-integrity checks (not per-point) ----
+# Run once against the whole database rather than per sampled point --
+# these check the database's own internal consistency and known
+# regression classes this project has actually hit, so (unlike
+# GOLDEN_FACTS) no external ground truth is needed: a mismatch here is
+# unambiguously a bug, not a matter of interpretation.
+
+# Every parent+child tag-table pair in the schema (see NavDB.h) -- a
+# tags row whose parent id doesn't exist is orphaned (e.g. a
+# DeltaApplier bug where a delete cleaned up one table but not the
+# other), and a parent row with zero tags rows isn't itself a problem
+# (untagged geometry is normal) so this only checks the orphan
+# direction, not the reverse.
+REFERENTIAL_INTEGRITY_PAIRS = [
+    ("way_tags", "ways"),
+    ("area_tags", "areas"),
+    ("road_tags", "roads"),
+    ("relation_tags", "relations"),
+    ("node_tags", "nodes"),
+]
+
+# Rough sanity floor/ceiling on total row counts -- meant to catch a
+# catastrophically incomplete import (died partway through, a `-R`
+# resume that silently skipped a phase) even if the point-sampling
+# checks above happen to still land on real data, not to precisely
+# bound normal variation. `ways` bounds are grounded in this database's
+# own last observed full-planet count (~353M as of 2026-07); the others
+# don't have as solid a historical baseline from this project
+# specifically, so they're deliberately much wider (order-of-magnitude
+# "not essentially empty" floors) rather than tuned ranges -- tighten
+# them once a few more real full-planet counts have been observed.
+ROW_COUNT_BOUNDS = {
+    "ways":      (150_000_000, 700_000_000),
+    "areas":     (20_000_000, 500_000_000),
+    "relations": (1_000_000, 50_000_000),
+    "roads":     (5_000_000, 150_000_000),
+    "nodes":     (20_000_000, 1_000_000_000),  # tagged nodes only, not nodes.dat's ~10.7B populated coordinates
+}
+
+# elevation_at_point_ft() coverage spot-checks (see TerrainLoader.cpp),
+# split by which DEM source should cover each point -- 3DEP is US +
+# territories only, Copernicus DEM GLO-30 is everywhere else. Plain city
+# centers/well-known flat land points, deliberately not extreme
+# peaks/depressions (already covered by the GOLDEN_FACTS elevation
+# facts) -- these only check that a value exists at all, not what it is,
+# so the only failure mode being tested for is a coverage gap (this
+# project has hit one for real before -- see the code comment on
+# nl_lowest/cdmx_zocalo above).
+TERRAIN_COVERAGE_POINTS = [
+    ("3DEP (US)", 38.9717, -95.2353, "Lawrence, KS (flat prairie)"),
+    ("3DEP (US)", 39.9612, -82.9988, "Columbus, OH"),
+    ("3DEP (US)", 45.5152, -122.6784, "Portland, OR"),
+    ("Copernicus (non-US)", 51.5072, -0.1276, "London, UK"),
+    ("Copernicus (non-US)", -1.2921, 36.8219, "Nairobi, Kenya"),
+    ("Copernicus (non-US)", 13.7563, 100.5018, "Bangkok, Thailand"),
+]
+
+# external_data_state.checked_at staleness thresholds, matching each
+# source's own documented refresh cadence in Replicator.cpp (with slack)
+# -- these are INFORMATIONAL (reported, not counted toward the hard
+# pass/fail exit code, and via run_staleness_checks() specifically kept
+# separate from run_structural_checks()): a poll process legitimately
+# stopped for maintenance (e.g. a fresh reimport in progress) makes every
+# one of these "stale" without anything actually being wrong, so this
+# isn't a fact about correctness the way the structural checks are.
+STALENESS_THRESHOLDS_HOURS = {
+    "osm": 6,            # minutely poll; a few missed cycles is still fine
+    "wmm": 24 * 120,      # ~3-month cadence, +30 days slack
+    "airspace": 24 * 45,  # ~1-month cadence, +2 weeks slack
+    "airports": 30,       # 6-hour check cadence, generous slack
+    "faa_obstacles": 30,
+}
+
+
+def read_regional_node_map_header(path):
+    """Reads just the 64-byte header of a RegionalNodeMap file (see
+    include/RegionalNodeMap.h) without touching the (potentially huge)
+    records that follow. Returns None if the file doesn't exist or
+    doesn't look like a RegionalNodeMap file at all (wrong magic)."""
+    import os
+    import struct
+    if not os.path.exists(path):
+        return None
+    with open(path, "rb") as f:
+        header = f.read(64)
+    if len(header) < 64 or header[0:8] != b"GPSXRNM1":
+        return None
+    version, = struct.unpack_from("<I", header, 8)
+    record_count, = struct.unpack_from("<Q", header, 12)
+    region_name = header[20:44].rstrip(b"\x00").decode("utf-8", errors="replace")
+    min_lon, min_lat, max_lon, max_lat = struct.unpack_from("<4f", header, 44)
+    created_at, = struct.unpack_from("<I", header, 60)
+    return {"version": version, "record_count": record_count, "region_name": region_name,
+            "bbox": (min_lon, min_lat, max_lon, max_lat), "created_at": created_at}
+
+
+def run_structural_checks(cur, region_names=None, nodes_file=None):
+    """Whole-database structural checks -- see the module comments above
+    each constant for what's being verified and why. Returns a list of
+    {title, pass, detail} dicts; contributes to the hard pass/fail exit
+    code (unlike run_staleness_checks()).
+
+    region_names: non-empty for a regional install (see
+    run_regional_checks()/public.installed_regions) -- the row-count
+    bounds, MultiPolygon floor, and fixed terrain-coverage points below
+    are all tuned for full-planet scale and don't translate to an
+    arbitrary region's much smaller data, so those are skipped and two
+    region-specific checks (membership, node-file sanity) run instead."""
+    results = []
+
+    # -- Referential integrity: no orphaned tag rows -- applies regardless
+    # of global vs. regional scope, so this always runs.
+    for child, parent in REFERENTIAL_INTEGRITY_PAIRS:
+        cur.execute(f"""
+            SELECT count(*) FROM {child} c
+            WHERE NOT EXISTS (SELECT 1 FROM {parent} p WHERE p.id = c.id)
+        """)
+        orphans = cur.fetchone()[0]
+        results.append({
+            "title": f"No orphaned {child} rows (parent {parent} missing)",
+            "pass": orphans == 0,
+            "detail": "0 orphaned rows" if orphans == 0 else f"{orphans} orphaned {child} row(s) with no matching {parent}.id",
+        })
+
+    if not region_names:
+        # -- Row-count sanity bounds --
+        for table, (lo, hi) in ROW_COUNT_BOUNDS.items():
+            cur.execute(f"SELECT count(*) FROM {table}")
+            n = cur.fetchone()[0]
+            ok = lo <= n <= hi
+            results.append({
+                "title": f"{table} row count within sanity bounds",
+                "pass": ok,
+                "detail": f"{n:,} rows (expected {lo:,}-{hi:,})",
+            })
+
+        # -- MultiPolygon presence (regression check for the WkbDecode
+        # type-6 gap this project hit in production: 764K areas rows,
+        # 0.3% of the table, silently excluded from every regional export
+        # before the fix -- see WkbDecode.h's own comment on why type 6
+        # was added). Areas from multipolygon relations use synthetic
+        # negative ids (see NavDB.cpp), so this counts negative-id areas
+        # whose geometry is genuinely a MultiPolygon (ST_NumGeometries >
+        # 1, not just a single-part polygon that happens to be typed
+        # MultiPolygon) -- floor of 10,000 is well below the ~764K
+        # historically affected, wide margin for genuine data variation,
+        # but far enough above zero to catch "this class of geometry
+        # silently isn't decoding again". Full-planet-scale only -- an
+        # arbitrary region could have anywhere from zero to millions of
+        # multipolygon relations, no floor here would be meaningful.
+        cur.execute("""
+            SELECT count(*) FROM areas
+            WHERE id < 0 AND ST_GeometryType(geog) = 'ST_MultiPolygon' AND ST_NumGeometries(geog) > 1
+        """)
+        multipolygon_count = cur.fetchone()[0]
+        results.append({
+            "title": "MultiPolygon relation areas present (WkbDecode type-6 regression check)",
+            "pass": multipolygon_count >= 10_000,
+            "detail": f"{multipolygon_count:,} genuine multi-part areas from relations (expected >= 10,000)",
+        })
+
+        # -- Terrain coverage -- fixed global points, not meaningful for a
+        # regional install (which only has terrain loaded for its own
+        # area, so these would legitimately show no coverage).
+        for source, lat, lon, label in TERRAIN_COVERAGE_POINTS:
+            cur.execute("SELECT elevation_at_point_ft(%s, %s)", (lon, lat))
+            elev = cur.fetchone()[0]
+            results.append({
+                "title": f"Terrain coverage: {label} ({source})",
+                "pass": elev is not None,
+                "detail": f"{elev} ft" if elev is not None else "NULL -- no DEM coverage at this point",
+            })
+    else:
+        # -- Region membership: every row in ways/areas should intersect
+        # SOME registered region's polygon. Uses ST_Intersects (not
+        # ST_Within) to match the actual export-time inclusion criterion
+        # (see RegionIndex.h) -- a way legitimately straddling a region
+        # border is correctly included without being fully inside it, so
+        # ST_Within would produce false failures for exactly the
+        # border-crossing case task #35's whole "fix at the source" effort
+        # was about. ORDER BY random() LIMIT is a real cost on a huge
+        # table but this tool is explicitly "meant to be rerun
+        # occasionally... not part of the build" -- favoring a simple,
+        # obviously-correct query here over a cheaper but subtler one
+        # (e.g. TABLESAMPLE, which can return zero rows by chance on a
+        # small table) is the right trade for an occasional QA tool.
+        for table in ("ways", "areas"):
+            cur.execute(f"""
+                WITH region_union AS (
+                    SELECT ST_Union(ST_Transform(ST_SetSRID(ST_GeomFromText(wkt), 4326), 3857)) AS geom
+                    FROM installed_regions
+                ),
+                sample AS (
+                    SELECT geog FROM {table} WHERE geog IS NOT NULL ORDER BY random() LIMIT 2000
+                )
+                SELECT count(*), count(*) FILTER (WHERE NOT ST_Intersects(sample.geog, region_union.geom))
+                FROM sample, region_union
+            """)
+            total, violations = cur.fetchone()
+            results.append({
+                "title": f"{table}: sampled rows fall within an installed region ({', '.join(region_names)})",
+                "pass": total == 0 or violations == 0,
+                "detail": (f"no rows to sample" if total == 0 else
+                           f"{violations}/{total} sampled row(s) don't intersect any installed region polygon"),
+            })
+
+        # -- RegionalNodeMap sanity: the node coordinate file should be
+        # non-empty and roughly proportional to the region's own table
+        # sizes. No precise expected ratio is established (every way has
+        # a different vertex count, and the file is deliberately widened
+        # beyond just this region's own nodes -- see RegionalDeltaApplier's
+        # top-of-file comment), so this is a deliberately loose floor:
+        # only catches "the file is basically empty/truncated", not a
+        # precise correctness check.
+        if nodes_file is None:
+            results.append({
+                "title": "RegionalNodeMap sanity",
+                "pass": True,
+                "detail": "skipped -- no --nodes-file given",
+            })
+        else:
+            header = read_regional_node_map_header(nodes_file)
+            if header is None:
+                results.append({
+                    "title": "RegionalNodeMap sanity",
+                    "pass": False,
+                    "detail": f"{nodes_file} not found or not a valid RegionalNodeMap file (bad magic)",
+                })
+            else:
+                cur.execute("SELECT (SELECT count(*) FROM ways) + (SELECT count(*) FROM areas)")
+                table_rows = cur.fetchone()[0]
+                ok = header["record_count"] > 0 and header["record_count"] >= table_rows * 0.5
+                results.append({
+                    "title": "RegionalNodeMap sanity",
+                    "pass": ok,
+                    "detail": f"{header['record_count']:,} node record(s) in {nodes_file} vs. "
+                              f"{table_rows:,} ways+areas rows (expect node records to be at least half that)",
+                })
+
+    return results
+
+
+def run_staleness_checks(cur):
+    """external_data_state freshness -- informational only, see
+    STALENESS_THRESHOLDS_HOURS' comment for why this doesn't affect the
+    hard pass/fail exit code."""
+    results = []
+    for name, max_hours in STALENESS_THRESHOLDS_HOURS.items():
+        cur.execute("SELECT value, checked_at, EXTRACT(EPOCH FROM (now() - checked_at)) / 3600.0 "
+                    "FROM external_data_state WHERE name = %s", (name,))
+        row = cur.fetchone()
+        if not row:
+            results.append({"title": name, "fresh": False, "detail": "no external_data_state row -- never checked"})
+            continue
+        value, checked_at, age_hours = row
+        fresh = age_hours is not None and age_hours <= max_hours
+        results.append({
+            "title": name,
+            "fresh": fresh,
+            "detail": f"checked_at={checked_at} ({age_hours:.1f}h ago, threshold {max_hours}h), value={value}",
+        })
+    return results
 
 
 def declination(gm, year, lat, lon):
@@ -335,49 +638,60 @@ def _sample_lat(rng, min_lat, max_lat):
     return math.degrees(math.asin(rng.uniform(s_min, s_max)))
 
 
-def build_points(cur, n_random, seed):
+def build_points(cur, n_random, seed, region_bbox=None):
+    """region_bbox: (min_lon, min_lat, max_lon, max_lat) -- when given (a
+    regional install, see run_regional_checks()), the global fixed points
+    (MAJOR_AIRPORT_IDENTS, minor airports, LANDMARKS) are skipped entirely
+    -- they're essentially guaranteed to fall outside a single installed
+    region and would just clutter the report with "no coverage" noise --
+    and random sampling is restricted to this bbox instead of WORLD_BBOX.
+    """
     points = []
 
-    cur.execute(
-        """
-        SELECT ident, name,
-               ST_X(ST_Transform(ST_SetSRID(geog,3857),4326)),
-               ST_Y(ST_Transform(ST_SetSRID(geog,3857),4326))
-        FROM airports WHERE ident = ANY(%s)
-        """,
-        (MAJOR_AIRPORT_IDENTS,),
-    )
-    for ident, name, lon, lat in cur.fetchall():
-        points.append({"lat": lat, "lon": lon, "kind": "major_airport", "label": f"{ident} {name}"})
+    if region_bbox is None:
+        cur.execute(
+            """
+            SELECT ident, name,
+                   ST_X(ST_Transform(ST_SetSRID(geog,3857),4326)),
+                   ST_Y(ST_Transform(ST_SetSRID(geog,3857),4326))
+            FROM airports WHERE ident = ANY(%s)
+            """,
+            (MAJOR_AIRPORT_IDENTS,),
+        )
+        for ident, name, lon, lat in cur.fetchall():
+            points.append({"lat": lat, "lon": lon, "kind": "major_airport", "label": f"{ident} {name}"})
 
-    cur.execute(
-        """
-        SELECT ident, name,
-               ST_X(ST_Transform(ST_SetSRID(geog,3857),4326)),
-               ST_Y(ST_Transform(ST_SetSRID(geog,3857),4326))
-        FROM airports
-        WHERE type='small_airport' AND iso_country='US' AND ident ~ '^K[A-Z0-9]{3}$'
-        ORDER BY random() LIMIT 5
-        """
-    )
-    for ident, name, lon, lat in cur.fetchall():
-        points.append({"lat": lat, "lon": lon, "kind": "minor_airport", "label": f"{ident} {name}"})
+        cur.execute(
+            """
+            SELECT ident, name,
+                   ST_X(ST_Transform(ST_SetSRID(geog,3857),4326)),
+                   ST_Y(ST_Transform(ST_SetSRID(geog,3857),4326))
+            FROM airports
+            WHERE type='small_airport' AND iso_country='US' AND ident ~ '^K[A-Z0-9]{3}$'
+            ORDER BY random() LIMIT 5
+            """
+        )
+        for ident, name, lon, lat in cur.fetchall():
+            points.append({"lat": lat, "lon": lon, "kind": "minor_airport", "label": f"{ident} {name}"})
 
-    for lat, lon, label in LANDMARKS:
-        points.append({"lat": lat, "lon": lon, "kind": "landmark", "label": label})
+        for lat, lon, label in LANDMARKS:
+            points.append({"lat": lat, "lon": lon, "kind": "landmark", "label": label})
 
+    bbox = region_bbox if region_bbox is not None else WORLD_BBOX
     rng = random.Random(seed)
     attempts = 0
     target = len(points) + n_random
     # Global hit-rate (land + OSM way coverage) is much lower than the
     # original CONUS-only version's (~100%, CONUS is essentially fully
     # OSM-mapped) -- oceans, ice caps, and remote unmapped land all
-    # reject. 300x gives generous headroom before giving up early.
+    # reject. 300x gives generous headroom before giving up early. A
+    # region_bbox has a much smaller/denser search space than the whole
+    # world, so the same multiplier is if anything more generous there.
     max_attempts = n_random * 300
     while len(points) < target and attempts < max_attempts:
         attempts += 1
-        lon = rng.uniform(WORLD_BBOX[0], WORLD_BBOX[2])
-        lat = _sample_lat(rng, WORLD_BBOX[1], WORLD_BBOX[3])
+        lon = rng.uniform(bbox[0], bbox[2])
+        lat = _sample_lat(rng, bbox[1], bbox[3])
         cur.execute(
             """
             SELECT count(*) FROM ways
@@ -558,7 +872,7 @@ def select_table_rows(results, max_rows):
     return shown, len(randoms) - len(shown_randoms)
 
 
-def render_html(results, golden_results, mean_diff, max_diff, max_table_rows):
+def render_html(results, golden_results, structural_results, staleness_results, mean_diff, max_diff, max_table_rows):
     def fmt_airspace(row):
         parts = []
         seen = set()
@@ -615,14 +929,41 @@ def render_html(results, golden_results, mean_diff, max_diff, max_table_rows):
     for g in golden_results:
         v = "match" if g["pass"] else "fail"
         vlabel = "MATCH" if g["pass"] else "MISMATCH"
+        tolerance_suffix = f" (&plusmn;{g['tolerance']})" if g["tolerance"] is not None else ""
         golden_html.append(f"""
         <div class="spot-card">
           <div class="spot-head">
             <span class="spot-verdict spot-{v}">{vlabel}</span>
             <h3>{esc(g['title'])}</h3>
           </div>
-          <div class="spot-row"><span class="spot-k">Our data</span><span class="spot-v mono">{g['actual']} {g['unit']}</span></div>
-          <div class="spot-row"><span class="spot-k">Public record</span><span class="spot-v mono">{g['public_value']} {g['unit']} (&plusmn;{g['tolerance']})</span></div>
+          <div class="spot-row"><span class="spot-k">Our data</span><span class="spot-v mono">{esc(str(g['actual']))} {g['unit']}</span></div>
+          <div class="spot-row"><span class="spot-k">Public record</span><span class="spot-v mono">{esc(str(g['public_value']))} {g['unit']}{tolerance_suffix}</span></div>
+        </div>""")
+
+    structural_html = []
+    for s in structural_results:
+        v = "match" if s["pass"] else "fail"
+        vlabel = "PASS" if s["pass"] else "FAIL"
+        structural_html.append(f"""
+        <div class="spot-card">
+          <div class="spot-head">
+            <span class="spot-verdict spot-{v}">{vlabel}</span>
+            <h3>{esc(s['title'])}</h3>
+          </div>
+          <div class="spot-row"><span class="spot-k">Detail</span><span class="spot-v mono">{esc(s['detail'])}</span></div>
+        </div>""")
+
+    staleness_html = []
+    for s in staleness_results:
+        v = "match" if s["fresh"] else "fail"
+        vlabel = "FRESH" if s["fresh"] else "STALE"
+        staleness_html.append(f"""
+        <div class="spot-card">
+          <div class="spot-head">
+            <span class="spot-verdict spot-{v}">{vlabel}</span>
+            <h3>{esc(s['title'])}</h3>
+          </div>
+          <div class="spot-row"><span class="spot-k">Detail</span><span class="spot-v mono">{esc(s['detail'])}</span></div>
         </div>""")
 
     major = [r for r in results if r["kind"] == "major_airport"]
@@ -632,6 +973,8 @@ def render_html(results, golden_results, mean_diff, max_diff, max_table_rows):
     class_b = sum(1 for r in major if any(a["class"] == "B" for a in r["class_airspace"]))
     no_class = sum(1 for r in results if not r["class_airspace"] and not r.get("intl_airspace"))
     golden_pass = sum(1 for g in golden_results if g["pass"])
+    structural_pass = sum(1 for s in structural_results if s["pass"])
+    staleness_fresh = sum(1 for s in staleness_results if s["fresh"])
 
     region_counts = {}
     for r in random_pts:
@@ -745,12 +1088,28 @@ footer {{ color: var(--text-muted); font-size: 0.8rem; border-top: 1px solid var
     <div class="stat"><span class="n">{max_diff:.3f}&deg;</span><span class="lbl">Max WMM deviation</span></div>
     <div class="stat"><span class="n">{no_class}</span><span class="lbl">Points correctly uncharted (Class G)</span></div>
     <div class="stat"><span class="n">{golden_pass} / {len(golden_results)}</span><span class="lbl">Golden-fact checks passed</span></div>
+    <div class="stat"><span class="n">{structural_pass} / {len(structural_results)}</span><span class="lbl">Structural checks passed</span></div>
+    <div class="stat"><span class="n">{staleness_fresh} / {len(staleness_results)}</span><span class="lbl">External data fresh</span></div>
     {region_stats_html}
   </div>
   <section>
     <h2>Golden-fact checks</h2>
     <div class="spot-grid">
       {"".join(golden_html)}
+    </div>
+  </section>
+  <section>
+    <h2>Structural checks</h2>
+    <p class="muted small">Whole-database checks, not tied to a sampled point -- referential integrity, row-count sanity, MultiPolygon regression coverage, and terrain DEM coverage. Contributes to this run's pass/fail exit code.</p>
+    <div class="spot-grid">
+      {"".join(structural_html)}
+    </div>
+  </section>
+  <section>
+    <h2>External data staleness</h2>
+    <p class="muted small">Informational only -- does not affect this run's pass/fail exit code. A poll process intentionally stopped for maintenance (e.g. a fresh reimport in progress) will show every source as stale here without anything being wrong.</p>
+    <div class="spot-grid">
+      {"".join(staleness_html)}
     </div>
   </section>
   <section>
@@ -799,6 +1158,7 @@ def main():
     ap.add_argument("--max-table-rows", type=int, default=500, help="cap on individual rows rendered in the HTML table (default 500); fixed points always shown in full, random points prioritized by interestingness then subsampled -- full data is always in --json regardless")
     ap.add_argument("-o", "--output", default="dq_report.html")
     ap.add_argument("--json", default=None, help="also write raw per-point results as JSON to this path")
+    ap.add_argument("--nodes-file", default=None, help="path to this install's RegionalNodeMap file (see --nodes-file in regional_install.cpp) -- only used for the RegionalNodeMap sanity check on a regional install; ignored against the master database")
     args = ap.parse_args()
 
     import time as _time
@@ -814,7 +1174,32 @@ def main():
     cur = conn.cursor()
     gm = GeoMag()  # defaults to the bundled current WMM coefficients
 
-    points, attempts = build_points(cur, args.n_random, args.seed)
+    # Auto-detect a regional install exactly like RegionalDeltaApplier does
+    # (see main.cpp's runDelta()) -- any rows in public.installed_regions
+    # mean this is a region-scoped database, not the master planet DB.
+    # Tolerant of the table not existing at all (a master DB created before
+    # this table was added), matching NavDB::loadInstalledRegions()'s own
+    # fallback behavior.
+    region_names = []
+    region_bbox = None
+    try:
+        cur.execute("SELECT name, min_lon, min_lat, max_lon, max_lat FROM installed_regions")
+        rows = cur.fetchall()
+        if rows:
+            region_names = [r[0] for r in rows]
+            region_bbox = (
+                min(r[1] for r in rows), min(r[2] for r in rows),
+                max(r[3] for r in rows), max(r[4] for r in rows),
+            )
+    except Exception:
+        conn.rollback()  # failed SELECT leaves the (autocommit-off-during-txn) connection in a bad state otherwise
+
+    if region_names:
+        print(f"Regional install detected: {', '.join(region_names)} -- restricting sampling to this region "
+              f"and skipping full-planet-scale checks (golden facts, row-count bounds, MultiPolygon/terrain checks)",
+              file=sys.stderr)
+
+    points, attempts = build_points(cur, args.n_random, args.seed, region_bbox=region_bbox)
     print(f"Checking {len(points)} points ({attempts} attempts to fill random quota)...", file=sys.stderr)
 
     results = []
@@ -828,51 +1213,70 @@ def main():
         if (i + 1) % progress_every == 0:
             print(f"  {i+1}/{len(points)}", file=sys.stderr)
 
-    kvly = next(r for r in results if "KVLY" in r["label"])
-    wtc_area = next(r for r in results if "Statue of Liberty" in r["label"])
-    # Every major_airport point's label is "IDENT Name", so any airport in
-    # MAJOR_AIRPORT_IDENTS is reachable by ident for a GOLDEN_FACTS check
-    # without needing a dedicated next(...) lookup per airport.
-    pts_by_key = {"kvly": kvly, "wtc_area": wtc_area}
-    for r in results:
-        if r["kind"] == "major_airport":
-            pts_by_key[r["label"].split(" ", 1)[0]] = r
-
-    # A few golden facts need data outside the standard per-point query
-    # (run once here rather than adding a runway lookup / raster call to
-    # every one of the thousands of sampled points above).
-    cur.execute("SELECT length_ft FROM runways WHERE airport_ident='KDEN' AND le_ident='16R' AND he_ident='34L'")
-    r = cur.fetchone()
-    pts_by_key["kden_16r34l"] = {"length_ft": r[0] if r else None}
-
-    # Direct raster elevation lookups -- exercises elevation_at_point_ft()
-    # (see TerrainLoader.cpp) independently of the airport/obstacle
-    # point-sampling above, at well-documented, DEM-friendly (flat, stable,
-    # not an extreme peak) ground elevations. Death Valley/Denver were the
-    # first choice here (see GOLDEN_FACTS below) but terrain coverage turns
-    # out to have a real gap over the CONUS interior -- confirmed via a
-    # direct raster query (zero rows in a Colorado bounding box) rather than
-    # assumed, so these two points were picked specifically because they're
-    # in regions already loaded (Mexico, Europe).
-    cur.execute("SELECT elevation_at_point_ft(%s, %s)", (4.6317, 51.9858))
-    pts_by_key["nl_lowest"] = {"elevation_ft": cur.fetchone()[0]}
-    cur.execute("SELECT elevation_at_point_ft(%s, %s)", (-99.13316, 19.43263))
-    pts_by_key["cdmx_zocalo"] = {"elevation_ft": cur.fetchone()[0]}
-
     golden_results = []
     all_golden_pass = True
-    for g in GOLDEN_FACTS:
-        actual = g["check"](pts_by_key)
-        ok = actual is not None and abs(actual - g["public_value"]) <= g["tolerance"]
-        all_golden_pass &= ok
-        golden_results.append({"title": g["title"], "actual": actual, "public_value": g["public_value"],
-                                "unit": g["unit"], "tolerance": g["tolerance"], "pass": ok})
+    # GOLDEN_FACTS are all tied to specific global airports/landmarks that
+    # build_points() doesn't sample at all on a regional install (see
+    # region_bbox above) -- nothing to check them against.
+    if not region_names:
+        kvly = next(r for r in results if "KVLY" in r["label"])
+        wtc_area = next(r for r in results if "Statue of Liberty" in r["label"])
+        # Every major_airport point's label is "IDENT Name", so any airport in
+        # MAJOR_AIRPORT_IDENTS is reachable by ident for a GOLDEN_FACTS check
+        # without needing a dedicated next(...) lookup per airport.
+        pts_by_key = {"kvly": kvly, "wtc_area": wtc_area}
+        for r in results:
+            if r["kind"] == "major_airport":
+                pts_by_key[r["label"].split(" ", 1)[0]] = r
+        # Every point (including every LANDMARKS entry) is also reachable by its
+        # exact label -- needed for the nearest-airport ident checks below,
+        # which reference landmarks by their full LANDMARKS label rather than
+        # a short custom key like "kvly"/"wtc_area".
+        pts_by_key.update(by_label)
+
+        # A few golden facts need data outside the standard per-point query
+        # (run once here rather than adding a runway lookup / raster call to
+        # every one of the thousands of sampled points above).
+        cur.execute("SELECT length_ft FROM runways WHERE airport_ident='KDEN' AND le_ident='16R' AND he_ident='34L'")
+        r = cur.fetchone()
+        pts_by_key["kden_16r34l"] = {"length_ft": r[0] if r else None}
+
+        # Direct raster elevation lookups -- exercises elevation_at_point_ft()
+        # (see TerrainLoader.cpp) independently of the airport/obstacle
+        # point-sampling above, at well-documented, DEM-friendly (flat, stable,
+        # not an extreme peak) ground elevations. Death Valley/Denver were the
+        # first choice here (see GOLDEN_FACTS below) but terrain coverage turns
+        # out to have a real gap over the CONUS interior -- confirmed via a
+        # direct raster query (zero rows in a Colorado bounding box) rather than
+        # assumed, so these two points were picked specifically because they're
+        # in regions already loaded (Mexico, Europe).
+        cur.execute("SELECT elevation_at_point_ft(%s, %s)", (4.6317, 51.9858))
+        pts_by_key["nl_lowest"] = {"elevation_ft": cur.fetchone()[0]}
+        cur.execute("SELECT elevation_at_point_ft(%s, %s)", (-99.13316, 19.43263))
+        pts_by_key["cdmx_zocalo"] = {"elevation_ft": cur.fetchone()[0]}
+
+        for g in GOLDEN_FACTS:
+            actual = g["check"](pts_by_key)
+            if g.get("kind") == "ident":
+                ok = actual is not None and actual == g["public_value"]
+                unit, tolerance = "", None
+            else:
+                ok = actual is not None and abs(actual - g["public_value"]) <= g["tolerance"]
+                unit, tolerance = g["unit"], g["tolerance"]
+            all_golden_pass &= ok
+            golden_results.append({"title": g["title"], "actual": actual, "public_value": g["public_value"],
+                                    "unit": unit, "tolerance": tolerance, "pass": ok})
 
     diffs = [r["wmm"]["diff"] for r in results if r["wmm"]["diff"] is not None]
     mean_diff = sum(diffs) / len(diffs) if diffs else 0.0
     max_diff = max(diffs) if diffs else 0.0
 
-    html = render_html(results, golden_results, mean_diff, max_diff, args.max_table_rows)
+    structural_results = run_structural_checks(cur, region_names=region_names, nodes_file=args.nodes_file)
+    all_structural_pass = all(s["pass"] for s in structural_results)
+    staleness_results = run_staleness_checks(cur)
+
+    html = render_html(results, golden_results, structural_results, staleness_results,
+                        mean_diff, max_diff, args.max_table_rows)
     with open(args.output, "w") as f:
         f.write(html)
     print(f"Wrote {args.output}", file=sys.stderr)
@@ -885,10 +1289,21 @@ def main():
     print(f"\nGolden-fact checks: {sum(g['pass'] for g in golden_results)}/{len(golden_results)} passed", file=sys.stderr)
     for g in golden_results:
         status = "PASS" if g["pass"] else "FAIL"
-        print(f"  [{status}] {g['title']}: {g['actual']} {g['unit']} (public record: {g['public_value']} +/-{g['tolerance']})", file=sys.stderr)
+        tolerance_suffix = f" +/-{g['tolerance']}" if g["tolerance"] is not None else ""
+        print(f"  [{status}] {g['title']}: {g['actual']} {g['unit']} (public record: {g['public_value']}{tolerance_suffix})", file=sys.stderr)
     print(f"WMM: mean |diff|={mean_diff:.3f} deg, max |diff|={max_diff:.3f} deg (vs independent pygeomag model)", file=sys.stderr)
 
-    sys.exit(0 if all_golden_pass else 1)
+    print(f"\nStructural checks: {sum(s['pass'] for s in structural_results)}/{len(structural_results)} passed", file=sys.stderr)
+    for s in structural_results:
+        status = "PASS" if s["pass"] else "FAIL"
+        print(f"  [{status}] {s['title']}: {s['detail']}", file=sys.stderr)
+
+    print(f"\nExternal-data staleness (informational, not counted toward exit code):", file=sys.stderr)
+    for s in staleness_results:
+        status = "FRESH" if s["fresh"] else "STALE"
+        print(f"  [{status}] {s['title']}: {s['detail']}", file=sys.stderr)
+
+    sys.exit(0 if (all_golden_pass and all_structural_pass) else 1)
 
 
 if __name__ == "__main__":
