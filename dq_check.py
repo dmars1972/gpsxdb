@@ -33,6 +33,9 @@ import json
 import math
 import random
 import sys
+import time
+from collections import defaultdict
+from contextlib import contextmanager
 
 import psycopg2
 from pygeomag import GeoMag
@@ -90,12 +93,6 @@ LANDMARKS = [
 # unlike the original CONUS-only version there's no reason to restrict
 # sampling to the US.
 WORLD_BBOX = (-180.0, -85.0, 180.0, 85.0)  # min_lon, min_lat, max_lon, max_lat
-
-# OpenAIP's icao_class integer convention (best-effort -- see
-# include/AirspaceLoader.h; OpenAIP doesn't publish these as named
-# constants anywhere queryable, this mapping is inferred from their
-# public API docs). 8 and any other unlisted value render as "?".
-ICAO_CLASS_LABELS = {0: "A", 1: "B", 2: "C", 3: "D", 4: "E", 5: "F", 6: "G"}
 
 # Very rough continent bucketing for the summary breakdown only -- not
 # meant to be geopolitically precise, just enough to sanity-check that
@@ -381,7 +378,12 @@ ROW_COUNT_BOUNDS = {
     "ways":      (150_000_000, 700_000_000),
     "areas":     (20_000_000, 500_000_000),
     "relations": (1_000_000, 50_000_000),
-    "roads":     (5_000_000, 150_000_000),
+    # "roads" only holds route=road/highway=* RELATIONS promoted via
+    # main.cpp's insertRoad() -- a small curated set, not every tagged
+    # highway way (those stay in "ways" only). Confirmed ~300k is the
+    # correct order of magnitude for this table, not a shortfall -- the
+    # previous bound (5M-150M) wrongly assumed "roads" meant all highways.
+    "roads":     (50_000, 2_000_000),
     "nodes":     (20_000_000, 1_000_000_000),  # tagged nodes only, not nodes.dat's ~10.7B populated coordinates
 }
 
@@ -706,116 +708,118 @@ def build_points(cur, n_random, seed, region_bbox=None):
     return points, attempts
 
 
-def query_point(cur, gm, year, lat, lon):
+@contextmanager
+def _timed(timings, label):
+    """Records one elapsed-time sample for `label` into timings (a label ->
+    list-of-seconds dict) -- used to report per-query-category averages
+    (see --time-report) without changing what query_point returns."""
+    t0 = time.perf_counter()
+    yield
+    if timings is not None:
+        timings[label].append(time.perf_counter() - t0)
+
+
+def query_point(cur, gm, year, lat, lon, timings=None):
     row = {}
 
-    cur.execute(
-        """
-        SELECT ident, name, type, elevation_ft,
-               ST_Distance(ST_SetSRID(geog,3857), ST_Transform(ST_SetSRID(ST_MakePoint(%s,%s),4326),3857)) AS d
-        FROM airports
-        ORDER BY ST_SetSRID(geog,3857) <-> ST_Transform(ST_SetSRID(ST_MakePoint(%s,%s),4326),3857)
-        LIMIT 1
-        """,
-        (lon, lat, lon, lat),
-    )
-    r = cur.fetchone()
+    # This project's own public.* query functions (see AirportsLoader.cpp /
+    # FAAObstacleLoader.cpp / AirspaceLoader.cpp / WMMLoader.cpp) rather than
+    # hand-rolled SQL here -- these are the same functions the consuming app
+    # calls, so dq_check now exercises exactly what production actually
+    # uses instead of a parallel/divergent query path.
+    with _timed(timings, "nearest_airport"):
+        cur.execute("SELECT * FROM nearest_airport(%s, %s)", (lon, lat))
+        r = cur.fetchone()
     row["nearest_airport"] = (
-        {"ident": r[0], "name": r[1], "type": r[2], "elevation_ft": r[3], "dist_km": round(r[4] / 1000, 2)}
+        {"ident": r[0], "name": r[1], "type": r[2], "elevation_ft": r[3], "dist_km": round(r[4], 2)}
         if r else None
     )
 
     # FAA Digital Obstacle File is US + territories only -- zero results
     # elsewhere reflects lack of source data, not a data quality problem.
-    cur.execute(
-        """
-        SELECT count(*), max(amsl_ht), max(agl_ht) FROM faa_obstacles
-        WHERE ST_DWithin(geog, ST_Transform(ST_SetSRID(ST_MakePoint(%s,%s),4326),3857), 9260)
-        """,
-        (lon, lat),
-    )
-    r = cur.fetchone()
+    with _timed(timings, "faa_obstacles"):
+        cur.execute(
+            "SELECT count(*), max(amsl_ht), max(agl_ht) FROM obstacles_nearby(%s, %s)",
+            (lon, lat),
+        )
+        r = cur.fetchone()
     row["obstacles"] = {"count": r[0], "max_amsl_ft": r[1], "max_agl_ft": r[2]}
 
-    cur.execute(
-        """
-        SELECT class, type_code, name FROM class_airspace
-        WHERE ST_Contains(geog, ST_Transform(ST_SetSRID(ST_MakePoint(%s,%s),4326),3857))
-        ORDER BY class LIMIT 5
-        """,
-        (lon, lat),
-    )
-    row["class_airspace"] = [{"class": a, "type": b, "name": c} for a, b, c in cur.fetchall()]
+    # airspace_at_point() unions FAA class/special-use airspace and OpenAIP
+    # international airspace into one call -- split back out by source here
+    # only because render_html's fmt_airspace() renders each source with
+    # slightly different chip styling, not because the query needs it.
+    with _timed(timings, "airspace_at_point"):
+        cur.execute(
+            "SELECT source, class, type, name, country FROM airspace_at_point(%s, %s)",
+            (lon, lat),
+        )
+        airspace_rows = cur.fetchall()
+    row["class_airspace"] = [
+        {"class": a[1], "type": a[2], "name": a[3]} for a in airspace_rows if a[0] == "FAA_CLASS"
+    ][:5]
+    row["sua"] = [
+        {"type": a[2], "name": a[3]} for a in airspace_rows if a[0] == "FAA_SUA"
+    ][:5]
+    # class here is already the decoded ICAO letter (A-G) -- airspace_at_point
+    # does that decode in SQL now, not ICAO_CLASS_LABELS in Python.
+    row["intl_airspace"] = [
+        {"name": a[3], "class": a[1], "country": a[4]} for a in airspace_rows if a[0] == "OPENAIP"
+    ][:5]
 
-    cur.execute(
-        """
-        SELECT type_code, name FROM special_use_airspace
-        WHERE ST_Contains(geog, ST_Transform(ST_SetSRID(ST_MakePoint(%s,%s),4326),3857))
-        LIMIT 5
-        """,
-        (lon, lat),
-    )
-    row["sua"] = [{"type": a, "name": b} for a, b in cur.fetchall()]
-
-    # OpenAIP covers every country except the US (FAA is authoritative
-    # there) -- see include/AirspaceLoader.h. icao_class/type are raw
-    # OpenAIP numeric codes; icao_class is decoded best-effort via
-    # ICAO_CLASS_LABELS, type is shown as-is.
-    cur.execute(
-        """
-        SELECT name, type, icao_class, country FROM international_airspace
-        WHERE ST_Contains(geog, ST_Transform(ST_SetSRID(ST_MakePoint(%s,%s),4326),3857))
-        ORDER BY icao_class LIMIT 5
-        """,
-        (lon, lat),
-    )
-    row["intl_airspace"] = [{"name": a, "type": b, "icao_class": c, "country": d} for a, b, c, d in cur.fetchall()]
-
-    cur.execute(
-        """
-        SELECT ST_Value(rast,1, ST_SetSRID(ST_MakePoint(%s,%s),4326))
-        FROM wmm WHERE ST_Intersects(rast, ST_SetSRID(ST_MakePoint(%s,%s),4326))
-        """,
-        (lon, lat, lon, lat),
-    )
-    r = cur.fetchone()
+    with _timed(timings, "wmm_db_lookup"):
+        cur.execute("SELECT declination_at_point(%s, %s)", (lon, lat))
+        r = cur.fetchone()
     db_decl = r[0] if r else None
-    model_decl = declination(gm, year, lat, lon)
+    with _timed(timings, "wmm_model_calc"):
+        model_decl = declination(gm, year, lat, lon)
     row["wmm"] = {
         "db_declination": round(db_decl, 3) if db_decl is not None else None,
         "model_declination": round(model_decl, 3),
         "diff": round(angle_diff(db_decl, model_decl), 3) if db_decl is not None else None,
     }
 
-    cur.execute(
-        """
-        SELECT name, count(*) FROM ways
-        WHERE ST_DWithin(geog, ST_Transform(ST_SetSRID(ST_MakePoint(%s,%s),4326),3857), 500) AND name IS NOT NULL
-        GROUP BY name ORDER BY count(*) DESC LIMIT 3
-        """,
-        (lon, lat),
-    )
-    row["ways"] = [{"name": a, "n": b} for a, b in cur.fetchall()]
-    cur.execute(
-        "SELECT count(*) FROM ways WHERE ST_DWithin(geog, ST_Transform(ST_SetSRID(ST_MakePoint(%s,%s),4326),3857), 500)",
-        (lon, lat),
-    )
-    row["ways_total"] = cur.fetchone()[0]
+    with _timed(timings, "ways"):
+        cur.execute(
+            """
+            SELECT name, count(*) FROM ways
+            WHERE ST_DWithin(geog, ST_Transform(ST_SetSRID(ST_MakePoint(%s,%s),4326),3857), 500) AND name IS NOT NULL
+            GROUP BY name ORDER BY count(*) DESC LIMIT 3
+            """,
+            (lon, lat),
+        )
+        row["ways"] = [{"name": a, "n": b} for a, b in cur.fetchall()]
+        cur.execute(
+            "SELECT count(*) FROM ways WHERE ST_DWithin(geog, ST_Transform(ST_SetSRID(ST_MakePoint(%s,%s),4326),3857), 500)",
+            (lon, lat),
+        )
+        row["ways_total"] = cur.fetchone()[0]
 
-    cur.execute(
-        """
-        SELECT name, count(*) FROM areas
-        WHERE ST_DWithin(geog, ST_Transform(ST_SetSRID(ST_MakePoint(%s,%s),4326),3857), 500) AND name IS NOT NULL
-        GROUP BY name ORDER BY count(*) DESC LIMIT 3
-        """,
-        (lon, lat),
-    )
-    row["areas"] = [{"name": a, "n": b} for a, b in cur.fetchall()]
-    cur.execute(
-        "SELECT count(*) FROM areas WHERE ST_DWithin(geog, ST_Transform(ST_SetSRID(ST_MakePoint(%s,%s),4326),3857), 500)",
-        (lon, lat),
-    )
-    row["areas_total"] = cur.fetchone()[0]
+    with _timed(timings, "areas"):
+        cur.execute(
+            """
+            SELECT name, count(*) FROM areas
+            WHERE ST_DWithin(geog, ST_Transform(ST_SetSRID(ST_MakePoint(%s,%s),4326),3857), 500) AND name IS NOT NULL
+            GROUP BY name ORDER BY count(*) DESC LIMIT 3
+            """,
+            (lon, lat),
+        )
+        row["areas"] = [{"name": a, "n": b} for a, b in cur.fetchall()]
+        cur.execute(
+            "SELECT count(*) FROM areas WHERE ST_DWithin(geog, ST_Transform(ST_SetSRID(ST_MakePoint(%s,%s),4326),3857), 500)",
+            (lon, lat),
+        )
+        row["areas_total"] = cur.fetchone()[0]
+
+    # Coverage-only, not accuracy -- checked at every sampled point (unlike
+    # the fixed golden-fact/TERRAIN_COVERAGE_POINTS spot-checks elsewhere,
+    # which verify a handful of specific known elevations). A NULL here is
+    # expected and not a bug for points over open ocean (Copernicus/3DEP
+    # tiles simply don't exist there) -- see aggregate reporting in main().
+    with _timed(timings, "terrain_elevation"):
+        cur.execute("SELECT elevation_at_point_ft(%s, %s)", (lon, lat))
+        r = cur.fetchone()
+    row["terrain_elevation_ft"] = r[0] if r and r[0] is not None else None
 
     return row
 
@@ -872,7 +876,8 @@ def select_table_rows(results, max_rows):
     return shown, len(randoms) - len(shown_randoms)
 
 
-def render_html(results, golden_results, structural_results, staleness_results, mean_diff, max_diff, max_table_rows):
+def render_html(results, golden_results, structural_results, staleness_results, timing_stats,
+                mean_diff, max_diff, max_table_rows):
     def fmt_airspace(row):
         parts = []
         seen = set()
@@ -885,8 +890,9 @@ def render_html(results, golden_results, structural_results, staleness_results, 
         for s in row["sua"]:
             parts.append(f'<span class="chip chip-sua">{esc(s["type"])}</span> {esc(s["name"])}')
         for a in row.get("intl_airspace", []):
-            label = ICAO_CLASS_LABELS.get(a["icao_class"], "?")
-            parts.append(f'<span class="chip chip-cls">{esc(label)}</span> {esc(a["name"])} <span class="muted small">({esc(a["country"])})</span>')
+            # "class" here is already the decoded ICAO letter (A-G) --
+            # airspace_at_point() does that decode in SQL now.
+            parts.append(f'<span class="chip chip-cls">{esc(a["class"] or "?")}</span> {esc(a["name"])} <span class="muted small">({esc(a["country"])})</span>')
         return "<br>".join(parts) if parts else '<span class="muted">none charted (Class G)</span>'
 
     def fmt_names(row, key):
@@ -966,12 +972,21 @@ def render_html(results, golden_results, structural_results, staleness_results, 
           <div class="spot-row"><span class="spot-k">Detail</span><span class="spot-v mono">{esc(s['detail'])}</span></div>
         </div>""")
 
+    timing_rows_html = "".join(f"""
+        <tr><td class="mono">{esc(t['label'])}</td>
+            <td class="mono">{t['avg_ms']:.2f} ms</td>
+            <td class="mono">{t['total_s']:.2f} s</td>
+            <td class="mono">{t['count']}</td></tr>"""
+        for t in timing_stats)
+    total_query_s = round(sum(t["total_s"] for t in timing_stats), 2)
+
     major = [r for r in results if r["kind"] == "major_airport"]
     minor = [r for r in results if r["kind"] == "minor_airport"]
     landmarks = [r for r in results if r["kind"] == "landmark"]
     random_pts = [r for r in results if r["kind"] == "random"]
     class_b = sum(1 for r in major if any(a["class"] == "B" for a in r["class_airspace"]))
     no_class = sum(1 for r in results if not r["class_airspace"] and not r.get("intl_airspace"))
+    terrain_covered = sum(1 for r in results if r.get("terrain_elevation_ft") is not None)
     golden_pass = sum(1 for g in golden_results if g["pass"])
     structural_pass = sum(1 for s in structural_results if s["pass"])
     staleness_fresh = sum(1 for s in staleness_results if s["fresh"])
@@ -1087,6 +1102,7 @@ footer {{ color: var(--text-muted); font-size: 0.8rem; border-top: 1px solid var
     <div class="stat"><span class="n">{mean_diff:.3f}&deg;</span><span class="lbl">Mean WMM deviation</span></div>
     <div class="stat"><span class="n">{max_diff:.3f}&deg;</span><span class="lbl">Max WMM deviation</span></div>
     <div class="stat"><span class="n">{no_class}</span><span class="lbl">Points correctly uncharted (Class G)</span></div>
+    <div class="stat"><span class="n">{terrain_covered} / {len(results)}</span><span class="lbl">Points with terrain elevation data<br><span class="muted small">(gaps over open ocean are expected, not a bug)</span></span></div>
     <div class="stat"><span class="n">{golden_pass} / {len(golden_results)}</span><span class="lbl">Golden-fact checks passed</span></div>
     <div class="stat"><span class="n">{structural_pass} / {len(structural_results)}</span><span class="lbl">Structural checks passed</span></div>
     <div class="stat"><span class="n">{staleness_fresh} / {len(staleness_results)}</span><span class="lbl">External data fresh</span></div>
@@ -1110,6 +1126,18 @@ footer {{ color: var(--text-muted); font-size: 0.8rem; border-top: 1px solid var
     <p class="muted small">Informational only -- does not affect this run's pass/fail exit code. A poll process intentionally stopped for maintenance (e.g. a fresh reimport in progress) will show every source as stale here without anything being wrong.</p>
     <div class="spot-grid">
       {"".join(staleness_html)}
+    </div>
+  </section>
+  <section>
+    <h2>Query performance <span class="count">&mdash; {total_query_s:.1f}s total across {len(results)} points</span></h2>
+    <p class="muted small">Average/total wall time per query category (includes network round-trip to the DB) -- a category that's unexpectedly slow relative to the others usually means a missing index after a fresh import, not a slow query itself.</p>
+    <div class="table-scroll">
+      <table>
+        <thead><tr><th>Category</th><th>Avg</th><th>Total</th><th>Samples</th></tr></thead>
+        <tbody>
+          {timing_rows_html}
+        </tbody>
+      </table>
     </div>
   </section>
   <section>
@@ -1204,14 +1232,32 @@ def main():
 
     results = []
     by_label = {}
+    query_timings = defaultdict(list)
     progress_every = 200 if len(points) > 1000 else 20
     for i, p in enumerate(points):
         row = {"idx": i, "lat": round(p["lat"], 5), "lon": round(p["lon"], 5), "kind": p["kind"], "label": p["label"]}
-        row.update(query_point(cur, gm, year, p["lat"], p["lon"]))
+        row.update(query_point(cur, gm, year, p["lat"], p["lon"], timings=query_timings))
         results.append(row)
         by_label[p["label"]] = row
         if (i + 1) % progress_every == 0:
             print(f"  {i+1}/{len(points)}", file=sys.stderr)
+
+    # Per-category average/total time across all points -- lets a slow
+    # query category (e.g. a missing index after a fresh import) stand out
+    # instead of only seeing the run's overall wall time.
+    timing_stats = []
+    for label, samples in query_timings.items():
+        timing_stats.append({
+            "label": label,
+            "count": len(samples),
+            "avg_ms": round(1000 * sum(samples) / len(samples), 2) if samples else 0.0,
+            "total_s": round(sum(samples), 2),
+        })
+    timing_stats.sort(key=lambda t: t["total_s"], reverse=True)
+    print("Average query time by category:", file=sys.stderr)
+    for t in timing_stats:
+        print(f"  {t['label']:<24} avg={t['avg_ms']:>8.2f}ms  total={t['total_s']:>8.2f}s  n={t['count']}",
+              file=sys.stderr)
 
     golden_results = []
     all_golden_pass = True
@@ -1275,7 +1321,7 @@ def main():
     all_structural_pass = all(s["pass"] for s in structural_results)
     staleness_results = run_staleness_checks(cur)
 
-    html = render_html(results, golden_results, structural_results, staleness_results,
+    html = render_html(results, golden_results, structural_results, staleness_results, timing_stats,
                         mean_diff, max_diff, args.max_table_rows)
     with open(args.output, "w") as f:
         f.write(html)

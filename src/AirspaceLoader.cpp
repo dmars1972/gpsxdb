@@ -16,6 +16,7 @@
 #include <cstring>
 #include <cstdint>
 #include <cstdlib>
+#include <unistd.h>
 
 namespace json = boost::json;
 
@@ -59,6 +60,30 @@ std::string multiPolygonWKB(
     static const char* h = "0123456789ABCDEF";
     std::string out; out.reserve(buf.size() * 2);
     for (uint8_t b : buf) { out += h[b>>4]; out += h[b&0xf]; }
+    return out;
+}
+
+// Same as multiPolygonWKB above but for a LineString (military training
+// routes) -- points must already be projected (see projectRing).
+std::string lineStringWKB(const std::vector<std::pair<double,double>>& pts) {
+    std::vector<uint8_t> buf;
+    auto wu32 = [&](uint32_t v) {
+        buf.push_back(v & 0xff); buf.push_back((v>>8)&0xff);
+        buf.push_back((v>>16)&0xff); buf.push_back((v>>24)&0xff);
+    };
+    auto wf64 = [&](double v) {
+        uint64_t u; memcpy(&u, &v, 8);
+        for (int i = 0; i < 8; ++i) buf.push_back((u>>(8*i))&0xff);
+    };
+    buf.push_back(0x01);
+    wu32(0x20000002); // LINESTRING with SRID flag
+    wu32(static_cast<uint32_t>(g_srid));
+    wu32(static_cast<uint32_t>(pts.size()));
+    for (auto& [x, y] : pts) { wf64(x); wf64(y); }
+
+    static const char* h2 = "0123456789ABCDEF";
+    std::string out; out.reserve(buf.size() * 2);
+    for (uint8_t b : buf) { out += h2[b>>4]; out += h2[b&0xf]; }
     return out;
 }
 
@@ -281,7 +306,11 @@ AltLimit jaltLimit(const json::object& o, const char* k) {
 bool AirspaceLoader::loadClassAirspace(bool verbose) {
     const std::string url  = "https://adds-faa.opendata.arcgis.com/api/download/v1/"
                               "items/c6a62360338e408cb1512366ad61559e/geojson?layers=0";
-    const std::string path = "/tmp/class_airspace.geojson";
+    // PID-keyed, not a fixed shared path -- same collision class found and
+    // fixed in AirportsLoader.cpp/TerrainLoader.cpp (this loader also runs
+    // as different OS users at different times: a manual bulk import vs.
+    // the gpsxdb-poll service's own periodic reload).
+    const std::string path = "/tmp/class_airspace_" + std::to_string(getpid()) + ".geojson";
 
     if (verbose) std::cout << "Downloading FAA Class Airspace data (~600MB)...\n";
     // Much larger/slower download than the other FAA sources this project
@@ -371,13 +400,14 @@ bool AirspaceLoader::loadClassAirspace(bool verbose) {
 
     if (verbose) std::cout << "  class airspace: " << count << " loaded, " << skipped << " skipped\n";
     std::remove(path.c_str());
+    createQueryFunctions();
     return true;
 }
 
 bool AirspaceLoader::loadSpecialUseAirspace(bool verbose) {
     const std::string url  = "https://adds-faa.opendata.arcgis.com/api/download/v1/"
                               "items/dd0d1b726e504137ab3c41b21835d05b/geojson?layers=0";
-    const std::string path = "/tmp/special_use_airspace.geojson";
+    const std::string path = "/tmp/special_use_airspace_" + std::to_string(getpid()) + ".geojson";
 
     if (verbose) std::cout << "Downloading FAA Special Use Airspace data...\n";
     if (!downloadFileRetry(url, path, 300)) {
@@ -464,6 +494,7 @@ bool AirspaceLoader::loadSpecialUseAirspace(bool verbose) {
 
     if (verbose) std::cout << "  special use airspace: " << count << " loaded, " << skipped << " skipped\n";
     std::remove(path.c_str());
+    createQueryFunctions();
     return true;
 }
 
@@ -598,7 +629,304 @@ bool AirspaceLoader::loadInternationalAirspace(const std::string& api_key, bool 
         std::cout << "  international airspace: " << count << " loaded, " << skipped
                   << " skipped (no/invalid geometry), " << us_skipped
                   << " skipped (US, covered by FAA data)\n";
+    createQueryFunctions();
     return count > 0;
+}
+
+bool AirspaceLoader::loadMilitaryTrainingRoutes(bool verbose) {
+    const std::string url  = "https://adds-faa.opendata.arcgis.com/api/download/v1/"
+                              "items/0c6899de28af447c801231ed7ba7baa6/geojson?layers=0";
+    const std::string path = "/tmp/mtr_segment_" + std::to_string(getpid()) + ".geojson";
+
+    if (verbose) std::cout << "Downloading FAA Military Training Route data...\n";
+    if (!downloadFileRetry(url, path, 300)) {
+        std::cerr << "[MTR] download failed from " << url << "\n";
+        return false;
+    }
+
+    if (verbose) std::cout << "Parsing...\n";
+    json::value doc;
+    try {
+        doc = json::parse(readWholeFile(path));
+    } catch (const std::exception& e) {
+        std::cerr << "[MTR] JSON parse error: " << e.what() << "\n";
+        std::remove(path.c_str());
+        return false;
+    }
+
+    {
+        pqxx::nontransaction txn(conn_);
+        txn.exec(R"(
+            CREATE TABLE IF NOT EXISTS public.military_training_routes (
+                id          serial PRIMARY KEY,
+                ident       varchar(16),
+                mtr_type    integer,
+                route_type  varchar(4),
+                lower_val   double precision,
+                lower_uom   varchar(4),
+                lower_code  varchar(8),
+                upper_val   double precision,
+                upper_uom   varchar(4),
+                upper_code  varchar(8),
+                width_left  double precision,
+                width_right double precision,
+                country     varchar(4),
+                geog        public.geometry
+            )
+        )");
+        txn.exec("CREATE INDEX IF NOT EXISTS military_training_routes_geog_idx  ON public.military_training_routes USING GIST (geog)");
+        txn.exec("CREATE INDEX IF NOT EXISTS military_training_routes_ident_idx ON public.military_training_routes (ident)");
+    }
+    {
+        pqxx::work txn(conn_);
+        txn.exec("TRUNCATE public.military_training_routes");
+        txn.commit();
+    }
+
+    pqxx::work txn(conn_);
+    auto stream = pqxx::stream_to::table(txn, {"military_training_routes"}, {
+        "ident", "mtr_type", "route_type",
+        "lower_val", "lower_uom", "lower_code",
+        "upper_val", "upper_uom", "upper_code",
+        "width_left", "width_right", "country", "geog"
+    });
+
+    int count = 0, skipped = 0;
+    const json::array* feats = featuresOf(doc, "MTR");
+    if (!feats) { std::remove(path.c_str()); return false; }
+    for (const auto& fv : *feats) {
+        const json::object& f = fv.as_object();
+        if (!f.contains("properties") || !f.contains("geometry") || f.at("geometry").is_null()) {
+            ++skipped; continue;
+        }
+        const json::object& p = f.at("properties").as_object();
+        const json::object& geom = f.at("geometry").as_object();
+        if (!geom.contains("type") || !geom.contains("coordinates") ||
+            std::string(geom.at("type").as_string()) != "LineString") {
+            ++skipped; continue;
+        }
+        auto pts = projectRing(geom.at("coordinates").as_array());
+        if (pts.size() < 2) { ++skipped; continue; }
+
+        stream.write_values(
+            jstr(p, "IDENT"), jint(p, "MTR_TYPE"), jstr(p, "ROUTETYPE"),
+            jdouble(p, "LOWER_VAL"), jstr(p, "LOWER_UOM"), jstr(p, "LOWER_CODE"),
+            jdouble(p, "UPPER_VAL"), jstr(p, "UPPER_UOM"), jstr(p, "UPPER_CODE"),
+            jdouble(p, "WIDTHLEFT"), jdouble(p, "WIDTHRIGHT"),
+            jstr(p, "COUNTRY"),
+            lineStringWKB(pts)
+        );
+        ++count;
+        if ((count + skipped) % 500 == 0) progress_cb_(count + skipped, static_cast<int64_t>(feats->size()));
+    }
+    stream.complete();
+    txn.commit();
+    progress_cb_(count + skipped, static_cast<int64_t>(feats->size()));
+
+    if (verbose) std::cout << "  military training routes: " << count << " loaded, " << skipped << " skipped\n";
+    std::remove(path.c_str());
+    createQueryFunctions();
+    return true;
+}
+
+bool AirspaceLoader::loadNationalDefenseTFRs(bool verbose) {
+    const std::string url  = "https://adds-faa.opendata.arcgis.com/api/download/v1/"
+                              "items/33b0758a796f45aa9a88e733d686c5c1/geojson?layers=0";
+    const std::string path = "/tmp/national_defense_tfr_" + std::to_string(getpid()) + ".geojson";
+
+    if (verbose) std::cout << "Downloading FAA National Defense Airspace TFR data...\n";
+    if (!downloadFileRetry(url, path, 300)) {
+        std::cerr << "[TFR] download failed from " << url << "\n";
+        return false;
+    }
+
+    if (verbose) std::cout << "Parsing...\n";
+    json::value doc;
+    try {
+        doc = json::parse(readWholeFile(path));
+    } catch (const std::exception& e) {
+        std::cerr << "[TFR] JSON parse error: " << e.what() << "\n";
+        std::remove(path.c_str());
+        return false;
+    }
+
+    {
+        pqxx::nontransaction txn(conn_);
+        txn.exec(R"(
+            CREATE TABLE IF NOT EXISTS public.national_defense_tfr (
+                id                    serial PRIMARY KEY,
+                name                  text,
+                type_code             varchar(16),
+                local_type            varchar(16),
+                working_hours_code    varchar(16),
+                working_hours_remark  text,
+                city                  text,
+                state                 text,
+                country               text,
+                geog                  public.geometry
+            )
+        )");
+        txn.exec("CREATE INDEX IF NOT EXISTS national_defense_tfr_geog_idx  ON public.national_defense_tfr USING GIST (geog)");
+        txn.exec("CREATE INDEX IF NOT EXISTS national_defense_tfr_state_idx ON public.national_defense_tfr (state)");
+    }
+    {
+        pqxx::work txn(conn_);
+        txn.exec("TRUNCATE public.national_defense_tfr");
+        txn.commit();
+    }
+
+    pqxx::work txn(conn_);
+    auto stream = pqxx::stream_to::table(txn, {"national_defense_tfr"}, {
+        "name", "type_code", "local_type",
+        "working_hours_code", "working_hours_remark",
+        "city", "state", "country", "geog"
+    });
+
+    int count = 0, skipped = 0;
+    const json::array* feats = featuresOf(doc, "National Defense TFR");
+    if (!feats) { std::remove(path.c_str()); return false; }
+    for (const auto& fv : *feats) {
+        const json::object& f = fv.as_object();
+        if (!f.contains("properties") || !f.contains("geometry") || f.at("geometry").is_null()) {
+            ++skipped; continue;
+        }
+        const json::object& p = f.at("properties").as_object();
+        auto polygons = polygonsFromGeometry(f.at("geometry").as_object());
+        if (polygons.empty()) { ++skipped; continue; }
+
+        stream.write_values(
+            jstr(p, "NAME"), jstr(p, "TYPE_CODE"), jstr(p, "LOCAL_TYPE"),
+            jstr(p, "WKHR_CODE"), jstr(p, "WKHR_RMK"),
+            jstr(p, "CITY"), jstr(p, "STATE"), jstr(p, "COUNTRY"),
+            multiPolygonWKB(polygons)
+        );
+        ++count;
+        if ((count + skipped) % 5 == 0) progress_cb_(count + skipped, static_cast<int64_t>(feats->size()));
+    }
+    stream.complete();
+    txn.commit();
+    progress_cb_(count + skipped, static_cast<int64_t>(feats->size()));
+
+    if (verbose) std::cout << "  national defense TFRs: " << count << " loaded, " << skipped << " skipped\n";
+    std::remove(path.c_str());
+    createQueryFunctions();
+    return true;
+}
+
+void AirspaceLoader::createQueryFunctions() {
+    bool have_class = false, have_sua = false, have_intl = false, have_tfr = false, have_mtr = false;
+    {
+        pqxx::work txn(conn_);
+        auto r = txn.exec(
+            "SELECT table_name FROM information_schema.tables WHERE table_schema='public' "
+            "AND table_name IN ('class_airspace','special_use_airspace','international_airspace',"
+            "'national_defense_tfr','military_training_routes')");
+        for (auto row : r) {
+            std::string t = row[0].as<std::string>();
+            if (t == "class_airspace") have_class = true;
+            else if (t == "special_use_airspace") have_sua = true;
+            else if (t == "international_airspace") have_intl = true;
+            else if (t == "national_defense_tfr") have_tfr = true;
+            else if (t == "military_training_routes") have_mtr = true;
+        }
+        txn.commit();
+    }
+
+    // Non-essential convenience functions, not core import data -- a bug
+    // here must never be allowed to take down the whole import (it already
+    // has once: an earlier version of airspace_at_point()'s SQL crashed the
+    // entire bulk import 7+ hours in, at the very last loader phase, via an
+    // uncaught pqxx::undefined_table exception -> std::terminate()). The
+    // two functions are independent try/catch blocks so a bug in one can't
+    // take out the other either.
+
+    if (have_class || have_sua || have_intl || have_tfr) {
+        std::vector<std::string> branches;
+        if (have_class)
+            branches.push_back(
+                "SELECT 'FAA_CLASS'::text, a.class, a.type_code, a.name, "
+                "       a.lower_val, a.lower_uom, a.lower_code, a.upper_val, a.upper_uom, a.upper_code, a.country "
+                "FROM public.class_airspace a, pt WHERE ST_Contains(a.geog, pt.g)");
+        if (have_sua)
+            branches.push_back(
+                "SELECT 'FAA_SUA'::text, s.class, s.type_code, s.name, "
+                "       s.lower_val, s.lower_uom, s.lower_code, s.upper_val, s.upper_uom, s.upper_code, s.country "
+                "FROM public.special_use_airspace s, pt WHERE ST_Contains(s.geog, pt.g)");
+        if (have_intl)
+            // icao_class (0-6) decoded to the ICAO letter it actually represents
+            // (A-G) -- this mapping is well-established and used elsewhere in
+            // this project (see dq_check.py's ICAO_CLASS_LABELS). type/
+            // lower_unit/lower_ref/upper_unit/upper_ref are deliberately left
+            // as OpenAIP's raw numeric codes, not decoded -- see
+            // loadInternationalAirspace's doc comment on why guessing at those
+            // specific codes isn't safe.
+            branches.push_back(
+                "SELECT 'OPENAIP'::text, "
+                "       CASE i.icao_class WHEN 0 THEN 'A' WHEN 1 THEN 'B' WHEN 2 THEN 'C' WHEN 3 THEN 'D' "
+                "                         WHEN 4 THEN 'E' WHEN 5 THEN 'F' WHEN 6 THEN 'G' ELSE NULL END, "
+                "       i.type::text, i.name, "
+                "       i.lower_val, i.lower_unit::text, i.lower_ref::text, "
+                "       i.upper_val, i.upper_unit::text, i.upper_ref::text, i.country "
+                "FROM public.international_airspace i, pt WHERE ST_Contains(i.geog, pt.g)");
+        if (have_tfr)
+            // national_defense_tfr has no altitude/class fields (it's a TFR
+            // area, not a classified airspace layer) -- nulls for those
+            // columns, matching how the other branches null out columns
+            // they don't have.
+            branches.push_back(
+                "SELECT 'NDA_TFR'::text, NULL::text, t.type_code, t.name, "
+                "       NULL::double precision, NULL::text, NULL::text, "
+                "       NULL::double precision, NULL::text, NULL::text, t.country "
+                "FROM public.national_defense_tfr t, pt WHERE ST_Contains(t.geog, pt.g)");
+
+        std::string body =
+            "WITH pt AS (SELECT ST_Transform(ST_SetSRID(ST_MakePoint(p_x, p_y), p_srid), 3857) AS g) ";
+        for (size_t i = 0; i < branches.size(); ++i) {
+            if (i > 0) body += " UNION ALL ";
+            body += branches[i];
+        }
+
+        try {
+            pqxx::work txn(conn_);
+            txn.exec(
+                "CREATE OR REPLACE FUNCTION public.airspace_at_point("
+                "  p_x double precision, p_y double precision, p_srid integer DEFAULT 4326"
+                ") RETURNS TABLE(source text, class text, type text, name text, "
+                "                lower_val double precision, lower_uom text, lower_code text, "
+                "                upper_val double precision, upper_uom text, upper_code text, "
+                "                country text) "
+                "LANGUAGE sql STABLE PARALLEL SAFE AS $f$ " + body + " $f$");
+            txn.commit();
+        } catch (const std::exception& e) {
+            std::cerr << "[AirspaceLoader] airspace_at_point() creation failed (non-fatal, "
+                         "may be stale or missing): " << e.what() << "\n";
+        }
+    }
+
+    if (have_mtr) {
+        try {
+            pqxx::work txn(conn_);
+            txn.exec(
+                "CREATE OR REPLACE FUNCTION public.military_routes_nearby("
+                "  p_x double precision, p_y double precision, "
+                "  p_radius_m double precision DEFAULT 9260, p_srid integer DEFAULT 4326"
+                ") RETURNS TABLE(id integer, ident varchar, mtr_type integer, "
+                "                lower_val double precision, upper_val double precision, "
+                "                dist_m double precision) "
+                "LANGUAGE sql STABLE PARALLEL SAFE AS $f$ "
+                "  SELECT m.id, m.ident, m.mtr_type, m.lower_val, m.upper_val, "
+                "         ST_Distance(m.geog, pt.g) "
+                "  FROM public.military_training_routes m, "
+                "       (SELECT ST_Transform(ST_SetSRID(ST_MakePoint(p_x, p_y), p_srid), 3857) AS g) pt "
+                "  WHERE ST_DWithin(m.geog, pt.g, p_radius_m) "
+                "  ORDER BY m.geog <-> pt.g "
+                "$f$");
+            txn.commit();
+        } catch (const std::exception& e) {
+            std::cerr << "[AirspaceLoader] military_routes_nearby() creation failed (non-fatal, "
+                         "may be stale or missing): " << e.what() << "\n";
+        }
+    }
 }
 
 std::string defaultOpenAipApiKey() {

@@ -5,6 +5,9 @@
 #include <cctype>
 #include <string>
 #include <unordered_set>
+#include <vector>
+#include <thread>
+#include <mutex>
 
 #include <pqxx/pqxx>
 #include "Log.h"
@@ -232,6 +235,15 @@ void NavDB::addAreaTags(int64_t id, const Tags& tags) {
     }
 }
 
+void NavDB::addRoadTags(int64_t id, const Tags& tags) {
+    for (const auto& [k, v] : tags) {
+        if (isExcludedTagKey(k)) continue;
+        std::string ck = sanitizeTag(k), cv = sanitizeTag(v);
+        if (ck.empty() || cv.empty()) continue;
+        road_tag_buf_.push_back({id, std::move(ck), std::move(cv)});
+    }
+}
+
 // ---- insert ----
 
 void NavDB::insertNode(int64_t id, const std::string& name,
@@ -264,7 +276,15 @@ void NavDB::insertArea(int64_t id, const std::string& name,
 
 void NavDB::insertRoad(int64_t id, const std::string& name,
                        const Tags& tags, const std::string& geog) {
-    addTags(id, tags);
+    // Was addTags() (the shared node/relation/road buffer) -- since a road
+    // is a promoted relation, insertRelation() and insertRoad() were called
+    // back-to-back for the same item.id, both feeding the same tag_buf_.
+    // Whichever of flushRelations()/flushRoads() happened to fire first
+    // (independent buffer-size thresholds) drained the whole shared buffer
+    // into its own table, cross-routing relation tags into road_tags and
+    // vice versa depending on flush timing. road_tag_buf_ is dedicated to
+    // roads only, mirroring way_tag_buf_/area_tag_buf_, so this can't happen.
+    addRoadTags(id, tags);
     road_buf_.push_back({id, name, geog});
     if (static_cast<int>(road_buf_.size()) > way_buffer_size_)
         flushRoads();
@@ -294,7 +314,8 @@ void NavDB::finalize_tags(const std::string& table) {
 
 void NavDB::finalize_tags_locked(const std::string& table) {
     auto& buf = (table == "way")  ? way_tag_buf_  :
-                (table == "area") ? area_tag_buf_ : tag_buf_;
+                (table == "area") ? area_tag_buf_ :
+                (table == "road") ? road_tag_buf_ : tag_buf_;
     if (buf.empty()) return;
     LOGI(thread_id_, "finalize_tags table=", table, " count=", buf.size());
     try {
@@ -471,13 +492,16 @@ static const char* ENABLE_INDEXES = R"SQL(
     ALTER TABLE relations ADD PRIMARY KEY (id);
 )SQL";
 
-static const char* CREATE_GIST_INDEXES = R"SQL(
-    CREATE INDEX IF NOT EXISTS nodes_geog_idx     ON public.nodes     USING GIST (geog);
-    CREATE INDEX IF NOT EXISTS ways_geog_idx      ON public.ways      USING GIST (geog);
-    CREATE INDEX IF NOT EXISTS areas_geog_idx     ON public.areas     USING GIST (geog);
-    CREATE INDEX IF NOT EXISTS roads_geog_idx     ON public.roads     USING GIST (geog);
-    CREATE INDEX IF NOT EXISTS relations_geog_idx ON public.relations USING GIST (geog);
-)SQL";
+// One row per index built by createGistIndexes() below -- kept as plain
+// data (not the single CREATE_GIST_INDEXES batch this replaced) so each
+// can run on its own connection/thread instead of one at a time.
+static const std::pair<const char*, const char*> kGistIndexes[] = {
+    {"nodes_geog_idx",     "nodes"},
+    {"ways_geog_idx",      "ways"},
+    {"areas_geog_idx",     "areas"},
+    {"roads_geog_idx",     "roads"},
+    {"relations_geog_idx", "relations"},
+};
 
 static const char* DROP_GIST_INDEXES = R"SQL(
     DROP INDEX IF EXISTS nodes_geog_idx;
@@ -514,14 +538,37 @@ void NavDB::enableIndexes() {
 }
 
 void NavDB::createGistIndexes() {
-    LOGI(thread_id_, "creating GiST spatial indexes (may take a while)");
-    try {
-        pqxx::work txn(conn_);
-        txn.exec(CREATE_GIST_INDEXES);
-        txn.commit();
-    } catch (const std::exception& e) {
-        std::cerr << "[NavDB] createGistIndexes error: " << e.what() << "\n";
-        throw;
+    // One thread per index, each on its own connection -- these are 5
+    // independent tables with no dependency between them, so there's no
+    // reason to build them one at a time in a single transaction (the
+    // previous approach, which took ~40 minutes serially on a full
+    // planet import: ways alone is 350M+ rows). Postgres has no problem
+    // running several CREATE INDEX statements concurrently as long as
+    // they're not on the same table.
+    LOGI(thread_id_, "creating GiST spatial indexes in parallel (may take a while)");
+    std::vector<std::thread> workers;
+    std::vector<std::string> errors;
+    std::mutex err_mu;
+    for (const auto& [index_name, table] : kGistIndexes) {
+        workers.emplace_back([&, index_name, table]() {
+            try {
+                pqxx::connection conn = newConnection();
+                pqxx::work txn(conn);
+                txn.exec("CREATE INDEX IF NOT EXISTS " + std::string(index_name) +
+                          " ON public." + table + " USING GIST (geog)");
+                txn.commit();
+            } catch (const std::exception& e) {
+                std::lock_guard lk(err_mu);
+                errors.push_back(std::string(index_name) + ": " + e.what());
+            }
+        });
+    }
+    for (auto& w : workers) w.join();
+    if (!errors.empty()) {
+        std::string msg = "[NavDB] createGistIndexes error(s):\n";
+        for (auto& e : errors) msg += "  " + e + "\n";
+        std::cerr << msg;
+        throw std::runtime_error(msg);
     }
     LOGI(thread_id_, "GiST indexes created");
 }
@@ -1150,14 +1197,74 @@ void NavDB::initializeSchema() {
         "CREATE INDEX international_airspace_country_idx ON public.international_airspace (country)",
         "CREATE INDEX international_airspace_type_idx    ON public.international_airspace (type)",
 
-        // ---- Terrain (USGS 3DEP elevation raster tiles) ----
-        // `terrain`'s columns/constraints are generated by raster2pgsql from
-        // actual tile metadata (pixel type, dimensions, SRID, etc.) rather
-        // than fixed DDL, so it isn't created here — just dropped for a
-        // clean -I reset. The terrain_load tool (re)creates it as needed.
+        // ---- Military Training Routes (IR/VR), FAA ArcGIS ----
+        // mtr_type (0/1 in source data) is NOT decoded to "IR"/"VR" --
+        // there's no coded-value domain on the field and no FAA doc found
+        // confirming which numeric value means which, so it's stored raw
+        // rather than guessed (same reasoning as international_airspace's
+        // undecoded OpenAIP codes above).
+        "DROP TABLE IF EXISTS public.military_training_routes",
+        "CREATE TABLE public.military_training_routes ("
+        "  id          serial PRIMARY KEY,"
+        "  ident       varchar(16),"
+        "  mtr_type    integer,"
+        "  route_type  varchar(4),"
+        "  lower_val   double precision,"
+        "  lower_uom   varchar(4),"
+        "  lower_code  varchar(8),"
+        "  upper_val   double precision,"
+        "  upper_uom   varchar(4),"
+        "  upper_code  varchar(8),"
+        "  width_left  double precision,"
+        "  width_right double precision,"
+        "  country     varchar(4),"
+        "  geog        public.geometry)",
+        "CREATE INDEX military_training_routes_geog_idx  ON public.military_training_routes USING GIST (geog)",
+        "CREATE INDEX military_training_routes_ident_idx ON public.military_training_routes (ident)",
+
+        // ---- National Defense Airspace TFRs, FAA ArcGIS ----
+        // Deliberately scoped/named -- this is only the long-duration
+        // security-related TFR subset (presidential movements, defense
+        // installations) published on FAA's regular ArcGIS data cycle, not
+        // the full day-to-day TFR picture (stadium games, wildfires, VIP
+        // movements change too fast for this static a source and aren't
+        // included here).
+        "DROP TABLE IF EXISTS public.national_defense_tfr",
+        "CREATE TABLE public.national_defense_tfr ("
+        "  id                    serial PRIMARY KEY,"
+        "  name                  text,"
+        "  type_code             varchar(16),"
+        "  local_type            varchar(16),"
+        "  working_hours_code    varchar(16),"
+        "  working_hours_remark  text,"
+        "  city                  text,"
+        "  state                 text,"
+        "  country               text,"
+        "  geog                  public.geometry)",
+        "CREATE INDEX national_defense_tfr_geog_idx  ON public.national_defense_tfr USING GIST (geog)",
+        "CREATE INDEX national_defense_tfr_state_idx ON public.national_defense_tfr (state)",
+
+        // ---- Terrain (USGS 3DEP / Copernicus elevation raster tiles) ----
+        // Previously left dropped-and-not-recreated on the theory that
+        // raster2pgsql infers terrain's DDL from tile metadata (pixel type,
+        // dimensions, SRID) -- checked empirically (raster2pgsql -s 4326:3857
+        // -t 256x256 -F -I -M against a real tile, same flags TerrainLoader
+        // always uses) and that's not actually true: -C (the flag that would
+        // make constraints metadata-dependent) is deliberately never passed
+        // (see TerrainLoader.cpp's own comment on why), so the DDL raster2pgsql
+        // emits is always exactly "rid serial PRIMARY KEY, rast raster,
+        // filename text", every time, regardless of tile content. Fixed DDL,
+        // same as wmm just above -- create it up front for the same reason:
+        // downstream consumers of this schema need a known DDL, not one that
+        // only exists once TerrainLoader happens to run later in the sequence.
         "CREATE EXTENSION IF NOT EXISTS postgis_raster",
         "DROP TABLE IF EXISTS public.terrain",
         "DROP TABLE IF EXISTS public.terrain_tiles",
+        "CREATE TABLE public.terrain (rid serial PRIMARY KEY, rast public.raster, filename text)",
+        "CREATE TABLE public.terrain_tiles ("
+        "  tile_name text PRIMARY KEY,"
+        "  source text NOT NULL DEFAULT '3dep',"
+        "  loaded_at timestamptz NOT NULL DEFAULT now())",
         // Elevation-band polygons (terrain_bands) and their staging tables
         // are a retired feature — dropped here too so a clean -I reset also
         // clears out any leftovers on a database predating the removal.
@@ -1169,12 +1276,30 @@ void NavDB::initializeSchema() {
         "DROP TABLE IF EXISTS public.terrain_region_staging_progress",
 
         // ---- WMM (World Magnetic Model declination raster) ----
-        // Same rationale as terrain just above: dropped only, not
-        // recreated — the wmm_load tool (re)creates wmm/wmm_cells/
-        // wmm_bands as needed on its next run.
+        // Unlike terrain, wmm's DDL is completely fixed (WMMLoader always
+        // creates it as (rid serial, rast raster) -- no source-data-dependent
+        // constraints), so -- unlike terrain -- there's no reason to leave it
+        // dropped-and-not-recreated: create it here too, matching
+        // ensureSchema()'s already-correct pattern, so every table exists
+        // right after a fresh -I instead of only once WMMLoader happens to
+        // run later in the sequence (this is what let query functions
+        // referencing wmm, like declination_at_point, be created up front
+        // alongside nearest_airport/obstacles_nearby/airspace_at_point
+        // instead of needing to wait).
         "DROP TABLE IF EXISTS public.wmm",
         "DROP TABLE IF EXISTS public.wmm_cells",
         "DROP TABLE IF EXISTS public.wmm_bands",
+        "CREATE TABLE public.wmm (rid serial PRIMARY KEY, rast public.raster)",
+        "CREATE INDEX wmm_rast_gist ON public.wmm USING GIST (ST_ConvexHull(rast))",
+        "CREATE TABLE public.wmm_cells ("
+        "  cell_name text PRIMARY KEY,"
+        "  loaded_at timestamptz NOT NULL DEFAULT now())",
+        "CREATE TABLE public.wmm_bands ("
+        "  id serial PRIMARY KEY,"
+        "  band_min_deg double precision NOT NULL,"
+        "  band_max_deg double precision NOT NULL,"
+        "  geog public.geometry)",
+        "CREATE INDEX wmm_bands_geog_idx ON public.wmm_bands USING GIST (geog)",
     };
 
     for (const char* sql : statements) {
@@ -1447,6 +1572,42 @@ void NavDB::ensureSchema() {
         "CREATE INDEX IF NOT EXISTS international_airspace_geog_idx    ON public.international_airspace USING GIST (geog)",
         "CREATE INDEX IF NOT EXISTS international_airspace_country_idx ON public.international_airspace (country)",
         "CREATE INDEX IF NOT EXISTS international_airspace_type_idx    ON public.international_airspace (type)",
+
+        // ---- Military Training Routes (IR/VR), FAA ArcGIS ----
+        // mtr_type not decoded -- see initializeSchema()'s copy of this DDL.
+        "CREATE TABLE IF NOT EXISTS public.military_training_routes ("
+        "  id          serial PRIMARY KEY,"
+        "  ident       varchar(16),"
+        "  mtr_type    integer,"
+        "  route_type  varchar(4),"
+        "  lower_val   double precision,"
+        "  lower_uom   varchar(4),"
+        "  lower_code  varchar(8),"
+        "  upper_val   double precision,"
+        "  upper_uom   varchar(4),"
+        "  upper_code  varchar(8),"
+        "  width_left  double precision,"
+        "  width_right double precision,"
+        "  country     varchar(4),"
+        "  geog        public.geometry)",
+        "CREATE INDEX IF NOT EXISTS military_training_routes_geog_idx  ON public.military_training_routes USING GIST (geog)",
+        "CREATE INDEX IF NOT EXISTS military_training_routes_ident_idx ON public.military_training_routes (ident)",
+
+        // ---- National Defense Airspace TFRs, FAA ArcGIS ----
+        // Scoped subset only -- see initializeSchema()'s copy of this DDL.
+        "CREATE TABLE IF NOT EXISTS public.national_defense_tfr ("
+        "  id                    serial PRIMARY KEY,"
+        "  name                  text,"
+        "  type_code             varchar(16),"
+        "  local_type            varchar(16),"
+        "  working_hours_code    varchar(16),"
+        "  working_hours_remark  text,"
+        "  city                  text,"
+        "  state                 text,"
+        "  country               text,"
+        "  geog                  public.geometry)",
+        "CREATE INDEX IF NOT EXISTS national_defense_tfr_geog_idx  ON public.national_defense_tfr USING GIST (geog)",
+        "CREATE INDEX IF NOT EXISTS national_defense_tfr_state_idx ON public.national_defense_tfr (state)",
 
         "CREATE EXTENSION IF NOT EXISTS postgis_raster",
         "CREATE TABLE IF NOT EXISTS public.terrain_tiles ("

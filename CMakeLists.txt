@@ -193,38 +193,18 @@ target_compile_options(regional_export PRIVATE -O2 -g -Wall -Wextra -Wno-psabi $
 target_compile_features(regional_export PRIVATE cxx_std_20)
 
 # ---- regional_db_export ----
-# Per-region binary-COPY table dumps (paired with regional_export's
-# nodes.dat output) for the regional installer bundle. Shells out to
-# `psql \copy` for the actual data movement (see regional_db_export.cpp
-# top-of-file comment for why) so only needs pqxx for control-plane
-# queries (SRID lookups).
+# Exports every region-scoped Postgres table (paired with regional_export's
+# nodes.dat output) for the regional installer bundle -- see
+# regional_db_export.cpp's top-of-file comment for the two categories it
+# handles (a single client-side pass for the 5 big parent+child table
+# pairs, plain per-region `psql \copy` queries for everything else) and why
+# they're one tool now instead of two (originally split as
+# regional_table_export, merged back 2026-07-30: every real invocation
+# needed both anyway, in a fixed order, so the split bought nothing beyond
+# what an internal code path would have).
 
 add_executable(regional_db_export
     src/regional_db_export.cpp
-)
-
-target_include_directories(regional_db_export PRIVATE
-    ${CMAKE_SOURCE_DIR}/include
-    ${PQXX_INCLUDE_DIRS}
-    ${PQ_INCLUDE}
-)
-
-target_link_libraries(regional_db_export PRIVATE
-    ${PQXX_LIBRARIES}
-    ${PQ_LIB}
-)
-
-target_compile_options(regional_db_export PRIVATE -O2 -g -Wall -Wextra -Wno-psabi ${PQXX_CFLAGS_OTHER})
-target_compile_features(regional_db_export PRIVATE cxx_std_20)
-
-# ---- regional_table_export ----
-# Single client-side pass over the 5 big parent+child table pairs (see
-# src/regional_table_export.cpp top-of-file comment) -- run before
-# regional_db_export, which handles the remaining smaller tables and
-# appends to the same manifest.txt this tool starts.
-
-add_executable(regional_table_export
-    src/regional_table_export.cpp
     src/RegionPolygons.cpp
     src/RegionIndex.cpp
     src/WkbDecode.cpp
@@ -232,21 +212,21 @@ add_executable(regional_table_export
     src/GeoUtils.cpp
 )
 
-target_include_directories(regional_table_export PRIVATE
+target_include_directories(regional_db_export PRIVATE
     ${CMAKE_SOURCE_DIR}/include
     ${PQXX_INCLUDE_DIRS}
     ${PQ_INCLUDE}
     ${PROJ_INCLUDE_DIRS}
 )
 
-target_link_libraries(regional_table_export PRIVATE
+target_link_libraries(regional_db_export PRIVATE
     ${PQXX_LIBRARIES}
     ${PQ_LIB}
     ${PROJ_LIBRARIES}
 )
 
-target_compile_options(regional_table_export PRIVATE -O2 -g -Wall -Wextra -Wno-psabi ${PQXX_CFLAGS_OTHER} ${PROJ_CFLAGS_OTHER})
-target_compile_features(regional_table_export PRIVATE cxx_std_20)
+target_compile_options(regional_db_export PRIVATE -O2 -g -Wall -Wextra -Wno-psabi ${PQXX_CFLAGS_OTHER} ${PROJ_CFLAGS_OTHER})
+target_compile_features(regional_db_export PRIVATE cxx_std_20)
 
 # ---- regional_install ----
 # Installs a <region>.gpsxdb.tar.gz bundle (regional_export + regional_db_export

@@ -255,6 +255,8 @@ void Replicator::checkAirspaceRefresh() {
             std::cerr << "[Replicator] no OpenAIP API key (~/.openaip_api_key) — "
                          "skipping international airspace refresh\n";
         }
+        ok = airspace.loadMilitaryTrainingRoutes(false) && ok;
+        ok = airspace.loadNationalDefenseTFRs(false) && ok;
         if (ok) {
             db_.setExternalDataTimestamp("airspace", now);
             std::cout << "[Replicator] airspace refresh complete\n";

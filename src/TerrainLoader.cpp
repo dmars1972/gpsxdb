@@ -12,7 +12,9 @@
 #include <thread>
 #include <atomic>
 #include <mutex>
+#include <memory>
 #include <curl/curl.h>
+#include <unistd.h>
 
 namespace {
 
@@ -22,6 +24,13 @@ size_t curlWriteToFile(void* ptr, size_t size, size_t nmemb, void* stream) {
     return size * nmemb;
 }
 
+// A fresh handle per tile, not reused across a thread's whole run: reusing
+// one handle kept a small number of long-lived TCP/TLS connections open to
+// the same S3 IP, which was observed to get bandwidth-throttled the longer
+// each connection stayed alive (a one-off fresh connection to the same
+// bucket got full speed while the app's reused connections had degraded to
+// a crawl) -- so a fresh connection per tile, despite the handshake cost,
+// is actually the faster and safer choice here.
 bool downloadFile(const std::string& url, const std::string& dest) {
     CURL* curl = curl_easy_init();
     if (!curl) return false;
@@ -72,25 +81,37 @@ std::vector<Tile> tilesForBBox(TerrainSource source,
     int lat1 = static_cast<int>(std::ceil(max_lat));
     int lon0 = static_cast<int>(std::floor(min_lon));
     int lon1 = static_cast<int>(std::ceil(max_lon));
+
+    auto addTile = [&](int lat, int lon) {
+        char buf[48];
+        std::string name, url;
+        if (source == TerrainSource::USGS3DEP) {
+            snprintf(buf, sizeof(buf), "n%02dw%03d", lat + 1, -lon);
+            name = buf;
+            url = "https://prd-tnm.s3.amazonaws.com/StagedProducts/Elevation/1/TIFF/current/"
+                  + name + "/USGS_1_" + name + ".tif";
+        } else {
+            char ns = lat >= 0 ? 'N' : 'S';
+            char ew = lon >= 0 ? 'E' : 'W';
+            snprintf(buf, sizeof(buf), "%c%02d_00_%c%03d_00",
+                    ns, std::abs(lat), ew, std::abs(lon));
+            name = buf;
+            std::string folder = "Copernicus_DSM_COG_10_" + name + "_DEM";
+            url = "https://copernicus-dem-30m.s3.amazonaws.com/" + folder + "/" + folder + ".tif";
+        }
+        tiles.push_back({lat, lon, name, url});
+    };
+
     for (int lat = lat0; lat < lat1; ++lat) {
-        for (int lon = lon0; lon < lon1; ++lon) {
-            char buf[48];
-            std::string name, url;
-            if (source == TerrainSource::USGS3DEP) {
-                snprintf(buf, sizeof(buf), "n%02dw%03d", lat + 1, -lon);
-                name = buf;
-                url = "https://prd-tnm.s3.amazonaws.com/StagedProducts/Elevation/1/TIFF/current/"
-                      + name + "/USGS_1_" + name + ".tif";
-            } else {
-                char ns = lat >= 0 ? 'N' : 'S';
-                char ew = lon >= 0 ? 'E' : 'W';
-                snprintf(buf, sizeof(buf), "%c%02d_00_%c%03d_00",
-                        ns, std::abs(lat), ew, std::abs(lon));
-                name = buf;
-                std::string folder = "Copernicus_DSM_COG_10_" + name + "_DEM";
-                url = "https://copernicus-dem-30m.s3.amazonaws.com/" + folder + "/" + folder + ".tif";
-            }
-            tiles.push_back({lat, lon, name, url});
+        if (lon0 <= lon1) {
+            for (int lon = lon0; lon < lon1; ++lon) addTile(lat, lon);
+        } else {
+            // Antimeridian wrap (min_lon > max_lon, e.g. oceania: 110 to
+            // -150) -- cover [lon0,180) and [-180,lon1) instead of the
+            // single [lon0,lon1) range, which is empty/backwards here and
+            // silently produced zero tiles for this bbox shape before.
+            for (int lon = lon0; lon < 180; ++lon) addTile(lat, lon);
+            for (int lon = -180; lon < lon1; ++lon) addTile(lat, lon);
         }
     }
     return tiles;
@@ -232,7 +253,19 @@ bool TerrainLoader::load(double min_lon, double min_lat, double max_lon, double 
         return true;
     }
 
-    const std::string tmp_dir = "/tmp/terrain_tiles";
+    // Keyed by PID, not a fixed shared directory -- same collision class
+    // just found and fixed in AirportsLoader.cpp's /tmp paths (a stale
+    // file left behind by one process/user silently blocks every other
+    // process from ever writing that path again). Tile filenames here are
+    // content-derived (e.g. "n47w074.tif"), not process-specific, so any
+    // two overlapping invocations sharing one directory -- this loader
+    // running twice concurrently, or a leftover process from an earlier
+    // kill/restart cycle -- could read/overwrite each other's in-flight
+    // downloads. Not confirmed as the cause of a batch-load failure wave
+    // seen in production (raster2pgsql/GDAL TIFFReadEncodedTile errors,
+    // consistent with a truncated file), but this closes off that
+    // possibility regardless of whether it was the actual cause.
+    const std::string tmp_dir = "/tmp/terrain_tiles_" + std::to_string(getpid());
     system(("mkdir -p " + tmp_dir).c_str());
 
     // libcurl requires curl_global_init() to happen once, before any thread
@@ -306,10 +339,23 @@ bool TerrainLoader::load(double min_lon, double min_lat, double max_lon, double 
         // ST_Value point queries, which only rely on the GIST index from -I.
         std::string sql_file = tmp_dir + "/batch_" + std::to_string(batch_idx) + ".sql";
         std::ostringstream gen_cmd;
+        // Tried -Y (COPY instead of INSERT, for faster loading) here --
+        // raster2pgsql flatly rejects it in combination with -s
+        // FROM_SRID:TO_SRID ("Invalid argument combination"), which this
+        // loader always uses (source tiles are never already in dest_srid).
+        // So plain INSERT output it is.
+        // raster2pgsql prints its own "Processing N/M: <file>" progress to
+        // stderr regardless of our own verbose flag (no CLI switch to turn
+        // it off) -- captured to a per-batch file instead of left to
+        // inherit our stderr, so the happy path stays on the one status
+        // line the rest of the import uses. Surfaced on failure below
+        // (this captured text is what actually diagnosed the -Y/-s
+        // incompatibility bug, not the bare exit code).
+        std::string batch_log = tmp_dir + "/batch_" + std::to_string(batch_idx) + ".rlog";
         gen_cmd << "raster2pgsql -s " << sourceSrid(source) << ":" << dest_srid << " -t 256x256 -F";
         gen_cmd << (use_append ? " -a" : " -I -M");
         for (auto& p : downloaded_paths) gen_cmd << " " << p;
-        gen_cmd << " terrain > " << sql_file;
+        gen_cmd << " terrain > " << sql_file << " 2>" << batch_log;
 
         if (verbose) {
             std::lock_guard lk(io_mu);
@@ -335,7 +381,7 @@ bool TerrainLoader::load(double min_lon, double min_lat, double max_lon, double 
             if (gen_rc == 0) {
                 std::ostringstream load_cmd;
                 load_cmd << "psql -h " << host_ << " -U " << user_ << " -d " << database_
-                          << " -q -v ON_ERROR_STOP=1 -f " << sql_file;
+                          << " -q -v ON_ERROR_STOP=1 -f " << sql_file << " 2>>" << batch_log;
                 load_rc = system(load_cmd.str().c_str());
             }
         }
@@ -350,9 +396,14 @@ bool TerrainLoader::load(double min_lon, double min_lat, double max_lon, double 
                       << ", psql rc=" << load_rc << ") for tiles:";
             for (auto& t : downloaded_tiles) std::cerr << " " << t.name;
             std::cerr << " — not marked as loaded, will retry on next run\n";
+            std::ifstream log_in(batch_log);
+            std::string line;
+            while (std::getline(log_in, line)) std::cerr << "    " << line << "\n";
             total_failed_batches.fetch_add(1, std::memory_order_relaxed);
+            std::remove(batch_log.c_str());
             return false;  // leave these tiles unmarked so a future run retries them
         }
+        std::remove(batch_log.c_str());
 
         {
             pqxx::work txn(db);
@@ -443,7 +494,10 @@ bool TerrainLoader::load(double min_lon, double min_lat, double max_lon, double 
 
 bool TerrainLoader::loadGlobal(int dest_srid, int threads, bool verbose) {
     bool any_loaded = false;
+    constexpr int kRegionCount = static_cast<int>(sizeof(kGlobalRegions) / sizeof(kGlobalRegions[0]));
+    int region_idx = 0;
     for (const auto& r : kGlobalRegions) {
+        region_progress_cb_(++region_idx, kRegionCount);
         // north_america now includes CONUS (folded in during the natural-
         // boundary region consolidation) alongside Canada/Mexico/Central
         // America/Caribbean/Alaska/Greenland, which still need Copernicus —

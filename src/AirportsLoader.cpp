@@ -12,6 +12,10 @@
 #include <cstring>
 #include <iomanip>
 #include <stdexcept>
+#include <thread>
+#include <chrono>
+#include <unistd.h>
+#include <cmath>
 
 // ---- Mercator projection (thread-local PROJ context, RAII cleanup) ----
 // Mirrors OSMReader.cpp's ProjContext pattern. The earlier version of this
@@ -41,6 +45,19 @@ static std::pair<double,double> toMercatorAP(double lon, double lat) {
     PJ_COORD in  = proj_coord(lon, lat, 0, 0);
     PJ_COORD out = proj_trans(tl_proj_ap.pj, PJ_FWD, in);
     return {out.xy.x, out.xy.y};
+}
+
+// OurAirports is a crowd-sourced, free dataset -- occasional bad rows are
+// expected (found live: a runway end with le_longitude_deg=3824610.0, a
+// clear data-entry error upstream). toMercatorAP()/PROJ doesn't validate
+// its input and doesn't report failure through its return value either
+// (a bad coordinate just gets logged by PROJ itself, e.g. "webmerc:
+// Invalid longitude", while still returning -- typically inf/nan -- as if
+// nothing were wrong), so garbage in means garbage silently written to
+// the geog column unless the input is checked before ever reaching it.
+static bool validLonLatAP(double lon, double lat) {
+    return std::isfinite(lon) && std::isfinite(lat) &&
+           lon >= -180.0 && lon <= 180.0 && lat >= -90.0 && lat <= 90.0;
 }
 
 // ---- WKB point ----
@@ -108,9 +125,24 @@ static bool parseBool(const std::string& s) {
     return s == "1" || s == "yes" || s == "true";
 }
 
+// curl's own --retry only covers one invocation's worth of transient
+// network hiccups; this adds a second layer on top (a few attempts with a
+// short sleep between them, mirroring AirspaceLoader's downloadFileRetry)
+// so a blip that outlasts curl's own retries doesn't silently kill the
+// entire airports load for an otherwise-successful multi-hour import (this
+// happened for real: one of these six downloads failed after curl's own
+// retries, and the failure surfaced no detail about which file or why).
 static bool downloadAP(const std::string& url, const std::string& dest) {
-    std::string cmd = "curl -sf --retry 3 -o \"" + dest + "\" \"" + url + "\"";
-    return system(cmd.c_str()) == 0;
+    constexpr int kAttempts = 3;
+    for (int i = 0; i < kAttempts; ++i) {
+        std::string cmd = "curl -sf --retry 3 -o \"" + dest + "\" \"" + url + "\"";
+        int rc = system(cmd.c_str());
+        if (rc == 0) return true;
+        std::cerr << "[AirportsLoader] download attempt " << (i + 1) << "/" << kAttempts
+                  << " failed (curl exit status " << rc << ") for " << url << "\n";
+        if (i + 1 < kAttempts) std::this_thread::sleep_for(std::chrono::seconds(5));
+    }
+    return false;
 }
 
 // ---- Table loaders ----
@@ -176,7 +208,7 @@ static void loadAirports(pqxx::connection& conn, const std::string& path, bool v
         auto lat = optDouble(v[4]), lon = optDouble(v[5]);
         std::optional<double> lat_m, lon_m;
         std::optional<std::string> geog;
-        if (lat && lon) {
+        if (lat && lon && validLonLatAP(*lon, *lat)) {
             auto [mx,my] = toMercatorAP(*lon, *lat);
             lon_m = mx; lat_m = my; geog = pointWKBAP(mx, my);
         }
@@ -254,11 +286,11 @@ static void loadRunways(pqxx::connection& conn, const std::string& path, bool ve
         auto he_lat = optDouble(v[15]), he_lon = optDouble(v[16]);
         std::optional<double> le_lat_m, le_lon_m, he_lat_m, he_lon_m;
         std::optional<std::string> le_geog, he_geog;
-        if (le_lat && le_lon) {
+        if (le_lat && le_lon && validLonLatAP(*le_lon, *le_lat)) {
             auto [mx,my] = toMercatorAP(*le_lon, *le_lat);
             le_lon_m = mx; le_lat_m = my; le_geog = pointWKBAP(mx, my);
         }
-        if (he_lat && he_lon) {
+        if (he_lat && he_lon && validLonLatAP(*he_lon, *he_lat)) {
             auto [mx,my] = toMercatorAP(*he_lon, *he_lat);
             he_lon_m = mx; he_lat_m = my; he_geog = pointWKBAP(mx, my);
         }
@@ -304,11 +336,11 @@ static void loadNavaids(pqxx::connection& conn, const std::string& path, bool ve
         auto dme_lat = optDouble(v[12]), dme_lon = optDouble(v[13]);
         std::optional<double> lat_m, lon_m, dme_lat_m, dme_lon_m;
         std::optional<std::string> geog;
-        if (lat && lon) {
+        if (lat && lon && validLonLatAP(*lon, *lat)) {
             auto [mx,my] = toMercatorAP(*lon, *lat);
             lon_m = mx; lat_m = my; geog = pointWKBAP(mx, my);
         }
-        if (dme_lat && dme_lon) {
+        if (dme_lat && dme_lon && validLonLatAP(*dme_lon, *dme_lat)) {
             auto [mx,my] = toMercatorAP(*dme_lon, *dme_lat);
             dme_lon_m = mx; dme_lat_m = my;
         }
@@ -359,7 +391,19 @@ static void loadNavaids(pqxx::connection& conn, const std::string& path, bool ve
 
 bool AirportsLoader::load(bool verbose) {
     const std::string base = "https://davidmegginson.github.io/ourairports-data/";
-    const std::string tmp  = "/tmp/ourairports_";
+    // Keyed by PID, not a fixed shared path: this loader runs as different
+    // OS users at different times (a manual daniel-run bulk import vs. the
+    // gpsxdb-poll service's own periodic reload) but always against the
+    // same "nav" database, so there's no natural database-scoped
+    // disambiguator the way Replicator.cpp's /tmp/osm_state_<database>.txt
+    // fix had. Whichever user's process ran first left these files behind
+    // owned by them (nothing here ever cleaned them up either) at mode 644,
+    // silently blocking every other user's curl from ever overwriting them
+    // again -- confirmed live: a gpsxdb-owned /tmp/ourairports_countries.csv
+    // from 2 days earlier made every subsequent daniel-run import fail this
+    // download with CURLE_WRITE_ERROR (23), retries included, since retrying
+    // the exact same unwritable path can't help.
+    const std::string tmp = "/tmp/ourairports_" + std::to_string(getpid()) + "_";
 
     struct FileSpec { std::string name, url, dest; };
     std::vector<FileSpec> files = {
@@ -371,11 +415,18 @@ bool AirportsLoader::load(bool verbose) {
         {"navaids",     base + "navaids.csv",             tmp + "navaids.csv"},
     };
 
+    auto cleanupTempFiles = [&files]() {
+        for (auto& f : files) std::remove(f.dest.c_str());
+    };
+
     if (verbose) std::cout << "Downloading OurAirports data...\n";
     for (auto& f : files) {
         if (verbose) { std::cout << "  " << f.name << "... "; std::cout.flush(); }
         if (!downloadAP(f.url, f.dest)) {
-            std::cerr << "FAILED — skipping airports load\n"; return false;
+            std::cerr << "[AirportsLoader] FAILED downloading " << f.name << " from " << f.url
+                      << " — skipping airports load (existing table contents, if any, left untouched)\n";
+            cleanupTempFiles();
+            return false;
         }
         if (verbose) std::cout << "OK\n";
     }
@@ -398,6 +449,42 @@ bool AirportsLoader::load(bool verbose) {
     loadFrequencies(conn_, files[3].dest, verbose); progress_cb_(4, 6);
     loadRunways    (conn_, files[4].dest, verbose); progress_cb_(5, 6);
     loadNavaids    (conn_, files[5].dest, verbose); progress_cb_(6, 6);
+
+    // p_srid defaults to 4326 but accepts 3857 (the table's native SRID)
+    // directly too -- ST_Transform is a no-op when source and target SRID
+    // already match. geog is passed to the KNN operator (<->) bare, not
+    // wrapped in ST_SetSRID(geog,...): that wrapping is a no-op value-wise
+    // (geog is already SRID 3857) but produces a different expression than
+    // what airports_geog_idx was built on, defeating the index and forcing
+    // a full seq scan + sort -- found the hard way via dq_check.py running
+    // ~150ms/call instead of a fraction of a ms.
+    // Non-essential convenience function, not core import data -- must
+    // never be allowed to take down the whole import on a bug (see the
+    // identical guard in AirspaceLoader::createQueryFunctions(), added
+    // after exactly that happened to airspace_at_point() 7+ hours into a
+    // run, via an uncaught pqxx exception -> std::terminate()).
+    try {
+        pqxx::work txn(conn_);
+        txn.exec(
+            "CREATE OR REPLACE FUNCTION public.nearest_airport("
+            "  p_x double precision, p_y double precision, p_srid integer DEFAULT 4326"
+            ") RETURNS TABLE(ident varchar, name varchar, type varchar, "
+            "                elevation_ft integer, dist_km double precision) "
+            "LANGUAGE sql STABLE PARALLEL SAFE AS $f$ "
+            "  SELECT a.ident, a.name, a.type, a.elevation_ft, "
+            "         ST_Distance(a.geog, pt.g) / 1000.0 "
+            "  FROM public.airports a, "
+            "       (SELECT ST_Transform(ST_SetSRID(ST_MakePoint(p_x, p_y), p_srid), 3857) AS g) pt "
+            "  ORDER BY a.geog <-> pt.g "
+            "  LIMIT 1 "
+            "$f$");
+        txn.commit();
+    } catch (const std::exception& e) {
+        std::cerr << "[AirportsLoader] nearest_airport() function creation failed (non-fatal): "
+                  << e.what() << "\n";
+    }
+
+    cleanupTempFiles();
     if (verbose) std::cout << "Airports data loaded.\n";
     return true;
 }

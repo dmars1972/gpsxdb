@@ -9,7 +9,7 @@
 // boundary-inclusive in Boost.Geometry, so these should agree on every
 // input; any mismatch here is a refactor bug, not an expected algorithm
 // change (that only applies to non-Point candidates, exercised later by
-// regional_table_export, not by this tool).
+// regional_db_export's --big-tables-only pass, not by this tool).
 //
 // Not part of the production build -- compiled/run directly, see task #47.
 #include "GeoUtils.h"

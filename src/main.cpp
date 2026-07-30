@@ -172,6 +172,8 @@ struct Status {
         // into the next one's display.
         phase_progress.store(0, std::memory_order_relaxed);
         phase_total.store(0, std::memory_order_relaxed);
+        region_index.store(0, std::memory_order_relaxed);
+        region_total.store(0, std::memory_order_relaxed);
     }
 
     // Current phase counters — reset at each phase transition for display
@@ -187,6 +189,14 @@ struct Status {
     // count rather than a done/total ratio).
     std::atomic<int64_t> phase_progress{0};
     std::atomic<int64_t> phase_total{0};
+    // TerrainLoading only, fed by TerrainLoader::setRegionProgressCallback —
+    // phase_progress/phase_total reset to a new (small) tile count at every
+    // region boundary with nothing to show that's actually forward overall
+    // progress, not a regression; region_total==0 means "not in the
+    // per-region part yet" (e.g. still on the CONUS 3DEP load), so it's
+    // left out of the display rather than shown as "0/0".
+    std::atomic<int> region_index{0};
+    std::atomic<int> region_total{0};
     // Running totals — never reset, used for final summary
     std::atomic<int64_t> total_nodes{0};
     std::atomic<int64_t> total_areas{0};
@@ -813,10 +823,24 @@ void statusThread(const Status& s, std::atomic<bool>& done,
                   const OSMMMap& osmmap,
                   const std::atomic<bool>& merge_done) {
     auto start = std::chrono::steady_clock::now();
+    bool was_loader_phase = false;
+    bool first_tick = true;
     while (!done.load(std::memory_order_relaxed)) {
         auto now      = std::chrono::steady_clock::now();
         double elapsed = std::chrono::duration<double>(now - start).count();
         Phase ph = static_cast<Phase>(s.phase.load(std::memory_order_relaxed));
+
+        // The bulk-load phases (Nodes through Spatial Indexing) and the
+        // loader phases (Airports through Terrain) use different-width
+        // status lines sharing one \r-overwritten line -- switching from
+        // the long format to the short one otherwise leaves leftover
+        // characters from the longer line trailing past the end of the
+        // shorter one. A newline right at that one transition both fixes
+        // that and leaves the initial-load status visible as its own
+        // permanent line instead of getting overwritten by everything after.
+        if (!first_tick && isLoaderPhase(ph) && !was_loader_phase) std::cout << "\n";
+        was_loader_phase = isLoaderPhase(ph);
+        first_tick = false;
         // Format elapsed as H:MM:SS
         int64_t secs = static_cast<int64_t>(elapsed);
         int h = secs / 3600, m = (secs % 3600) / 60, sec = secs % 60;
@@ -833,6 +857,14 @@ void statusThread(const Status& s, std::atomic<bool>& done,
             int64_t t = s.phase_total.load(std::memory_order_relaxed);
             std::cout << "\r" << elapsed_str << "  " << loaderPhaseTag(ph) << ":";
             if (t > 0) std::cout << p << "/" << t; else std::cout << p;
+            // Terrain-only: which of the 10 global regions is current, so a
+            // small per-region tile count (e.g. "56/4330" right after a
+            // finished region showed "2000/2019") doesn't read as having
+            // gone backwards -- see setRegionProgressCallback's doc comment.
+            int rt = s.region_total.load(std::memory_order_relaxed);
+            if (rt > 0)
+                std::cout << "  regions:(" << s.region_index.load(std::memory_order_relaxed)
+                          << "/" << rt << ")";
             std::cout << "   " << std::flush;
         } else {
             int64_t total  = s.nodes + s.areas + s.ways + s.relations;
@@ -913,8 +945,8 @@ static int runDelta(const Args& args) {
         // coordinate store — see RegionalDeltaApplier's top-of-file
         // comment) instead of the master OSMMMap, and every installed
         // region's own polygon (same RegionIndex/RegionPolygons infra
-        // regional_export.cpp and regional_table_export.cpp use, parsed
-        // from the DB's own WKT text rather than a data/regions/*.wkt
+        // regional_export.cpp and regional_db_export.cpp's --big-tables-only
+        // pass use, parsed from the DB's own WKT text rather than a data/regions/*.wkt
         // file) for DB-write filtering. A database with more than one
         // region installed is handled by one applier testing against all
         // of them, not one poll process per region.
@@ -1055,35 +1087,42 @@ int main(int argc, char** argv) {
                 NavDB db(0, args.server, args.user, args.database, db_flush_mu_early);
                 db.truncateForResume("airports");
             }
-            AirportsLoader(args.server, args.user, args.database).load(false);
-            LOGI(-1, "airports data loaded");
+            {
+                bool ok = AirportsLoader(args.server, args.user, args.database).load(false);
+                LOGI(-1, ok ? "airports data loaded" : "airports data load FAILED — see stderr above");
+            }
         }
         if (args.resume_phase == Phase::FAALoading || args.resume_phase == Phase::Vacuuming) {
             LOGI(-1, "resume: loading FAA obstacle data");
-            FAAObstacleLoader(args.server, args.user, args.database).load(false);
-            LOGI(-1, "FAA obstacle data loaded");
+            bool ok = FAAObstacleLoader(args.server, args.user, args.database).load(false);
+            LOGI(-1, ok ? "FAA obstacle data loaded" : "FAA obstacle data load FAILED — see stderr above");
         }
         if (args.resume_phase == Phase::FAALoading || args.resume_phase == Phase::WMMLoading
             || args.resume_phase == Phase::Vacuuming) {
             LOGI(-1, "resume: loading WMM declination data");
-            WMMLoader(args.server, args.user, args.database).load(currentDecimalYear(),
+            bool ok = WMMLoader(args.server, args.user, args.database).load(currentDecimalYear(),
                     -180, -90, 180, 90, 0.25, 3857, 0.25, 50.0, 4, false);
-            LOGI(-1, "WMM declination data loaded");
+            LOGI(-1, ok ? "WMM declination data loaded" : "WMM declination data load FAILED — see stderr above");
         }
         if (args.resume_phase == Phase::WMMLoading || args.resume_phase == Phase::AirspaceLoading
             || args.resume_phase == Phase::Vacuuming) {
             LOGI(-1, "resume: loading airspace data");
+            bool class_ok, sua_ok, intl_ok = true, mtr_ok, tfr_ok;
             {
                 AirspaceLoader airspace(args.server, args.user, args.database);
-                airspace.loadClassAirspace(false);
-                airspace.loadSpecialUseAirspace(false);
+                class_ok = airspace.loadClassAirspace(false);
+                sua_ok = airspace.loadSpecialUseAirspace(false);
                 std::string openaip_key = defaultOpenAipApiKey();
                 if (!openaip_key.empty())
-                    airspace.loadInternationalAirspace(openaip_key, false);
+                    intl_ok = airspace.loadInternationalAirspace(openaip_key, false);
                 else
                     LOGI(-1, "no OpenAIP API key found (~/.openaip_api_key) — skipping international airspace");
+                mtr_ok = airspace.loadMilitaryTrainingRoutes(false);
+                tfr_ok = airspace.loadNationalDefenseTFRs(false);
             }
-            LOGI(-1, "airspace data loaded");
+            LOGI(-1, (class_ok && sua_ok && intl_ok && mtr_ok && tfr_ok)
+                     ? "airspace data loaded"
+                     : "airspace data load FAILED for one or more sources — see stderr above");
         }
         if (args.resume_phase == Phase::AirspaceLoading || args.resume_phase == Phase::TerrainLoading
             || args.resume_phase == Phase::Vacuuming) {
@@ -1361,53 +1400,67 @@ int main(int argc, char** argv) {
         status.phase_total.store(total, std::memory_order_relaxed);
     };
 
+    // Every loader's success/failure is now actually checked and logged --
+    // previously these all logged an unconditional "X data loaded" after
+    // calling .load(false), regardless of what it returned, which let a
+    // real failure (a transient download hiccup that outlasted the
+    // loader's own retries) pass by completely silently in the log.
     status.advancePhase(Phase::Indexing, Phase::AirportsLoading);
     LOGI(-1, "loading airports data");
     {
         AirportsLoader loader(args.server, args.user, args.database);
         loader.setProgressCallback(reportProgress);
-        loader.load(false);
+        bool ok = loader.load(false);
+        LOGI(-1, ok ? "airports data loaded" : "airports data load FAILED — see stderr above");
     }
-    LOGI(-1, "airports data loaded");
 
     status.advancePhase(Phase::AirportsLoading, Phase::FAALoading);
     LOGI(-1, "loading FAA obstacle data");
     {
         FAAObstacleLoader loader(args.server, args.user, args.database);
         loader.setProgressCallback(reportProgress);
-        loader.load(false);
+        bool ok = loader.load(false);
+        LOGI(-1, ok ? "FAA obstacle data loaded" : "FAA obstacle data load FAILED — see stderr above");
     }
-    LOGI(-1, "FAA obstacle data loaded");
 
     status.advancePhase(Phase::FAALoading, Phase::WMMLoading);
     LOGI(-1, "loading WMM declination data");
     {
         WMMLoader loader(args.server, args.user, args.database);
         loader.setProgressCallback(reportProgress);
-        loader.load(currentDecimalYear(), -180, -90, 180, 90, 0.25, 3857, 0.25, 50.0, 4, false);
+        bool ok = loader.load(currentDecimalYear(), -180, -90, 180, 90, 0.25, 3857, 0.25, 50.0, 4, false);
+        LOGI(-1, ok ? "WMM declination data loaded" : "WMM declination data load FAILED — see stderr above");
     }
-    LOGI(-1, "WMM declination data loaded");
 
     status.advancePhase(Phase::WMMLoading, Phase::AirspaceLoading);
     LOGI(-1, "loading airspace data");
     {
         AirspaceLoader airspace(args.server, args.user, args.database);
         airspace.setProgressCallback(reportProgress);
-        airspace.loadClassAirspace(false);
-        airspace.loadSpecialUseAirspace(false);
+        bool class_ok = airspace.loadClassAirspace(false);
+        bool sua_ok = airspace.loadSpecialUseAirspace(false);
+        bool intl_ok = true;
         std::string openaip_key = defaultOpenAipApiKey();
         if (!openaip_key.empty())
-            airspace.loadInternationalAirspace(openaip_key, false);
+            intl_ok = airspace.loadInternationalAirspace(openaip_key, false);
         else
             LOGI(-1, "no OpenAIP API key found (~/.openaip_api_key) — skipping international airspace");
+        bool mtr_ok = airspace.loadMilitaryTrainingRoutes(false);
+        bool tfr_ok = airspace.loadNationalDefenseTFRs(false);
+        LOGI(-1, (class_ok && sua_ok && intl_ok && mtr_ok && tfr_ok)
+                 ? "airspace data loaded"
+                 : "airspace data load FAILED for one or more sources — see stderr above");
     }
-    LOGI(-1, "airspace data loaded");
 
     status.advancePhase(Phase::AirspaceLoading, Phase::TerrainLoading);
     LOGI(-1, "loading terrain elevation data");
     {
         TerrainLoader terrain(args.server, args.user, args.database);
         terrain.setProgressCallback(reportProgress);
+        terrain.setRegionProgressCallback([&](int idx, int total) {
+            status.region_index.store(idx, std::memory_order_relaxed);
+            status.region_total.store(total, std::memory_order_relaxed);
+        });
         terrain.load(kConusBbox.min_lon, kConusBbox.min_lat, kConusBbox.max_lon, kConusBbox.max_lat,
                      TerrainSource::USGS3DEP, 3857, args.way_threads, false);
         terrain.loadGlobal(3857, args.way_threads, false);

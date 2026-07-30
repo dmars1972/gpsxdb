@@ -203,9 +203,10 @@ void RegionalDeltaApplier::createNode(NodeEntry& n) {
     pending_[n.id] = {n.lon_m, n.lat_m};
 
     if (n.tags.empty()) return;
-    // Matches regional_table_export's own `nodes` table criterion: only a
-    // tagged node that's itself geometrically in-region gets a DB row —
-    // this is a separate concern from pure coordinate resolution above.
+    // Matches regional_db_export --big-tables-only's own `nodes` table
+    // criterion: only a tagged node that's itself geometrically in-region
+    // gets a DB row — this is a separate concern from pure coordinate
+    // resolution above.
     if (!nodeInRegion(n.lon_m, n.lat_m)) return;
     db_.updateNode(n.id, n.name, n.lon_m, n.lat_m, n.tags, n.geog_wkb_hex);
 }

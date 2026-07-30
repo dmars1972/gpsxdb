@@ -1,5 +1,6 @@
 #pragma once
 #include <string>
+#include <functional>
 #include "DbClient.h"
 #include "Regions.h"
 
@@ -71,4 +72,21 @@ public:
     bool loadGlobal(int dest_srid = 3857,
                     int threads = 10,
                     bool verbose = true);
+
+    // Optional hook: loadGlobal() calls region_progress_cb_(index, total)
+    // (1-based index) right before starting each kGlobalRegions entry --
+    // separate from DbClient's progress_cb_ (which reports tile progress
+    // within the current region/call and would otherwise reset with no
+    // indication of overall standing, e.g. going from "tile 2000/2019" for
+    // one region straight to "tile 56/4330" for the next with nothing to
+    // show this is actually further along overall, not further behind).
+    // Not called for the separate CONUS 3DEP load() before loadGlobal()
+    // starts -- that's a single call outside the region loop, not one of
+    // the 10 entries this counts.
+    void setRegionProgressCallback(std::function<void(int, int)> cb) {
+        region_progress_cb_ = std::move(cb);
+    }
+
+private:
+    std::function<void(int, int)> region_progress_cb_ = [](int, int) {};
 };

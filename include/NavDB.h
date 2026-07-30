@@ -190,6 +190,7 @@ private:
     void addTags(int64_t id, const Tags& tags, bool is_node = false);
     void addWayTags(int64_t id, const Tags& tags);
     void addAreaTags(int64_t id, const Tags& tags);
+    void addRoadTags(int64_t id, const Tags& tags);
     void flushNodes();
     void flushWays();
     void flushAreas();
@@ -213,6 +214,7 @@ private:
     std::vector<TagRecord>  tag_buf_;
     std::vector<TagRecord>  way_tag_buf_;
     std::vector<TagRecord>  area_tag_buf_;
+    std::vector<TagRecord>  road_tag_buf_;
 
     static constexpr int NODE_BUFFER_SIZE = 20000;
     static constexpr int WAY_BUFFER_SIZE  = 10000;

@@ -48,8 +48,8 @@
 //
 //  - Region membership filtering: every way/area/road/relation change is
 //    tested against this install's own region polygon before deciding to
-//    upsert or delete, matching regional_table_export's own inclusion
-//    criterion -- including deleting a previously-in-region entity that
+//    upsert or delete, matching regional_db_export --big-tables-only's own
+//    inclusion criterion -- including deleting a previously-in-region entity that
 //    edited its way across the region boundary. Node DB rows (as opposed
 //    to pure coordinate resolution) follow the same in-region-only rule,
 //    independent of pending_/overlay_ promotion.

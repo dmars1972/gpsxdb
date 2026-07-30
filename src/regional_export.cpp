@@ -16,8 +16,8 @@
 // The actual spatial matching (bbox pre-filter, rtree of the region's
 // constituent polygon envelopes, exact intersects() test against only the
 // rtree's candidates) is RegionIndex (include/RegionIndex.h), shared with
-// regional_table_export -- see that header for the covered_by-vs-
-// intersects() correctness note. Region polygons are projected to
+// regional_db_export's --big-tables-only pass -- see that header for the
+// covered_by-vs-intersects() correctness note. Region polygons are projected to
 // Mercator meters once at startup (matching nodes.dat's on-disk units —
 // production data is loaded with use_mercator=true, i.e. no -L/--wgs84
 // flag), same forward projection as node coordinates, so no per-record
@@ -37,15 +37,16 @@
 // legitimately cross a region's border, referencing vertices whose own
 // coordinate falls just outside the polygon -- a region-aware poll process
 // needs those too, to resolve such a way's full geometry locally. This
-// tool folds in regional_table_export.cpp's <region>/extra_vertices.bin
-// (--extra-vertices-dir, defaulting to --out-dir, i.e. the same directory
-// regional_table_export was pointed at) -- exact-match coordinate lookups
-// against a hash built from those files, ORed into the same per-node
-// region bitmask as the polygon test. Coordinates match bit-for-bit (no
-// tolerance/rounding): both regional_table_export's decoded WKB vertices
-// and nodes.dat's own records trace back to the same resolved doubles
-// written by GeoUtils::buildWayGeom/DeltaApplier at import time, never
-// reprojected in between. regional_table_export MUST run first now (the
+// tool folds in regional_db_export.cpp's --big-tables-only pass's
+// <region>/extra_vertices.bin (--extra-vertices-dir, defaulting to
+// --out-dir, i.e. the same directory that pass was pointed at) --
+// exact-match coordinate lookups against a hash built from those files,
+// ORed into the same per-node region bitmask as the polygon test.
+// Coordinates match bit-for-bit (no tolerance/rounding): both the
+// --big-tables-only pass's decoded WKB vertices and nodes.dat's own
+// records trace back to the same resolved doubles written by
+// GeoUtils::buildWayGeom/DeltaApplier at import time, never reprojected in
+// between. regional_db_export --big-tables-only MUST run first now (the
 // reverse of this pipeline's original order) so extra_vertices.bin exists
 // before this scan starts.
 #include "OSMMMap.h"
@@ -123,11 +124,11 @@ CoordKey makeCoordKey(double lon_m, double lat_m) {
 }
 
 // Loads every region's <extra_vertices_dir>/<region>/extra_vertices.bin
-// (regional_table_export.cpp's output -- see that file's top-of-file
-// comment) into one combined hash, ORing each region's bit into whichever
-// coordinates it contributed. A region with no such file (e.g. it borders
-// no other region, or regional_table_export hasn't been re-run for it yet)
-// contributes nothing -- not an error.
+// (regional_db_export.cpp's --big-tables-only output -- see that file's
+// top-of-file comment) into one combined hash, ORing each region's bit
+// into whichever coordinates it contributed. A region with no such file
+// (e.g. it borders no other region, or --big-tables-only hasn't been
+// re-run for it yet) contributes nothing -- not an error.
 std::unordered_map<CoordKey, uint32_t, CoordKeyHash> loadExtraVertices(
         const std::string& extra_vertices_dir, const std::vector<RegionIndex::Entry>& regions, bool verbose) {
     std::unordered_map<CoordKey, uint32_t, CoordKeyHash> extra;
@@ -192,12 +193,12 @@ int main(int argc, char** argv) {
                          "defaults to the machine's hardware concurrency.\n"
                          "\n"
                          "Also widens each region's node file with border-crossing way/area/\n"
-                         "road vertices from regional_table_export.cpp's <region>/\n"
+                         "road vertices from regional_db_export --big-tables-only's <region>/\n"
                          "extra_vertices.bin, read from --extra-vertices-dir (default: same as\n"
-                         "--out-dir). regional_table_export must have already been run against\n"
-                         "that directory. --no-extra-vertices restores the old polygon-only\n"
-                         "behavior (e.g. for a byte-for-byte regression diff against a\n"
-                         "pre-widening build).\n";
+                         "--out-dir). regional_db_export --big-tables-only must have already\n"
+                         "been run against that directory. --no-extra-vertices restores the\n"
+                         "old polygon-only behavior (e.g. for a byte-for-byte regression diff\n"
+                         "against a pre-widening build).\n";
             std::cout.flush();
             _exit(0);  // avoid pqxx/PROJ static-destructor double-free on normal return
         }

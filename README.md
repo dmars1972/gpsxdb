@@ -519,22 +519,23 @@ full planet.
   [--regions name1,name2,...] [--region-batch-size N] [-v]
 ```
 
-This runs three tools in sequence for every requested region (all of them
+This runs two tools in sequence for every requested region (all of them
 if `--regions` is omitted), then bundles the result:
+- `regional_db_export --big-tables-only` — single client-side pass over the
+  5 big parent+child table pairs (ways/areas/roads/relations/nodes and
+  their `_tags` children), classifying each row against every region's
+  real polygon in one read instead of one `ST_Intersects` query per
+  region. Also writes each region's `extra_vertices.bin`.
 - `regional_export` — one pass over the master `nodes.dat` producing each
-  region's own node coordinate slice, widened to include every vertex of
-  any way/area/road included in that region (not just nodes whose own
-  coordinate falls inside the region polygon — needed so a region-aware
-  poll process can always resolve a border-crossing way's full geometry
-  locally, see below).
-- `regional_table_export` — single client-side pass over the 5 big
-  parent+child table pairs (ways/areas/roads/relations/nodes and their
-  `_tags` children), classifying each row against every region's real
-  polygon in one read instead of one `ST_Intersects` query per region.
-- `regional_db_export` — the remaining, smaller tables (airports, WMM,
-  terrain, airspace, etc.), one per region.
-- `--region-batch-size` bounds peak disk usage for `regional_table_export`
-  (all requested regions' big-table output otherwise lands on disk
+  region's own node coordinate slice, widened (via `extra_vertices.bin`
+  above) to include every vertex of any way/area/road included in that
+  region (not just nodes whose own coordinate falls inside the region
+  polygon — needed so a region-aware poll process can always resolve a
+  border-crossing way's full geometry locally, see below).
+- `regional_db_export --small-tables-only` — the remaining, smaller tables
+  (airports, WMM, terrain, airspace, etc.), one per region.
+- `--region-batch-size` bounds peak disk usage for the `--big-tables-only`
+  pass (all requested regions' big-table output otherwise lands on disk
   simultaneously) by splitting the region list into batches.
 
 ### Installing a bundle

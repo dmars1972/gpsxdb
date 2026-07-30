@@ -52,6 +52,37 @@ public:
     //
     // api_key: your OpenAIP API key (see openaip.net account settings).
     bool loadInternationalAirspace(const std::string& api_key, bool verbose = true);
+
+    // Downloads and loads FAA Military Training Routes (IR/VR) into the
+    // military_training_routes table. Same source/coverage/cadence as
+    // loadClassAirspace above. mtr_type (a 0/1 code in the source data,
+    // presumably IR vs VR) is stored raw, not decoded -- no coded-value
+    // domain on the field and no FAA documentation found confirming which
+    // value means which; see the DDL comment in NavDB.cpp for detail.
+    bool loadMilitaryTrainingRoutes(bool verbose = true);
+
+    // Downloads and loads the FAA's "National Defense Airspace TFR Areas"
+    // layer into the national_defense_tfr table. Deliberately scoped/named:
+    // this covers only long-duration security-related TFRs (presidential
+    // movements, defense installations) published on FAA's regular ArcGIS
+    // data cycle -- NOT the full day-to-day TFR picture pilots see on
+    // tfr.faa.gov (stadium games, wildfires, VIP movements change far too
+    // fast for a source on this cadence, and the only feed found with that
+    // full picture has no geometry at all, just free-text descriptions --
+    // not usable for the spatial queries this project is built around).
+    bool loadNationalDefenseTFRs(bool verbose = true);
+
+private:
+    // (Re)creates public.airspace_at_point() (a UNION ALL across whichever
+    // of class_airspace/special_use_airspace/international_airspace/
+    // national_defense_tfr currently exist) and
+    // public.military_routes_nearby() -- called at the end of each loadXxx()
+    // above so both stay correct regardless of which subset actually ran
+    // (e.g. no OpenAIP key configured, so international_airspace never gets
+    // created). CREATE FUNCTION validates a SQL-language body's table
+    // references at creation time, so a table that doesn't exist yet must
+    // be left out of the UNION rather than just returning no rows from it.
+    void createQueryFunctions();
 };
 
 // Reads the OpenAIP API key from ~/.openaip_api_key (never from the repo —

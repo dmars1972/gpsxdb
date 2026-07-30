@@ -26,7 +26,7 @@
 // used uniformly for every candidate type including Point, dispatched via
 // std::visit over WkbDecode::GeomVariant so one Entry serves both
 // regional_export's plain (id, lon_m, lat_m) points and
-// regional_table_export's decoded table rows.
+// regional_db_export's --big-tables-only pass's decoded table rows.
 //
 // Callers are responsible for projecting both the region polygons (via
 // build()'s `polygon` parameter) and every candidate geometry into the
