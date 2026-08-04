@@ -842,20 +842,33 @@ further.
 
 ## Data sources
 
-- **OSM planet/extracts**: [planet.openstreetmap.org](https://planet.openstreetmap.org) or [Geofabrik](https://download.geofabrik.de)
-- **OurAirports**: [davidmegginson.github.io/ourairports-data](https://davidmegginson.github.io/ourairports-data/) (downloaded automatically at import time)
-- **FAA Digital Obstacle File**: [aeronav.faa.gov/Obst_Data/DDOF.zip](https://aeronav.faa.gov/Obst_Data/DDOF.zip) — daily-updated file of all US man-made obstacles affecting aeronautical charting (downloaded automatically at import time)
-- **USGS 3DEP**: 1 arc-second (~30m) elevation, US + territories only
-- **Copernicus DEM GLO-30**: [copernicus-dem-30m.s3.amazonaws.com](https://copernicus-dem-30m.s3.amazonaws.com/) — ~30m elevation, worldwide, public AWS Open Data, no API key
-- **NOAA/NCEI World Magnetic Model**: [ncei.noaa.gov/products/world-magnetic-model](https://www.ncei.noaa.gov/products/world-magnetic-model) — WMM2025 coefficients, embedded in this project's source rather than fetched at runtime
-- **FAA Class/Special Use Airspace**: FAA Aeronautical Information Services' public ArcGIS open data portal (adds-faa.opendata.arcgis.com), downloaded automatically
-- **OpenAIP**: [openaip.net](https://www.openaip.net/) — crowd-sourced international airspace, CC BY-NC 4.0 (noncommercial use only), requires a free API key
+| Source | License | Notes |
+| --- | --- | --- |
+| **OSM planet/extracts** — [planet.openstreetmap.org](https://planet.openstreetmap.org) / [Geofabrik](https://download.geofabrik.de) | [ODbL 1.0](https://opendatacommons.org/licenses/odbl/1-0/) | Attribution + share-alike on the database itself — see note below |
+| **OurAirports** — [davidmegginson.github.io/ourairports-data](https://davidmegginson.github.io/ourairports-data/) | Public domain | Downloaded automatically at import time |
+| **FAA Digital Obstacle File** — [aeronav.faa.gov/Obst_Data/DDOF.zip](https://aeronav.faa.gov/Obst_Data/DDOF.zip) | Public domain (US govt. work) | Daily-updated; downloaded automatically at import time |
+| **FAA Class/Special Use Airspace, MTR, TFR** — FAA Aeronautical Information Services ArcGIS portal (adds-faa.opendata.arcgis.com) | Public domain (US govt. work) | Downloaded automatically |
+| **USGS 3DEP** | Public domain (US govt. work) | 1 arc-second (~30m) elevation, US + territories only |
+| **Copernicus DEM GLO-30** — [copernicus-dem-30m.s3.amazonaws.com](https://copernicus-dem-30m.s3.amazonaws.com/) | [Copernicus Data Terms](https://spacedata.copernicus.eu/data-offer/copernicus-data-terms) (free, attribution required) | ~30m elevation, worldwide, public AWS Open Data, no API key |
+| **NOAA/NCEI World Magnetic Model** — [ncei.noaa.gov/products/world-magnetic-model](https://www.ncei.noaa.gov/products/world-magnetic-model) | Public domain (US govt. work) | WMM2025 coefficients, embedded in source rather than fetched at runtime |
+| **OpenAIP** — [openaip.net](https://www.openaip.net/) | CC BY-NC 4.0, with a bundling carve-out — see note below | Crowd-sourced international airspace, requires a free API key |
+
+### Attribution and redistribution
+
+Everything this project imports carries its own license, separate from and unaffected by this repository's own (MIT) license on the *code*. Two sources need active attention before any data — bundled exports, a hosted install, anything derived from the database — is distributed to a third party, commercially or otherwise:
+
+- **OpenStreetMap data is ODbL-licensed.** ODbL is commercial-use-friendly — it does not restrict charging for a product or service built on OSM data (this is how Mapbox and many others operate). It requires (1) attribution to OpenStreetMap and its contributors, and (2) that the database itself — or a substantial extract of it, which a regional bundle is — stay available under ODbL or a compatible license if you redistribute it. This applies regardless of what license covers this project's code; ODbL governs the *data*, not the software that produces or serves it. A short attribution notice ("© OpenStreetMap contributors, ODbL 1.0") should accompany any bundle or public-facing instance. See [osmfoundation.org/wiki/Licence](https://wiki.osmfoundation.org/wiki/Licence/Attribution_Guidelines) for the current attribution guidelines.
+- **OpenAIP data is CC BY-NC 4.0**, but openAIP's own site terms (see [openaip.net/legal](https://www.openaip.net/legal)) go further than bare CC BY-NC: they state third parties may ship openAIP data bundled with paid/commercial applications as long as they don't *exclusively* sell openAIP data, plus attribution. Since this project bundles openAIP's airspace layer alongside OSM/FAA/terrain/WMM data rather than reselling it standalone, that carve-out plausibly covers commercial regional bundles as-is — **but verify the current wording at openaip.net/legal yourself before relying on it**, since terms can change and this project hasn't independently confirmed it beyond what's summarized there. For zero ambiguity (or if openAIP data becomes a more central feature later), openAIP also offers a commercial license that drops the NC/share-alike restriction — contact `licensing@openaip.net`.
+
+Public-domain US government sources (FAA, USGS, NOAA/NCEI) carry no restriction and need no attribution, though citing them is good practice.
+
+None of the above is legal advice — it's a summary of publicly stated license terms as of this writing. Get a real legal opinion before relying on it for a commercial launch.
 
 ---
 
 ## License
 
-MIT License — see [LICENSE](LICENSE)
+MIT License — see [LICENSE](LICENSE) — covers this repository's **code only**. The data it imports and can export is licensed separately per source; see [Data sources](#data-sources) above before redistributing anything derived from the database.
 
 ---
 
