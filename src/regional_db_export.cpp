@@ -862,6 +862,22 @@ int main(int argc, char** argv) {
     // mode targets a scratch --out-dir used only to produce
     // extra_vertices.bin for an already-built region (no table/tag output
     // goes there, so no real manifest to own).
+    //
+    // Only written if manifest.txt doesn't already exist -- NOT just for
+    // idempotence's sake. --big-tables-only (one call, all regions) and
+    // --small-tables-only (one call per region) are two separate process
+    // invocations of this same main(), run back to back by
+    // build_regional_bundles.sh for every real bundle build. Unconditionally
+    // truncating here on every invocation silently discarded the previous
+    // invocation's already-appended table.*.rows= entries -- confirmed live:
+    // after --big-tables-only wrote ways/areas/roads/relations/nodes rows
+    // for a region, the following --small-tables-only call for that same
+    // region overwrote manifest.txt back down to just these 3 lines before
+    // appending its own tables, permanently losing the big-table entries
+    // (the .bin files themselves were untouched -- regional_install.cpp
+    // detects tables by file existence, not manifest entries, so this
+    // wasn't data loss, but it made every shipped bundle's manifest an
+    // incomplete, misleading record).
     for (const auto& r : selected) {
         std::string region_dir = out_dir + "/" + r.name;
         if (!mkdirP(region_dir)) {
@@ -869,6 +885,8 @@ int main(int argc, char** argv) {
             _exit(1);
         }
         if (extra_vertices_only) continue;
+        std::ifstream existing(region_dir + "/manifest.txt");
+        if (existing.good()) continue;
         std::ofstream manifest(region_dir + "/manifest.txt");
         manifest << "region=" << r.name << "\n";
         manifest << "bbox=" << r.min_lon << "," << r.min_lat << "," << r.max_lon << "," << r.max_lat << "\n";
@@ -984,18 +1002,28 @@ int main(int argc, char** argv) {
         // kTables entries are independent queries writing independent
         // files -- run parallel_tables of them concurrently (each its own
         // psql subprocess/connection) instead of strictly sequentially,
-        // see top-of-file comment for why. manifest/cerr/cout writes from
-        // different worker threads are serialized via manifest_mu.
+        // see top-of-file comment for why. manifest writes from different
+        // worker threads are serialized inside appendManifestLines() (it
+        // takes manifest_mu itself) -- do NOT also lock manifest_mu around
+        // a call to it (see the comment at that call site below): an
+        // earlier version did exactly that and self-deadlocked every
+        // worker thread on its first table, 100% reproducible, confirmed
+        // live via unbuffered debug prints showing every thread finish
+        // exactly one copyOut() and then never proceed.
+        //
+        // Connections are constructed here, one at a time on the main
+        // thread, before any worker thread is spawned, rather than one
+        // per thread inside table_worker -- harmless either way for this
+        // bug, but avoids ever having a thread mid-connection-setup (this
+        // Postgres requires SSL) at the same moment another thread forks
+        // via popen(), which is a separate real hazard class worth not
+        // inviting even though it wasn't what caused the hang above.
         std::atomic<size_t> next_idx{0};
-        auto table_worker = [&]() {
-            // Own connection per worker thread -- only used for the
-            // COUNT(*) queries text-format tables need (see
-            // copyOutCompressedGz's comment); pqxx::connection isn't safe
-            // to share across threads. Opened once per worker regardless
-            // of whether this thread ever hits a text-format table, since
-            // that's unknown up front and connection setup is cheap next
-            // to everything else this loop does.
-            pqxx::connection count_conn(conninfo);
+        std::vector<std::unique_ptr<pqxx::connection>> count_conns;
+        count_conns.reserve(static_cast<size_t>(parallel_tables));
+        for (int p = 0; p < parallel_tables; ++p) count_conns.push_back(std::make_unique<pqxx::connection>(conninfo));
+
+        auto table_worker = [&](pqxx::connection& count_conn) {
             for (;;) {
                 size_t i = next_idx.fetch_add(1);
                 if (i >= kTables.size()) return;
@@ -1033,21 +1061,31 @@ int main(int argc, char** argv) {
                     n = copyOut(host, user, db, sql, out_path, format);
                 }
 
-                std::lock_guard<std::mutex> lock(manifest_mu);
+                // appendManifestLines locks manifest_mu itself -- do NOT
+                // also hold it here across that call (a prior version did,
+                // via an outer lock_guard on the same non-recursive mutex,
+                // which self-deadlocked every worker thread on its very
+                // first table: confirmed live via unbuffered debug prints
+                // showing all parallel_tables threads finish exactly one
+                // copyOut() each and then never proceed).
                 if (n < 0) {
-                    std::cerr << "[regional_db_export] " << r.name << "/" << t.name << " FAILED\n";
                     appendManifestLines(manifest_mu, region_dir, "table." + t.name + ".rows=FAILED\n");
+                    std::lock_guard<std::mutex> lock(manifest_mu);
+                    std::cerr << "[regional_db_export] " << r.name << "/" << t.name << " FAILED\n";
                     continue;
                 }
                 std::ostringstream lines;
                 lines << "table." << t.name << ".rows=" << n << "\ntable." << t.name << ".format=" << format << "\n";
                 appendManifestLines(manifest_mu, region_dir, lines.str());
-                if (verbose) std::cout << "  " << t.name << ": " << n << " row(s)\n";
+                if (verbose) {
+                    std::lock_guard<std::mutex> lock(manifest_mu);
+                    std::cout << "  " << t.name << ": " << n << " row(s)\n";
+                }
             }
         };
         std::vector<std::thread> pool;
         pool.reserve(static_cast<size_t>(parallel_tables));
-        for (int p = 0; p < parallel_tables; ++p) pool.emplace_back(table_worker);
+        for (int p = 0; p < parallel_tables; ++p) pool.emplace_back(table_worker, std::ref(*count_conns[p]));
         for (auto& th : pool) th.join();
 
         for (const auto& name : kGlobalTables) {
