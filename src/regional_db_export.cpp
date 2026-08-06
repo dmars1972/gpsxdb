@@ -268,17 +268,6 @@ std::string envelopeSql(const GlobalRegion& r, int srid) {
     return ss.str();
 }
 
-// COUNT(*) via pqxx of an arbitrary SELECT -- used to get the row count for
-// text-format tables, since (unlike copyOut()'s file-based \copy)
-// copyOutCompressedGz streams straight through a compressor and never
-// prints the usual "COPY N" notice (confirmed empirically: `\copy ... TO
-// STDOUT` suppresses it entirely rather than mixing it into the piped data).
-int64_t countRows(pqxx::connection& conn, const std::string& select_sql) {
-    pqxx::work txn(conn);
-    auto r = txn.exec("SELECT COUNT(*) FROM (" + select_sql + ") q");
-    return r[0][0].as<int64_t>();
-}
-
 // Streams `psql \copy (<select_sql>) TO STDOUT WITH (FORMAT text)` straight
 // through pigz to <out_path>.gz -- the uncompressed data never touches disk
 // (unlike write-then-compress), which matters given terrain/wmm's
@@ -291,28 +280,50 @@ int64_t countRows(pqxx::connection& conn, const std::string& select_sql) {
 // rather than relying on system()'s default /bin/sh, which may be dash)
 // makes a psql failure fail the whole pipeline even though pigz's own exit
 // code would otherwise mask it.
-bool copyOutCompressedGz(const std::string& host, const std::string& user, const std::string& db,
-                         const std::string& select_sql, const std::string& out_path) {
+//
+// Returns the row count, or -1 on failure. `\copy ... TO STDOUT` suppresses
+// psql's usual "COPY N" notice entirely (confirmed empirically -- unlike
+// copyOut()'s file-based \copy, which prints it normally), so a prior
+// version ran a separate `SELECT COUNT(*) FROM (<select_sql>) q` query
+// afterward purely to populate the manifest -- redundantly re-executing
+// the same expensive spatial predicate (measured taking several minutes
+// per region on top of the actual export). Fixed by tee-ing the stream to
+// the compressor while counting lines on the main pipe instead: COPY TEXT
+// format guarantees exactly one line per row (any newline embedded in a
+// field value is backslash-escaped, never literal, specifically so row
+// boundaries stay unambiguous -- verified against a real query before
+// relying on it), so `wc -l` gives an exact count with no second query.
+// pipefail covers the main psql | tee | wc -l chain but NOT a failure
+// inside the tee'd process substitution (pigz) -- an acceptable gap since
+// a truncated/corrupt .gz from a failed pigz is still caught by the
+// bundle's own tar tzf integrity check downstream.
+int64_t copyOutCompressedGz(const std::string& host, const std::string& user, const std::string& db,
+                            const std::string& select_sql, const std::string& out_path) {
     std::ostringstream script;
     script << "set -o pipefail; psql -h " << host << " -U " << user << " -d " << db
            << " -v ON_ERROR_STOP=1 -A -t -c \"\\copy ($1) TO STDOUT WITH (FORMAT text)\""
-           << " | pigz > \"$2\"";
+           << " | tee >(pigz > \"$2\") | wc -l";
 
     std::ostringstream cmd;
     cmd << "bash -c " << shellQuote(script.str()) << " _ "
         << shellQuote(select_sql) << " " << shellQuote(out_path + ".gz") << " 2>&1";
 
     FILE* p = popen(cmd.str().c_str(), "r");
-    if (!p) return false;
+    if (!p) return -1;
     std::string output;
     char buf[4096];
     while (fgets(buf, sizeof(buf), p)) output += buf;
     int rc = pclose(p);
     if (rc != 0) {
         std::cerr << "[regional_db_export] compressed copy failed: " << output << "\n";
-        return false;
+        return -1;
     }
-    return true;
+    try {
+        return std::stoll(output);
+    } catch (...) {
+        std::cerr << "[regional_db_export] compressed copy: could not parse row count from: " << output << "\n";
+        return -1;
+    }
 }
 
 // Runs `psql \copy (<select_sql>) TO '<out_path>' WITH (FORMAT <format>)`,
@@ -1011,19 +1022,9 @@ int main(int argc, char** argv) {
         // live via unbuffered debug prints showing every thread finish
         // exactly one copyOut() and then never proceed.
         //
-        // Connections are constructed here, one at a time on the main
-        // thread, before any worker thread is spawned, rather than one
-        // per thread inside table_worker -- harmless either way for this
-        // bug, but avoids ever having a thread mid-connection-setup (this
-        // Postgres requires SSL) at the same moment another thread forks
-        // via popen(), which is a separate real hazard class worth not
-        // inviting even though it wasn't what caused the hang above.
         std::atomic<size_t> next_idx{0};
-        std::vector<std::unique_ptr<pqxx::connection>> count_conns;
-        count_conns.reserve(static_cast<size_t>(parallel_tables));
-        for (int p = 0; p < parallel_tables; ++p) count_conns.push_back(std::make_unique<pqxx::connection>(conninfo));
 
-        auto table_worker = [&](pqxx::connection& count_conn) {
+        auto table_worker = [&]() {
             for (;;) {
                 size_t i = next_idx.fetch_add(1);
                 if (i >= kTables.size()) return;
@@ -1056,7 +1057,7 @@ int main(int argc, char** argv) {
                 std::string out_path = region_dir + "/" + t.name + ".bin";
                 int64_t n;
                 if (is_terrain) {
-                    n = copyOutCompressedGz(host, user, db, sql, out_path) ? countRows(count_conn, sql) : -1;
+                    n = copyOutCompressedGz(host, user, db, sql, out_path);
                 } else {
                     n = copyOut(host, user, db, sql, out_path, format);
                 }
@@ -1085,7 +1086,7 @@ int main(int argc, char** argv) {
         };
         std::vector<std::thread> pool;
         pool.reserve(static_cast<size_t>(parallel_tables));
-        for (int p = 0; p < parallel_tables; ++p) pool.emplace_back(table_worker, std::ref(*count_conns[p]));
+        for (int p = 0; p < parallel_tables; ++p) pool.emplace_back(table_worker);
         for (auto& th : pool) th.join();
 
         for (const auto& name : kGlobalTables) {
