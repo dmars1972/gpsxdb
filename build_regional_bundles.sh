@@ -34,7 +34,8 @@
 #
 # Usage: ./build_regional_bundles.sh -s <host> -d <db> -u <user> \
 #            -f <master nodes.dat path> -n <max_id> --out-dir <dir> \
-#            [--regions name1,name2,...] [--region-batch-size N] [-v]
+#            [--regions name1,name2,...] [--region-batch-size N] \
+#            [--small-staging-dir <dir>] [-v]
 #
 # Requires ~/.pgpass for authentication. Output: <out-dir>/<region>.gpsxdb.tar.gz
 # per region. Per-region staging data is deleted right after each bundle is
@@ -42,10 +43,24 @@
 # harmless), any not-yet-processed regions' .nodes.dat slices, and (with
 # --region-batch-size) not-yet-bundled batches' big-table dumps remain
 # under <out-dir>/staging while the run is in progress.
+#
+# --small-staging-dir: point --small-tables-only's own staging (dominated
+# by the terrain export) at a different, faster disk than --out-dir/staging.
+# Measured on this project's own hardware: <out-dir>/staging lived on a
+# single slow spinning disk, which iostat showed pinned at ~97% util /
+# 100-200ms average I/O wait during a region's bundling step -- moving
+# --small-tables-only's output to the same NVMe Postgres itself runs on
+# (plenty of headroom there; the DB's own read/write during these queries
+# never exceeded a few percent of that disk's throughput) dropped that
+# disk to 0% util and made the step CPU-bound instead of I/O-bound.
+# Verified end-to-end on a real region (south_america, ~85GB bundle):
+# no correctness difference, meaningfully faster wall-clock. Defaults to
+# the same as --out-dir/staging (i.e. a no-op) since not every deployment
+# has a second, faster disk available -- set this only if you do.
 set -euo pipefail
 
 HOST=""; DB=""; USER_=""; NODES_FILE=""; MAX_ID="20000000000"
-OUT_DIR="."; REGIONS=""; VERBOSE=""; REGION_BATCH_SIZE=""
+OUT_DIR="."; REGIONS=""; VERBOSE=""; REGION_BATCH_SIZE=""; SMALL_STAGING_DIR=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -57,9 +72,10 @@ while [[ $# -gt 0 ]]; do
         --out-dir) OUT_DIR="$2"; shift 2 ;;
         --regions) REGIONS="$2"; shift 2 ;;
         --region-batch-size) REGION_BATCH_SIZE="$2"; shift 2 ;;
+        --small-staging-dir) SMALL_STAGING_DIR="$2"; shift 2 ;;
         -v|--verbose) VERBOSE="-v"; shift ;;
         -h|--help)
-            echo "Usage: $0 -s <host> -d <db> -u <user> -f <nodes.dat> -n <max_id> --out-dir <dir> [--regions n1,n2,...] [--region-batch-size N] [-v]"
+            echo "Usage: $0 -s <host> -d <db> -u <user> -f <nodes.dat> -n <max_id> --out-dir <dir> [--regions n1,n2,...] [--region-batch-size N] [--small-staging-dir <dir>] [-v]"
             exit 0 ;;
         *) echo "Unknown argument: $1" >&2; exit 1 ;;
     esac
@@ -73,6 +89,8 @@ fi
 BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/build"
 STAGING_DIR="$OUT_DIR/staging"
 mkdir -p "$STAGING_DIR"
+[[ -z "$SMALL_STAGING_DIR" ]] && SMALL_STAGING_DIR="$STAGING_DIR"
+mkdir -p "$SMALL_STAGING_DIR"
 
 REGION_ARGS=()
 [[ -n "$REGIONS" ]] && REGION_ARGS=(--regions "$REGIONS")
@@ -124,9 +142,9 @@ echo "[build_regional_bundles] running regional_export (nodes.dat slices, one pa
 echo "[build_regional_bundles] processing ${#region_list[@]} region(s) one at a time..."
 for region in "${region_list[@]}"; do
     echo "[build_regional_bundles] === $region ==="
-    "$BIN_DIR/regional_db_export" -s "$HOST" -d "$DB" -u "$USER_" --out-dir "$STAGING_DIR" --small-tables-only $VERBOSE --regions "$region"
+    "$BIN_DIR/regional_db_export" -s "$HOST" -d "$DB" -u "$USER_" --out-dir "$SMALL_STAGING_DIR" --small-tables-only $VERBOSE --regions "$region"
 
-    region_dir="$STAGING_DIR/$region"
+    region_dir="$SMALL_STAGING_DIR/$region"
     nodes_src="$STAGING_DIR/$region.nodes.dat"
     if [[ -f "$nodes_src" ]]; then
         mv "$nodes_src" "$region_dir/"
@@ -143,6 +161,28 @@ for region in "${region_list[@]}"; do
         cp "$wkt_src" "$region_dir/$region.wkt"
     else
         echo "[build_regional_bundles] WARNING: no $wkt_src found -- bundle won't self-register in installed_regions" >&2
+    fi
+
+    # The 5 big table pairs (--big-tables-only, above) always write to
+    # STAGING_DIR -- when --small-staging-dir points somewhere else, merge
+    # them into region_dir with a move (not a copy): the one necessary read
+    # of this data off STAGING_DIR happens either way (here, or later when
+    # tar would have read it in place), so moving it first just avoids the
+    # bundling step needing to read from two different directories, at the
+    # cost of one extra (fast, since the destination is the faster disk)
+    # write. A no-op loop when --small-staging-dir wasn't given, since
+    # region_dir == STAGING_DIR/$region in that case and every file below
+    # is already exactly where it needs to be.
+    if [[ "$SMALL_STAGING_DIR" != "$STAGING_DIR" ]]; then
+        for f in ways.bin way_tags.bin areas.bin area_tags.bin roads.bin road_tags.bin relations.bin relation_tags.bin nodes.bin node_tags.bin; do
+            old_f="$STAGING_DIR/$region/$f"
+            if [[ -f "$old_f" ]]; then
+                mv "$old_f" "$region_dir/$f"
+            else
+                echo "[build_regional_bundles] WARNING: no $old_f found -- bundle will be missing $f" >&2
+            fi
+        done
+        rm -rf "$STAGING_DIR/$region"
     fi
 
     bundle="$OUT_DIR/$region.gpsxdb.tar.gz"
@@ -162,7 +202,7 @@ for region in "${region_list[@]}"; do
     # region pays this cost. The plain .bin table dumps (COPY binary
     # format) still compress ~30% under pigz, same as gzip, so bundle
     # size for customers is unaffected by this change.
-    tar cf - -C "$STAGING_DIR" "$region" | pigz > "$bundle"
+    tar cf - -C "$SMALL_STAGING_DIR" "$region" | pigz > "$bundle"
 
     echo "[build_regional_bundles] cleaning up staging data for $region"
     rm -rf "$region_dir"
