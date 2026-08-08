@@ -106,6 +106,10 @@ if(WIN32)
         kernel32 user32 gdi32 winspool shell32 ole32 oleaut32 uuid comdlg32 advapi32
     )
     target_link_options(win_link_smoketest PRIVATE -static)
+    # Same libwinpthread/libpq pthread-shim collision as regional_install
+    # above (this target links the identical archives with -static) --
+    # without this it won't even link, let alone run.
+    target_link_options(win_link_smoketest PRIVATE -Wl,--allow-multiple-definition)
     target_compile_features(win_link_smoketest PRIVATE cxx_std_20)
 
 else()
