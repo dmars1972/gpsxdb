@@ -36,6 +36,41 @@ if(WIN32)
     find_path(PQXX_INCLUDE_DIR pqxx/pqxx REQUIRED)
     find_path(PQ_WIN_INCLUDE_DIR libpq-fe.h REQUIRED)
 
+    # vcpkg's libpq.a bundles pthread-win32.c.obj -- a minimal
+    # pthreads-for-Windows shim meant for toolchains with no real pthreads.
+    # MinGW has one (libwinpthread), and -static links it in full, so that
+    # shim put a SECOND complete pthread implementation in the image:
+    # objdump -t on the resulting .exe showed two live definitions each of
+    # pthread_mutex_lock and pthread_self. The two are source-level
+    # equivalent but keep entirely separate TLS and once-control state, so a
+    # pthread_once_t initialised by one and consumed by the other is garbage.
+    # libstdc++ is compiled against winpthread and can't be redirected off
+    # it, so it faulted inside winpthread's enterOnceObject -- reached via
+    # std::locale's pthread_once from __do_global_ctors, i.e. before main,
+    # which is why the binary produced no output whatsoever -- and Windows
+    # killed the process with 0xC0000374 (STATUS_HEAP_CORRUPTION).
+    #
+    # -Wl,--allow-multiple-definition does NOT fix this: it only downgrades
+    # the duplicate-symbol error to silence and leaves both copies linked.
+    # The crash above was observed with that flag in place. Deleting the shim
+    # member is the actual fix -- winpthread then becomes the single pthread
+    # implementation, which is what libstdc++ requires.
+    #
+    # Patched on a build-local copy so the vcpkg-installed archive is never
+    # mutated (vcpkg would restore it anyway, and other consumers may want
+    # the shim on toolchains that genuinely lack pthreads).
+    set(PQ_PATCHED_LIB ${CMAKE_BINARY_DIR}/libpq_no_pthread_shim.a)
+    add_custom_command(
+        OUTPUT ${PQ_PATCHED_LIB}
+        COMMAND ${CMAKE_COMMAND} -E copy ${PQ_WIN_LIB} ${PQ_PATCHED_LIB}
+        COMMAND ${CMAKE_AR} d ${PQ_PATCHED_LIB} pthread-win32.c.obj
+        COMMAND ${CMAKE_RANLIB} ${PQ_PATCHED_LIB}
+        DEPENDS ${PQ_WIN_LIB}
+        COMMENT "Stripping libpq's bundled pthread shim (pthread-win32.c.obj)"
+        VERBATIM
+    )
+    add_custom_target(libpq_no_pthread_shim DEPENDS ${PQ_PATCHED_LIB})
+
     add_executable(regional_install
         src/regional_install.cpp
         src/NavDB.cpp
@@ -53,7 +88,7 @@ if(WIN32)
     # single left-to-right pass matching dependency order exactly.
     target_link_libraries(regional_install PRIVATE
         -Wl,--start-group
-        ${PQXX_LIB} ${PQ_WIN_LIB} ${PGCOMMON_LIB} ${PGPORT_LIB} ${SSL_LIB} ${CRYPTO_LIB}
+        ${PQXX_LIB} ${PQ_PATCHED_LIB} ${PGCOMMON_LIB} ${PGPORT_LIB} ${SSL_LIB} ${CRYPTO_LIB}
         -Wl,--end-group
         # libpq's real Windows system dependencies (winsock, crypto/LDAP
         # for SSPI/GSSAPI auth, registry/UI libs pulled in by its Win32
@@ -72,18 +107,14 @@ if(WIN32)
     # locked, and a mismatched set fails just as hard at load time with
     # 0xC0000139 (STATUS_ENTRYPOINT_NOT_FOUND). One flag covers all three.
     target_link_options(regional_install PRIVATE -static)
-    # -static above pulls in libwinpthread.a in full, which collides with
-    # libpq.a's own bundled minimal pthreads-for-Windows shim
-    # (pthread-win32.c.obj, built for non-MinGW Windows targets that don't
-    # have a real pthreads implementation) -- both define pthread_mutex_lock
-    # etc., which a dynamically-imported winpthread never surfaced (only a
-    # DLL import stub, not full object inclusion, so no archive-level
-    # symbol collision). Both are functionally equivalent standard pthread
-    # semantics, so accepting the linker's first definition is safe here --
-    # this is a known MinGW+libpq static-link interaction, not specific to
-    # this project's own code.
-    target_link_options(regional_install PRIVATE -Wl,--allow-multiple-definition)
     target_compile_features(regional_install PRIVATE cxx_std_20)
+    # Deliberately no -Wl,--allow-multiple-definition: with the shim member
+    # stripped there is nothing left to collide, and a duplicate-symbol error
+    # here would be a real regression worth failing the build over rather
+    # than silencing. nm on libpq.a confirms every pthread definition lives
+    # in that one member; its other objects only reference pthread_mutex_lock
+    # and pthread_mutex_unlock, which now bind to winpthread.
+    add_dependencies(regional_install libpq_no_pthread_shim)
 
     # ---- Temporary diagnostic target (not shipped, not built by default) ----
     # Bisects the 0xC0000374 pre-main heap corruption: same archives, same
@@ -100,17 +131,14 @@ if(WIN32)
     )
     target_link_libraries(win_link_smoketest PRIVATE
         -Wl,--start-group
-        ${PQXX_LIB} ${PQ_WIN_LIB} ${PGCOMMON_LIB} ${PGPORT_LIB} ${SSL_LIB} ${CRYPTO_LIB}
+        ${PQXX_LIB} ${PQ_PATCHED_LIB} ${PGCOMMON_LIB} ${PGPORT_LIB} ${SSL_LIB} ${CRYPTO_LIB}
         -Wl,--end-group
         secur32 crypt32 wldap32 wsock32 ws2_32
         kernel32 user32 gdi32 winspool shell32 ole32 oleaut32 uuid comdlg32 advapi32
     )
     target_link_options(win_link_smoketest PRIVATE -static)
-    # Same libwinpthread/libpq pthread-shim collision as regional_install
-    # above (this target links the identical archives with -static) --
-    # without this it won't even link, let alone run.
-    target_link_options(win_link_smoketest PRIVATE -Wl,--allow-multiple-definition)
     target_compile_features(win_link_smoketest PRIVATE cxx_std_20)
+    add_dependencies(win_link_smoketest libpq_no_pthread_shim)
 
 else()
 # ---- Linux build: everything else (unchanged, just indented one level
