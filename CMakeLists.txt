@@ -61,6 +61,17 @@ if(WIN32)
         secur32 crypt32 wldap32 wsock32 ws2_32
         kernel32 user32 gdi32 winspool shell32 ole32 oleaut32 uuid comdlg32 advapi32
     )
+    # The x64-mingw-static triplet only governs how vcpkg builds its own
+    # ports (libpqxx/libpq/openssl land as .a archives) -- it says nothing
+    # about the compiler's own runtime. Without -static the .exe still
+    # imports libgcc_s_seh-1.dll, libstdc++-6.dll and libwinpthread-1.dll
+    # from the cross-compiler's lib dir, and dies at load time with
+    # 0xC0000135 (STATUS_DLL_NOT_FOUND) on any machine that doesn't have
+    # MinGW-w64 installed -- i.e. every machine we ship to. Shipping those
+    # three DLLs next to the .exe is not the fix: they're GCC-version-
+    # locked, and a mismatched set fails just as hard at load time with
+    # 0xC0000139 (STATUS_ENTRYPOINT_NOT_FOUND). One flag covers all three.
+    target_link_options(regional_install PRIVATE -static)
     target_compile_features(regional_install PRIVATE cxx_std_20)
 
 else()

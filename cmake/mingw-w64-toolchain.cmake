@@ -12,6 +12,18 @@
 #     -DVCPKG_CHAINLOAD_TOOLCHAIN_FILE=$(pwd)/cmake/mingw-w64-toolchain.cmake
 #   cmake --build build-win --target regional_install
 #
+# Then confirm the .exe is actually self-contained before shipping it --
+# `file` reporting "PE32+ executable" does NOT mean statically linked:
+#
+#   x86_64-w64-mingw32-objdump -p build-win/regional_install.exe \
+#     | grep 'DLL Name'
+#
+# Every line must be a Windows system DLL (KERNEL32, ADVAPI32, WS2_32,
+# msvcrt, ...). If libgcc_s_seh-1.dll, libstdc++-6.dll or
+# libwinpthread-1.dll appear, the -static link option in CMakeLists.txt
+# got dropped and the binary will fail to start with 0xC0000135 on any
+# machine without MinGW-w64 installed.
+#
 # This file is loaded BY vcpkg's own toolchain file (via
 # VCPKG_CHAINLOAD_TOOLCHAIN_FILE), not passed directly as
 # CMAKE_TOOLCHAIN_FILE -- that's what lets find_package(libpqxx CONFIG)
