@@ -16,6 +16,40 @@ extracts.
 
 ---
 
+## Quick start: installing a region
+
+**Most users want this, not a full-planet import.** A regional bundle
+(`<region>.gpsxdb.tar.gz`) is a self-contained export — roads, terrain,
+airspace, WMM declination, airports, everything — for one region of the
+world (10 natural continents plus a few border corridors; see
+[Regional bundles](#regional-bundles) below, scoped by `include/Regions.h`).
+Given one, installing it into a fresh database is a single command:
+
+```bash
+createdb <your_db>
+psql -d <your_db> -c "CREATE EXTENSION postgis;"
+
+./build/regional_install <region>.gpsxdb.tar.gz \
+  -s <your_db_server> -d <your_db> -u <your_user_id> \
+  --nodes-file <region>.nodes.dat
+```
+
+That's it — the bundle's own manifest and embedded region polygon handle
+the rest, and the install registers itself so `osm_import -m poll`
+afterward automatically stays region-scoped (no separate flag; see
+[Region-aware poll](#region-aware-poll)) instead of needing the full
+master database. See [Regional bundles](#regional-bundles) below for the
+full region list, how bundles get built, and installing more than one
+region into the same database.
+
+Everything else in this README — running a full-planet `osm_import`,
+building bundles yourself, tuning thread counts for a bulk import — is for
+*producing* regional bundles in the first place, not for installing one.
+Skip ahead to [Data sources](#data-sources) if you just want to know
+what's inside before you commit to it.
+
+---
+
 ## Features
 
 - **Multi-threaded node processing** — parallel Mercator projection across configurable node threads
