@@ -23,7 +23,9 @@ extracts.
 airspace, WMM declination, airports, everything — for one region of the
 world (10 natural continents plus a few border corridors; see
 [Regional bundles](#regional-bundles) below, scoped by `include/Regions.h`).
-Given one, installing it into a fresh database is a single command:
+Given one, installing it into a fresh database is a single command (build
+`regional_install` first — see [Building](#building), same one command
+produces it and everything else here):
 
 ```bash
 createdb <your_db>
@@ -178,9 +180,20 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
 ```
 
-Produces two binaries:
-- `build/osm_import` — main importer
-- `build/airports_load` — standalone OurAirports loader (for testing)
+One build produces every binary this project has, including the regional
+bundle toolchain used in [Quick start](#quick-start-installing-a-region) and
+[Regional bundles](#regional-bundles) below — there's no separate build step
+for those, they come from this same command:
+
+- `build/osm_import` — main importer (full-planet import, delta/poll replication)
+- `build/regional_install` — installs a `<region>.gpsxdb.tar.gz` bundle into a target database
+- `build/regional_export` — exports a region's node coordinates from the master `nodes.dat`
+- `build/regional_db_export` — exports a region's table data from the master database
+- `build/airports_load` — standalone OurAirports loader
+- `build/faa_obstacles_load` — standalone FAA obstacle loader
+- `build/terrain_load` — standalone terrain elevation loader
+- `build/wmm_load` — standalone WMM declination loader
+- `build/airspace_load` — standalone airspace loader
 
 ---
 
