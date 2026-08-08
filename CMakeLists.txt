@@ -74,6 +74,29 @@ if(WIN32)
     target_link_options(regional_install PRIVATE -static)
     target_compile_features(regional_install PRIVATE cxx_std_20)
 
+    # ---- Temporary diagnostic target (not shipped, not built by default) ----
+    # Bisects the 0xC0000374 pre-main heap corruption: same archives, same
+    # link options, none of this project's sources. See the header comment in
+    # tools/win_link_smoketest.cpp for how to read its output. Build with:
+    #   cmake --build build-win --target win_link_smoketest
+    # Delete this block and the source file once that bug is understood.
+    add_executable(win_link_smoketest EXCLUDE_FROM_ALL
+        tools/win_link_smoketest.cpp
+    )
+    target_include_directories(win_link_smoketest PRIVATE
+        ${PQXX_INCLUDE_DIR}
+        ${PQ_WIN_INCLUDE_DIR}
+    )
+    target_link_libraries(win_link_smoketest PRIVATE
+        -Wl,--start-group
+        ${PQXX_LIB} ${PQ_WIN_LIB} ${PGCOMMON_LIB} ${PGPORT_LIB} ${SSL_LIB} ${CRYPTO_LIB}
+        -Wl,--end-group
+        secur32 crypt32 wldap32 wsock32 ws2_32
+        kernel32 user32 gdi32 winspool shell32 ole32 oleaut32 uuid comdlg32 advapi32
+    )
+    target_link_options(win_link_smoketest PRIVATE -static)
+    target_compile_features(win_link_smoketest PRIVATE cxx_std_20)
+
 else()
 # ---- Linux build: everything else (unchanged, just indented one level
 # under this else() branch so the two build paths can share one file
