@@ -347,7 +347,18 @@ bool tableExists(pqxx::connection& conn, const std::string& table) {
 
 int main(int argc, char** argv) {
     std::string bundle_path, host, db, user, nodes_file;
-    std::string work_dir = "/tmp";
+    // Deliberately not a hardcoded "/tmp": on Windows that resolves to \tmp
+    // on the current drive, which normally doesn't exist, so every run
+    // without an explicit --work-dir would fail at extraction.
+    // temp_directory_path() gives %TEMP% on Windows and $TMPDIR-or-/tmp on
+    // POSIX. Note this makes the Linux default honour $TMPDIR where it
+    // previously always used /tmp -- standard behaviour, but a change.
+    std::string work_dir;
+    {
+        std::error_code ec;
+        fs::path tmp = fs::temp_directory_path(ec);
+        work_dir = ec ? std::string(".") : tmp.string();
+    }
     std::string regions_dir = "data/regions";
     bool verbose = false;
 
@@ -363,12 +374,13 @@ int main(int argc, char** argv) {
         else if (arg == "-h" || arg == "--help") {
             std::cout << "Usage: regional_install <bundle.gpsxdb.tar.gz> -s <host> -d <db> -u <user>\n"
                          "                         --nodes-file <target nodes.dat path>\n"
-                         "                         [--work-dir <dir>, default /tmp]\n"
+                         "                         [--work-dir <dir>, default " << work_dir << "]\n"
                          "                         [--regions-dir <dir>, default data/regions] [-v]\n"
                          "\n"
                          "--work-dir is where the bundle is extracted -- a multi-GB region bundle\n"
-                         "can exceed a tmpfs /tmp's size or quota, so point this at plain disk\n"
-                         "(e.g. alongside nodes.dat) if that happens.\n"
+                         "can exceed the system temp dir's size or quota (notably a tmpfs /tmp on\n"
+                         "Linux), so point this at plain disk (e.g. alongside nodes.dat) if that\n"
+                         "happens.\n"
                          "\n"
                          "--regions-dir is a fallback only -- current bundles embed their own\n"
                          "<region>.wkt (used to register this region in public.installed_regions,\n"
@@ -378,7 +390,19 @@ int main(int argc, char** argv) {
                          "\n"
                          "Idempotent: safe to install multiple (even overlapping) regions into\n"
                          "the same target -- see regional_install.cpp's top-of-file comment for\n"
-                         "the dedup strategy. Requires ~/.pgpass for authentication.\n";
+                         "the dedup strategy.\n"
+                         "\n"
+    // libpq's password file lives in a different place on each platform, and
+    // naming the wrong one sends people down a long debugging detour: libpq
+    // silently ignores ~/.pgpass on Windows, so the failure surfaces as a
+    // bare authentication error with nothing pointing at the file.
+#ifdef _WIN32
+                         "Authentication uses libpq's password file, which on Windows is\n"
+                         "%APPDATA%\\postgresql\\pgpass.conf -- NOT ~/.pgpass, which libpq does\n"
+                         "not read on this platform.\n";
+#else
+                         "Authentication uses libpq's password file: ~/.pgpass.\n";
+#endif
             std::cout.flush();  // _exit() skips normal stdio cleanup -- must flush explicitly,
                                  // otherwise this is silently lost whenever stdout isn't line-
                                  // buffered (any pipe/redirect, not just a real terminal)
@@ -396,9 +420,9 @@ int main(int argc, char** argv) {
         _exit(1);
     }
 
-    // Extract to a private temp dir under work_dir (plain /tmp by default,
-    // but a multi-GB bundle can exceed a tmpfs /tmp's size or quota -- see
-    // --work-dir above).
+    // Extract to a private temp dir under work_dir (the system temp dir by
+    // default, but a multi-GB bundle can exceed its size or quota -- notably
+    // a tmpfs /tmp on Linux -- see --work-dir above).
     {
         std::error_code ec;
         fs::create_directories(work_dir, ec);  // best-effort, same as before
