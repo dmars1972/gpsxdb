@@ -1261,6 +1261,18 @@ void NavDB::initializeSchema() {
         "DROP TABLE IF EXISTS public.terrain",
         "DROP TABLE IF EXISTS public.terrain_tiles",
         "CREATE TABLE public.terrain (rid serial PRIMARY KEY, rast public.raster, filename text)",
+        // The base table DDL is fixed (see above), but raster2pgsql's -I flag
+        // -- which TerrainLoader only ever passes on its very first bootstrap
+        // batch, since every batch after that sees this table already exists
+        // and uses -a instead -- also emits this GIST index as a separate
+        // statement. Since this hand-rolled CREATE TABLE makes the table
+        // "already exist" before TerrainLoader ever runs, that bootstrap -I
+        // never fires and the index was silently never created. Discovered
+        // 2026-08-08: production nav and a freshly regional_install'd nav_gui
+        // both had zero index on terrain.rast, making ST_Value/ST_Intersects
+        // point lookups a full sequential scan (13+s instead of low-ms).
+        // Name/definition matches what raster2pgsql -I actually generates.
+        "CREATE INDEX IF NOT EXISTS terrain_st_convexhull_idx ON public.terrain USING gist (st_convexhull(rast))",
         "CREATE TABLE public.terrain_tiles ("
         "  tile_name text PRIMARY KEY,"
         "  source text NOT NULL DEFAULT '3dep',"
