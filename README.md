@@ -180,6 +180,19 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
 ```
 
+`-j$(nproc)` assumes RAM scales with core count, which isn't true on every
+machine (e.g. a 16-core / 10GB laptop) — several files here are memory-heavy
+to compile (anything using Boost.Geometry: `RegionPolygons.cpp`,
+`RegionIndex.cpp`, `regional_export.cpp`; anything pulling in `pqxx`'s
+heavily-templated headers), and running many of them in parallel at once can
+OOM-kill `cc1plus` even with several GB of swap available, since the peak
+memory spike from N simultaneous compiles can arrive faster than swap
+absorbs it. If you hit that, cap parallelism explicitly instead:
+
+```bash
+cmake --build build -j4   # or lower, depending on available RAM
+```
+
 One build produces every binary this project has, including the regional
 bundle toolchain used in [Quick start](#quick-start-installing-a-region) and
 [Regional bundles](#regional-bundles) below — there's no separate build step
