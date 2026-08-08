@@ -42,14 +42,17 @@
 #include <mutex>
 #include <cstdio>
 #include <cstdlib>
-#include <sys/stat.h>
-#include <unistd.h>
+#include <filesystem>
+#include <random>
+#include <unistd.h>  // _exit -- MinGW-w64 provides this natively too
+
+namespace fs = std::filesystem;
 
 namespace {
 
 bool fileExists(const std::string& path) {
-    struct stat st;
-    return stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode);
+    std::error_code ec;
+    return fs::is_regular_file(path, ec);
 }
 
 // Every table's export is a plain file -- terrain used to optionally ship
@@ -62,8 +65,122 @@ std::string copyFromClause(const std::string& bin_path) {
 }
 
 bool dirExists(const std::string& path) {
-    struct stat st;
-    return stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
+    std::error_code ec;
+    return fs::is_directory(path, ec);
+}
+
+// mkdtemp() isn't available on MinGW-w64 -- create a directory with a
+// random suffix under `parent` instead, retrying on the (vanishingly
+// unlikely) chance of a collision. Used on both platforms rather than a
+// Windows-only shim, so there's exactly one temp-dir-creation path to
+// reason about instead of two.
+std::string makeTempDir(const std::string& parent) {
+    std::random_device rd;
+    std::mt19937_64 gen(rd());
+    static const char charset[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    for (int attempt = 0; attempt < 100; ++attempt) {
+        std::string suffix;
+        for (int i = 0; i < 12; ++i) suffix += charset[gen() % (sizeof(charset) - 1)];
+        fs::path candidate = fs::path(parent) / ("regional_install." + suffix);
+        std::error_code ec;
+        if (fs::create_directory(candidate, ec)) return candidate.string();
+    }
+    throw std::runtime_error("makeTempDir: failed to create a unique temp dir under " + parent);
+}
+
+// Equivalent to `find <root> -mindepth 1 -maxdepth 2 -name <filename>`,
+// returning the first match's parent directory (or "" if none). A plain
+// nested loop rather than std::filesystem::recursive_directory_iterator's
+// depth-limiting API, which is easy to get subtly wrong -- this is easy to
+// verify correct by inspection instead.
+std::string findFileWithinTwoLevels(const std::string& root, const std::string& filename) {
+    std::error_code ec;
+    for (const auto& e1 : fs::directory_iterator(root, ec)) {
+        if (e1.is_regular_file() && e1.path().filename() == filename)
+            return e1.path().parent_path().string();
+        if (e1.is_directory()) {
+            std::error_code ec2;
+            for (const auto& e2 : fs::directory_iterator(e1.path(), ec2)) {
+                if (e2.is_regular_file() && e2.path().filename() == filename)
+                    return e2.path().parent_path().string();
+            }
+        }
+    }
+    return "";
+}
+
+// Runs a command built from an argument vector (argv[0] = program name),
+// capturing combined stdout+stderr -- callers never need to think about
+// shell quoting, which differs completely between POSIX shells and
+// cmd.exe. Uses popen/_popen rather than exec directly, since capturing
+// output through a pipe is the simplest cross-platform way to get both
+// the exit code and any error text for reporting. stream_output echoes
+// each line to stdout as it arrives (matches the previous verbose-mode
+// behavior), independent of the buffered `output` this always returns.
+struct ProcessResult {
+    int exit_code = -1;
+    std::string output;
+};
+
+#ifdef _WIN32
+// Windows command-line quoting: wrap in double quotes if the argument
+// contains whitespace or a double quote, doubling any backslashes that
+// immediately precede a quote and escaping the quote itself -- the
+// convention the MSVC runtime's argument parser (and so cmd.exe) expects.
+std::string quoteArg(const std::string& arg) {
+    if (!arg.empty() && arg.find_first_of(" \t\"") == std::string::npos) return arg;
+    std::string out = "\"";
+    size_t backslashes = 0;
+    for (char c : arg) {
+        if (c == '\\') { ++backslashes; continue; }
+        if (c == '"') { out.append(backslashes * 2 + 1, '\\'); backslashes = 0; out += '"'; continue; }
+        if (backslashes) { out.append(backslashes, '\\'); backslashes = 0; }
+        out += c;
+    }
+    if (backslashes) out.append(backslashes * 2, '\\');
+    out += '"';
+    return out;
+}
+#else
+// POSIX single-quote escaping: wrap in '...', breaking out any embedded
+// single quote as '\'' (close quote, escaped literal quote, reopen quote).
+std::string quoteArg(const std::string& arg) {
+    std::string out = "'";
+    for (char c : arg) {
+        if (c == '\'') out += "'\\''";
+        else out += c;
+    }
+    out += "'";
+    return out;
+}
+#endif
+
+ProcessResult runProcess(const std::vector<std::string>& argv, bool stream_output = false) {
+    std::ostringstream cmd;
+    for (size_t i = 0; i < argv.size(); ++i) {
+        if (i) cmd << ' ';
+        cmd << quoteArg(argv[i]);
+    }
+    cmd << " 2>&1";
+
+    ProcessResult result;
+#ifdef _WIN32
+    FILE* p = _popen(cmd.str().c_str(), "r");
+#else
+    FILE* p = popen(cmd.str().c_str(), "r");
+#endif
+    if (!p) return result;
+    char buf[4096];
+    while (fgets(buf, sizeof(buf), p)) {
+        result.output += buf;
+        if (stream_output) std::cout << buf;
+    }
+#ifdef _WIN32
+    result.exit_code = _pclose(p);
+#else
+    result.exit_code = pclose(p);
+#endif
+    return result;
 }
 
 std::string readManifestField(const std::string& manifest_path, const std::string& key) {
@@ -205,19 +322,12 @@ void appendAirportTags(std::ostringstream& sql, const std::string& region_dir) {
 
 bool runScript(const std::string& host, const std::string& user, const std::string& db,
               const std::string& script_path, bool verbose) {
-    std::ostringstream cmd;
-    cmd << "psql -h " << host << " -U " << user << " -d " << db
-        << " -v ON_ERROR_STOP=1 -f '" << script_path << "'";
-    if (!verbose) cmd << " -q";
-    cmd << " 2>&1";
-    FILE* p = popen(cmd.str().c_str(), "r");
-    if (!p) return false;
-    std::string output;
-    char buf[4096];
-    while (fgets(buf, sizeof(buf), p)) { output += buf; if (verbose) std::cout << buf; }
-    int rc = pclose(p);
-    if (rc != 0) {
-        std::cerr << "[regional_install] install script failed:\n" << output << "\n";
+    std::vector<std::string> argv = {"psql", "-h", host, "-U", user, "-d", db,
+                                      "-v", "ON_ERROR_STOP=1", "-f", script_path};
+    if (!verbose) argv.push_back("-q");
+    ProcessResult r = runProcess(argv, verbose);
+    if (r.exit_code != 0) {
+        std::cerr << "[regional_install] install script failed:\n" << r.output << "\n";
         return false;
     }
     return true;
@@ -269,6 +379,9 @@ int main(int argc, char** argv) {
                          "Idempotent: safe to install multiple (even overlapping) regions into\n"
                          "the same target -- see regional_install.cpp's top-of-file comment for\n"
                          "the dedup strategy. Requires ~/.pgpass for authentication.\n";
+            std::cout.flush();  // _exit() skips normal stdio cleanup -- must flush explicitly,
+                                 // otherwise this is silently lost whenever stdout isn't line-
+                                 // buffered (any pipe/redirect, not just a real terminal)
             _exit(0);  // avoid pqxx static-destructor double-free on normal return
         }
         else if (arg[0] != '-') bundle_path = arg;
@@ -286,20 +399,20 @@ int main(int argc, char** argv) {
     // Extract to a private temp dir under work_dir (plain /tmp by default,
     // but a multi-GB bundle can exceed a tmpfs /tmp's size or quota -- see
     // --work-dir above).
-    system(("mkdir -p '" + work_dir + "'").c_str());
-    std::string tmpl_str = work_dir + "/regional_install.XXXXXX";
-    std::vector<char> tmpl(tmpl_str.begin(), tmpl_str.end());
-    tmpl.push_back('\0');
-    char* tmp_dir_c = mkdtemp(tmpl.data());
-    if (!tmp_dir_c) {
-        std::cerr << "Error: mkdtemp failed under " << work_dir << "\n";
+    {
+        std::error_code ec;
+        fs::create_directories(work_dir, ec);  // best-effort, same as before
+    }
+    std::string tmp_dir;
+    try {
+        tmp_dir = makeTempDir(work_dir);
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << "\n";
         _exit(1);
     }
-    std::string tmp_dir = tmp_dir_c;
 
     if (verbose) std::cout << "[regional_install] extracting " << bundle_path << " to " << tmp_dir << "\n";
-    std::string extract_cmd = "tar xzf '" + bundle_path + "' -C '" + tmp_dir + "'";
-    if (system(extract_cmd.c_str()) != 0) {
+    if (runProcess({"tar", "xzf", bundle_path, "-C", tmp_dir}).exit_code != 0) {
         std::cerr << "Error: failed to extract " << bundle_path << "\n";
         _exit(1);
     }
@@ -307,18 +420,7 @@ int main(int argc, char** argv) {
     // regional_db_export writes one subdirectory per region under its
     // --out-dir; a single-region bundle's tar root should contain exactly
     // one such directory. Find it.
-    std::string region_dir;
-    {
-        std::string find_cmd = "find '" + tmp_dir + "' -mindepth 1 -maxdepth 2 -name manifest.txt";
-        FILE* p = popen(find_cmd.c_str(), "r");
-        char buf[4096];
-        if (p && fgets(buf, sizeof(buf), p)) {
-            std::string manifest_path = buf;
-            if (!manifest_path.empty() && manifest_path.back() == '\n') manifest_path.pop_back();
-            region_dir = manifest_path.substr(0, manifest_path.find_last_of('/'));
-        }
-        if (p) pclose(p);
-    }
+    std::string region_dir = findFileWithinTwoLevels(tmp_dir, "manifest.txt");
     if (region_dir.empty() || !dirExists(region_dir)) {
         std::cerr << "Error: could not find a region directory (manifest.txt) inside " << bundle_path << "\n";
         _exit(1);
@@ -357,8 +459,9 @@ int main(int argc, char** argv) {
                              "terrain.schema.sql and public.terrain doesn't exist on target -- "
                              "skipping terrain import for this region\n";
             } else {
-                std::string cmd = "psql -h " + host + " -U " + user + " -d " + db + " -v ON_ERROR_STOP=1 -f '" + schema_path + "'";
-                if (system(cmd.c_str()) != 0) {
+                std::vector<std::string> argv = {"psql", "-h", host, "-U", user, "-d", db,
+                                                  "-v", "ON_ERROR_STOP=1", "-f", schema_path};
+                if (runProcess(argv).exit_code != 0) {
                     std::cerr << "[regional_install] WARNING: applying terrain.schema.sql failed -- "
                                  "skipping terrain import for this region\n";
                 }
@@ -400,8 +503,9 @@ int main(int argc, char** argv) {
         std::cerr << "[regional_install] WARNING: no " << region_name
                   << ".nodes.dat in bundle -- node coordinate store not updated\n";
     } else if (!fileExists(nodes_file)) {
-        std::string cp_cmd = "cp '" + region_nodes_path + "' '" + nodes_file + "'";
-        if (system(cp_cmd.c_str()) != 0) {
+        std::error_code ec;
+        fs::copy_file(region_nodes_path, nodes_file, ec);
+        if (ec) {
             std::cerr << "[regional_install] ERROR: failed to install initial " << nodes_file << "\n";
             _exit(1);
         }
@@ -412,7 +516,13 @@ int main(int argc, char** argv) {
             std::cerr << "[regional_install] ERROR: nodes.dat merge failed\n";
             _exit(1);
         }
-        if (rename(merged_path.c_str(), nodes_file.c_str()) != 0) {
+        // std::filesystem::rename (unlike raw POSIX rename()/Windows
+        // rename()) is specified with atomic replace-if-exists semantics on
+        // every platform -- Windows' own rename() fails outright if the
+        // destination already exists, which this call always does here.
+        std::error_code ec;
+        fs::rename(merged_path, nodes_file, ec);
+        if (ec) {
             std::cerr << "[regional_install] ERROR: failed to replace " << nodes_file << " with merged result "
                       << "(merged file left at " << merged_path << ")\n";
             _exit(1);
@@ -451,8 +561,10 @@ int main(int argc, char** argv) {
         }
     }
 
-    std::string cleanup_cmd = "rm -rf '" + tmp_dir + "'";
-    system(cleanup_cmd.c_str());
+    {
+        std::error_code ec;
+        fs::remove_all(tmp_dir, ec);  // best-effort cleanup, matches original's un-checked call
+    }
 
     std::cout << "[regional_install] done -- region '" << region_name << "' installed\n";
     std::cout.flush();

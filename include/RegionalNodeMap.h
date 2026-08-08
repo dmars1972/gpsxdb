@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <optional>
 #include <utility>
+#include <vector>
 
 /**
  * Sorted, ID-keyed node coordinate store for a single region — the regional
@@ -30,8 +31,12 @@
  *
  * Writing: use Writer to append records in ascending-id order (the natural
  * output order of OSMMMap::forEachPopulated + a bbox test) and finalize()
- * to backfill the header. Reading: construct RegionalNodeMap to mmap an
- * existing file and call select(id).
+ * to backfill the header. Reading: construct RegionalNodeMap to read an
+ * existing file into memory and call select(id) -- a single region's file
+ * is a few GB at most (nowhere near OSMMMap's 320GB global store, which is
+ * what actually justifies mmap there), so a plain owned buffer is simpler
+ * and just as fast in practice, and keeps this class free of any
+ * platform-specific I/O API.
  */
 class RegionalNodeMap {
 public:
@@ -64,9 +69,9 @@ public:
         bool finalized_ = false;
     };
 
-    // Opens an existing regional file read-only and mmaps it.
+    // Opens an existing regional file and reads it into memory.
     explicit RegionalNodeMap(const std::string& path);
-    ~RegionalNodeMap();
+    ~RegionalNodeMap() = default;
 
     RegionalNodeMap(const RegionalNodeMap&) = delete;
     RegionalNodeMap& operator=(const RegionalNodeMap&) = delete;
@@ -86,9 +91,7 @@ public:
                        const std::string& output_path);
 
 private:
-    int fd_ = -1;
-    size_t size_ = 0;
-    void* map_ = nullptr;
+    std::vector<uint8_t> buf_;
     std::string region_name_;
     Bbox bbox_{};
     uint64_t record_count_ = 0;

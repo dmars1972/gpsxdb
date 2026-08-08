@@ -1,9 +1,6 @@
 #include "RegionalNodeMap.h"
 
-#include <fcntl.h>
-#include <unistd.h>
-#include <sys/stat.h>
-#include <sys/mman.h>
+#include <fstream>
 #include <cstring>
 #include <cstdio>
 #include <ctime>
@@ -73,35 +70,25 @@ void RegionalNodeMap::Writer::finalize() {
 // ---- reader ----
 
 RegionalNodeMap::RegionalNodeMap(const std::string& path) {
-    fd_ = open(path.c_str(), O_RDONLY);
-    if (fd_ < 0) throw std::runtime_error("RegionalNodeMap: cannot open " + path);
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) throw std::runtime_error("RegionalNodeMap: cannot open " + path);
 
-    struct stat st;
-    if (fstat(fd_, &st) != 0 || static_cast<size_t>(st.st_size) < kHeaderSize) {
-        close(fd_);
+    std::streamoff size = f.tellg();
+    if (size < 0 || static_cast<size_t>(size) < kHeaderSize)
         throw std::runtime_error("RegionalNodeMap: " + path + " too small or unreadable");
-    }
-    size_ = static_cast<size_t>(st.st_size);
+    buf_.resize(static_cast<size_t>(size));
 
-    map_ = mmap(nullptr, size_, PROT_READ, MAP_SHARED, fd_, 0);
-    if (map_ == MAP_FAILED) {
-        close(fd_);
-        throw std::runtime_error("RegionalNodeMap: mmap failed for " + path);
-    }
+    f.seekg(0);
+    if (!f.read(reinterpret_cast<char*>(buf_.data()), static_cast<std::streamsize>(buf_.size())))
+        throw std::runtime_error("RegionalNodeMap: read failed for " + path);
 
-    const uint8_t* base = static_cast<const uint8_t*>(map_);
-    if (memcmp(base + OFF_MAGIC, kMagic, 8) != 0) {
-        munmap(map_, size_);
-        close(fd_);
+    const uint8_t* base = buf_.data();
+    if (memcmp(base + OFF_MAGIC, kMagic, 8) != 0)
         throw std::runtime_error("RegionalNodeMap: bad magic in " + path);
-    }
     uint32_t version;
     memcpy(&version, base + OFF_VERSION, 4);
-    if (version != kVersion) {
-        munmap(map_, size_);
-        close(fd_);
+    if (version != kVersion)
         throw std::runtime_error("RegionalNodeMap: unsupported version in " + path);
-    }
     memcpy(&record_count_, base + OFF_COUNT, 8);
 
     char name_buf[NAME_LEN + 1] = {0};
@@ -112,20 +99,12 @@ RegionalNodeMap::RegionalNodeMap(const std::string& path) {
     memcpy(bbox_f, base + OFF_BBOX, sizeof(bbox_f));
     bbox_ = {bbox_f[0], bbox_f[1], bbox_f[2], bbox_f[3]};
 
-    if (kHeaderSize + record_count_ * kRecordSize > size_) {
-        munmap(map_, size_);
-        close(fd_);
+    if (kHeaderSize + record_count_ * kRecordSize > buf_.size())
         throw std::runtime_error("RegionalNodeMap: truncated record data in " + path);
-    }
-}
-
-RegionalNodeMap::~RegionalNodeMap() {
-    if (map_) munmap(map_, size_);
-    if (fd_ >= 0) close(fd_);
 }
 
 std::optional<std::pair<double,double>> RegionalNodeMap::select(int64_t id) const {
-    const uint8_t* records = static_cast<const uint8_t*>(map_) + kHeaderSize;
+    const uint8_t* records = buf_.data() + kHeaderSize;
     size_t lo = 0, hi = record_count_;
     while (lo < hi) {
         size_t mid = lo + (hi - lo) / 2;
@@ -161,8 +140,8 @@ bool RegionalNodeMap::merge(const std::string& path_a, const std::string& path_b
     RegionalNodeMap a(path_a);
     RegionalNodeMap b(path_b);
 
-    const uint8_t* ra = static_cast<const uint8_t*>(a.map_) + kHeaderSize;
-    const uint8_t* rb = static_cast<const uint8_t*>(b.map_) + kHeaderSize;
+    const uint8_t* ra = a.buf_.data() + kHeaderSize;
+    const uint8_t* rb = b.buf_.data() + kHeaderSize;
 
     Writer w(output_path, a.region_name_, a.bbox_);
 
