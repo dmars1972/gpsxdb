@@ -72,6 +72,17 @@ if(WIN32)
     # locked, and a mismatched set fails just as hard at load time with
     # 0xC0000139 (STATUS_ENTRYPOINT_NOT_FOUND). One flag covers all three.
     target_link_options(regional_install PRIVATE -static)
+    # -static above pulls in libwinpthread.a in full, which collides with
+    # libpq.a's own bundled minimal pthreads-for-Windows shim
+    # (pthread-win32.c.obj, built for non-MinGW Windows targets that don't
+    # have a real pthreads implementation) -- both define pthread_mutex_lock
+    # etc., which a dynamically-imported winpthread never surfaced (only a
+    # DLL import stub, not full object inclusion, so no archive-level
+    # symbol collision). Both are functionally equivalent standard pthread
+    # semantics, so accepting the linker's first definition is safe here --
+    # this is a known MinGW+libpq static-link interaction, not specific to
+    # this project's own code.
+    target_link_options(regional_install PRIVATE -Wl,--allow-multiple-definition)
     target_compile_features(regional_install PRIVATE cxx_std_20)
 
 else()
