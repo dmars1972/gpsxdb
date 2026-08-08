@@ -4,6 +4,71 @@ project(osm_import CXX)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+if(WIN32)
+    # ---- Windows/MinGW cross-compile: regional_install only ----
+    # Every other binary in this project (osm_import, regional_db_export,
+    # the standalone loaders, etc.) is Linux-only and stays on the pkg-
+    # config path below -- see cmake/mingw-w64-toolchain.cmake for how to
+    # actually invoke this branch (needs vcpkg + that toolchain file, not
+    # a plain `cmake -B build` the way the Linux build works). See task
+    # #57's plan for why regional_install specifically is the one binary
+    # ported: it's the one piece a customer's Windows machine needs to run
+    # (installing a region bundle into a Postgres DB that stays on Linux),
+    # and it already depends on nothing but pqxx/libpq -- no PROJ, no
+    # Boost.Geometry, unlike the export-side tooling that stays Linux-only.
+    # Resolved directly rather than via find_package(libpqxx CONFIG) +
+    # libpqxx::pqxx: that imported target's own transitively-expanded
+    # deps (libpq, libpgcommon, ...) land wherever CMake's generator
+    # places them in the actual link line -- not necessarily adjacent to
+    # each other or in dependency order -- which breaks a plain static
+    # linker's single left-to-right archive scan (undefined symbols in
+    # one archive aren't retried against an earlier-scanned archive that
+    # would have resolved them). Explicitly finding and ordering every
+    # archive ourselves sidesteps that entirely: everything below is a
+    # plain path/name in a list, in the exact order given, no CMake-side
+    # reordering to fight.
+    find_library(PQXX_LIB      pqxx      REQUIRED)
+    find_library(PQ_WIN_LIB    pq        REQUIRED)
+    find_library(PGCOMMON_LIB  pgcommon  REQUIRED)
+    find_library(PGPORT_LIB    pgport    REQUIRED)
+    find_library(SSL_LIB       ssl       REQUIRED)
+    find_library(CRYPTO_LIB    crypto    REQUIRED)
+    find_path(PQXX_INCLUDE_DIR pqxx/pqxx REQUIRED)
+    find_path(PQ_WIN_INCLUDE_DIR libpq-fe.h REQUIRED)
+
+    add_executable(regional_install
+        src/regional_install.cpp
+        src/NavDB.cpp
+        src/RegionalNodeMap.cpp
+    )
+    target_include_directories(regional_install PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${PQXX_INCLUDE_DIR}
+        ${PQ_WIN_INCLUDE_DIR}
+    )
+    # --start-group/--end-group: pqxx/pq/pgcommon/pgport/ssl/crypto have
+    # real circular-ish cross-references at the archive level (pgcommon
+    # needs pgport, pq needs pgcommon, pqxx needs pq, ...) -- grouping
+    # makes ld loop until everything resolves instead of relying on a
+    # single left-to-right pass matching dependency order exactly.
+    target_link_libraries(regional_install PRIVATE
+        -Wl,--start-group
+        ${PQXX_LIB} ${PQ_WIN_LIB} ${PGCOMMON_LIB} ${PGPORT_LIB} ${SSL_LIB} ${CRYPTO_LIB}
+        -Wl,--end-group
+        # libpq's real Windows system dependencies (winsock, crypto/LDAP
+        # for SSPI/GSSAPI auth, registry/UI libs pulled in by its Win32
+        # port layer) -- same list vcpkg's own libpq.pc reports.
+        secur32 crypt32 wldap32 wsock32 ws2_32
+        kernel32 user32 gdi32 winspool shell32 ole32 oleaut32 uuid comdlg32 advapi32
+    )
+    target_compile_features(regional_install PRIVATE cxx_std_20)
+
+else()
+# ---- Linux build: everything else (unchanged, just indented one level
+# under this else() branch so the two build paths can share one file
+# without a WIN32 cross-compile config ever reaching the pkg-config calls
+# below, which would fail outright under MinGW) ----
+
 find_package(Protobuf REQUIRED)
 find_package(ZLIB REQUIRED)
 find_package(PkgConfig REQUIRED)
@@ -306,3 +371,5 @@ target_link_libraries(airspace_load PRIVATE
 
 target_compile_options(airspace_load PRIVATE -O2 -Wall -Wextra -Wno-psabi)
 target_compile_features(airspace_load PRIVATE cxx_std_20)
+
+endif() # WIN32
