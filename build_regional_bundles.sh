@@ -191,17 +191,21 @@ for region in "${region_list[@]}"; do
     # sample) showed ~7.5x wall-clock speedup (2.2s vs 16.2s) at identical
     # compression ratio (383,762,583 vs 383,403,944 bytes) -- but that
     # doesn't hold at full bundle scale, where disk I/O reading the
-    # dominant terrain.bin.gz (already gzip-compressed by
-    # copyOutCompressedGz, so re-compressing it is pure waste either way)
-    # is the real bottleneck, not CPU. Verified end-to-end on a real
-    # region (altai, ~104GB staged input, 78GB of it already-compressed
-    # terrain.bin.gz): pigz produced a byte-verified-intact 95GB bundle in
-    # 30m11s, vs. gzip's measured ~78min for Africa's similarly-sized
-    # input (extrapolated rate applied to altai's size: ~53min) -- a real
-    # but more modest ~1.7x, not 7.5x. Still a genuine win given every
-    # region pays this cost. The plain .bin table dumps (COPY binary
-    # format) still compress ~30% under pigz, same as gzip, so bundle
-    # size for customers is unaffected by this change.
+    # dominant terrain.bin is the real bottleneck, not CPU. Verified
+    # end-to-end on a real region (altai, ~104GB staged input): pigz
+    # produced a byte-verified-intact 95GB bundle in 30m11s, vs. gzip's
+    # measured ~78min for Africa's similarly-sized input (extrapolated
+    # rate applied to altai's size: ~53min) -- a real but more modest
+    # ~1.7x, not 7.5x. Still a genuine win given every region pays this
+    # cost. Measured 2026-08-05, back when terrain.bin was itself
+    # pre-compressed to terrain.bin.gz at export time (regional_db_export's
+    # inline pigz pass, removed 2026-08-08 -- it was compressing terrain
+    # twice, once there and uselessly again by this same tar|pigz step, so
+    # this step now does the terrain compression work regional_db_export
+    # used to do). Re-measure if these numbers matter for future tuning --
+    # this step's own input is bigger now (terrain.bin, not terrain.bin.gz),
+    # trading against a now-lighter export step; total end-to-end time and
+    # final bundle size should be similar either way, just relocated.
     tar cf - -C "$SMALL_STAGING_DIR" "$region" | pigz > "$bundle"
 
     echo "[build_regional_bundles] cleaning up staging data for $region"

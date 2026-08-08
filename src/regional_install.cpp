@@ -52,21 +52,12 @@ bool fileExists(const std::string& path) {
     return stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode);
 }
 
-// terrain/wmm's text-format dumps get gzip-compressed at export (see
-// regional_db_export.cpp -- hex-encoded raster bytes are ~2x bloat from
-// the encoding alone). binOrGzExists/copyFromClause detect the .gz variant
-// here and decompress via `\copy ... FROM PROGRAM 'gunzip -c ...'` rather
-// than requiring a separate temp-file decompression step in this program.
-// The manifest's format= field (read by tableFormat()) stays a plain valid
-// COPY format ("text"/"binary") either way -- compression is purely a
-// file-existence question, not tracked as separate manifest bookkeeping.
-bool binOrGzExists(const std::string& bin_path) {
-    return fileExists(bin_path) || fileExists(bin_path + ".gz");
-}
-
+// Every table's export is a plain file -- terrain used to optionally ship
+// pre-compressed as terrain.bin.gz (regional_db_export.cpp's old inline
+// pigz pass, removed 2026-08-08 since it just double-compressed against
+// the bundle's own outer tar.gz), but all 22 region bundles are being
+// rebuilt with the fixed exporter, so no target file is ever gzipped now.
 std::string copyFromClause(const std::string& bin_path) {
-    if (fileExists(bin_path + ".gz"))
-        return "PROGRAM 'gunzip -c \"" + bin_path + ".gz\"'";
     return "'" + bin_path + "'";
 }
 
@@ -150,7 +141,7 @@ const std::vector<ChildGroup> kChildren = {
 void appendParentGroup(std::ostringstream& sql, const std::string& region_dir,
                        const ParentGroup& g) {
     std::string bin_path = region_dir + "/" + g.table + ".bin";
-    if (!binOrGzExists(bin_path)) return;
+    if (!fileExists(bin_path)) return;
 
     std::string staging = "staging_" + g.table;
     // Bare columns only -- no indexes/constraints (in particular, no GIST
@@ -178,7 +169,7 @@ void appendParentGroup(std::ostringstream& sql, const std::string& region_dir,
 void appendChildGroup(std::ostringstream& sql, const std::string& region_dir,
                       const ChildGroup& g) {
     std::string bin_path = region_dir + "/" + g.table + ".bin";
-    if (!binOrGzExists(bin_path)) return;
+    if (!fileExists(bin_path)) return;
 
     std::string staging = "staging_" + g.table;
     // Bare columns only -- no indexes/constraints (in particular, no GIST
@@ -200,7 +191,7 @@ void appendChildGroup(std::ostringstream& sql, const std::string& region_dir,
 // against new_airport_ids' ident column rather than an integer id.
 void appendAirportTags(std::ostringstream& sql, const std::string& region_dir) {
     std::string bin_path = region_dir + "/airport_tags.bin";
-    if (!binOrGzExists(bin_path)) return;
+    if (!fileExists(bin_path)) return;
     sql << "CREATE TEMP TABLE staging_airport_tags (LIKE public.tags) ON COMMIT DROP;\n";
     sql << "\\copy staging_airport_tags FROM " << copyFromClause(bin_path) << " WITH (FORMAT " << tableFormat(region_dir, "airport_tags") << ")\n";
     sql << "INSERT INTO public.tags "
@@ -357,7 +348,7 @@ int main(int argc, char** argv) {
     // ---- 2. public.terrain's DDL (raster2pgsql-generated, not fixed) ----
     {
         pqxx::connection conn("host=" + host + " dbname=" + db + " user=" + user);
-        bool has_terrain_rows = binOrGzExists(region_dir + "/terrain.bin");
+        bool has_terrain_rows = fileExists(region_dir + "/terrain.bin");
         bool terrain_table_exists = tableExists(conn, "terrain");
         std::string schema_path = region_dir + "/terrain.schema.sql";
         if (has_terrain_rows && !terrain_table_exists) {

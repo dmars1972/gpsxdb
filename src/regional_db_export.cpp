@@ -193,17 +193,6 @@ void loadRegionBoundaries(pqxx::connection& conn, const std::string& regions_dir
     }
 }
 
-// Safely single-quotes an arbitrary string for use as one shell argument.
-std::string shellQuote(const std::string& s) {
-    std::string out = "'";
-    for (char c : s) {
-        if (c == '\'') out += "'\\''";
-        else out += c;
-    }
-    out += "'";
-    return out;
-}
-
 void appendManifestLines(std::mutex& mtx, const std::string& region_dir, const std::string& text) {
     std::lock_guard<std::mutex> lock(mtx);
     std::ofstream mf(region_dir + "/manifest.txt", std::ios::app);
@@ -266,64 +255,6 @@ std::string envelopeSql(const GlobalRegion& r, int srid) {
     ss << "ST_Transform((SELECT geom FROM public.region_boundaries WHERE name='"
        << r.name << "'), " << srid << ")";
     return ss.str();
-}
-
-// Streams `psql \copy (<select_sql>) TO STDOUT WITH (FORMAT text)` straight
-// through pigz to <out_path>.gz -- the uncompressed data never touches disk
-// (unlike write-then-compress), which matters given terrain/wmm's
-// hex-encoded raster dumps can run to hundreds of GB uncompressed for a
-// large region (measured). select_sql and out_path are passed as bash
-// positional parameters ($1/$2, via safely shell-quoted arguments) rather
-// than interpolated into the script text, since select_sql routinely
-// contains single quotes (e.g. name='urals') that would otherwise break
-// naive quoting; `set -o pipefail` (bash-specific, hence explicit `bash -c`
-// rather than relying on system()'s default /bin/sh, which may be dash)
-// makes a psql failure fail the whole pipeline even though pigz's own exit
-// code would otherwise mask it.
-//
-// Returns the row count, or -1 on failure. `\copy ... TO STDOUT` suppresses
-// psql's usual "COPY N" notice entirely (confirmed empirically -- unlike
-// copyOut()'s file-based \copy, which prints it normally), so a prior
-// version ran a separate `SELECT COUNT(*) FROM (<select_sql>) q` query
-// afterward purely to populate the manifest -- redundantly re-executing
-// the same expensive spatial predicate (measured taking several minutes
-// per region on top of the actual export). Fixed by tee-ing the stream to
-// the compressor while counting lines on the main pipe instead: COPY TEXT
-// format guarantees exactly one line per row (any newline embedded in a
-// field value is backslash-escaped, never literal, specifically so row
-// boundaries stay unambiguous -- verified against a real query before
-// relying on it), so `wc -l` gives an exact count with no second query.
-// pipefail covers the main psql | tee | wc -l chain but NOT a failure
-// inside the tee'd process substitution (pigz) -- an acceptable gap since
-// a truncated/corrupt .gz from a failed pigz is still caught by the
-// bundle's own tar tzf integrity check downstream.
-int64_t copyOutCompressedGz(const std::string& host, const std::string& user, const std::string& db,
-                            const std::string& select_sql, const std::string& out_path) {
-    std::ostringstream script;
-    script << "set -o pipefail; psql -h " << host << " -U " << user << " -d " << db
-           << " -v ON_ERROR_STOP=1 -A -t -c \"\\copy ($1) TO STDOUT WITH (FORMAT text)\""
-           << " | tee >(pigz > \"$2\") | wc -l";
-
-    std::ostringstream cmd;
-    cmd << "bash -c " << shellQuote(script.str()) << " _ "
-        << shellQuote(select_sql) << " " << shellQuote(out_path + ".gz") << " 2>&1";
-
-    FILE* p = popen(cmd.str().c_str(), "r");
-    if (!p) return -1;
-    std::string output;
-    char buf[4096];
-    while (fgets(buf, sizeof(buf), p)) output += buf;
-    int rc = pclose(p);
-    if (rc != 0) {
-        std::cerr << "[regional_db_export] compressed copy failed: " << output << "\n";
-        return -1;
-    }
-    try {
-        return std::stoll(output);
-    } catch (...) {
-        std::cerr << "[regional_db_export] compressed copy: could not parse row count from: " << output << "\n";
-        return -1;
-    }
 }
 
 // Runs `psql \copy (<select_sql>) TO '<out_path>' WITH (FORMAT <format>)`,
@@ -1036,31 +967,26 @@ int main(int argc, char** argv) {
 
                 // Raster columns (terrain, wmm) have no binary send/recv
                 // function, so those two use "text" instead -- hex-encoded
-                // raw bytes, ~2x bloat from the encoding alone. For
-                // `terrain` specifically this has measured to hundreds of
-                // GB uncompressed for a single large region, so its
-                // export streams straight through pigz rather than
-                // writing the uncompressed dump to disk first. `wmm` stays
-                // on the plain path: it's tiny, so neither the disk-I/O
-                // savings nor the compression itself are worth the extra
-                // query. The rest of kTables (binary format) also stay
-                // uncompressed -- this machine's Postgres runs
+                // raw bytes, ~2x bloat from the encoding alone. Both stay
+                // uncompressed at this stage now (terrain used to stream
+                // through pigz inline to cut bytes-on-disk on the old SATA
+                // staging drive -- moot now that staging runs on NVMe, and
+                // it meant terrain got compressed twice: once here, once
+                // more by build_regional_bundles.sh's own outer `tar |
+                // pigz` bundling pass, which the code there already noted
+                // was "pure waste" against an already-gzipped stream.
+                // Removing the inline pass means that outer pass is the
+                // only compression terrain's hex-text ever goes through,
+                // at roughly the same final bundle size for a fraction of
+                // the total CPU work). The rest of kTables (binary format)
+                // also stay uncompressed -- this machine's Postgres runs
                 // CPU-saturated from the spatial queries themselves, so
                 // adding pigz there would compete for the same CPU the
                 // queries need, for tables that are only single-digit GB
-                // at most. regional_install.cpp detects the resulting .gz
-                // suffix and decompresses via `\copy ... FROM PROGRAM
-                // 'gunzip -c ...'` -- the manifest's format= field stays a
-                // plain valid COPY format ("text"), not "text.gz".
-                bool is_terrain = (t.name == "terrain");
+                // at most.
                 std::string format = (t.name == "terrain" || t.name == "wmm") ? "text" : "binary";
                 std::string out_path = region_dir + "/" + t.name + ".bin";
-                int64_t n;
-                if (is_terrain) {
-                    n = copyOutCompressedGz(host, user, db, sql, out_path);
-                } else {
-                    n = copyOut(host, user, db, sql, out_path, format);
-                }
+                int64_t n = copyOut(host, user, db, sql, out_path, format);
 
                 // appendManifestLines locks manifest_mu itself -- do NOT
                 // also hold it here across that call (a prior version did,
