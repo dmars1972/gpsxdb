@@ -1,4 +1,5 @@
 #include "AirportsLoader.h"
+#include "ConvenienceFunctions.h"
 #include <pqxx/pqxx>
 #include <proj.h>
 
@@ -458,31 +459,8 @@ bool AirportsLoader::load(bool verbose) {
     // what airports_geog_idx was built on, defeating the index and forcing
     // a full seq scan + sort -- found the hard way via dq_check.py running
     // ~150ms/call instead of a fraction of a ms.
-    // Non-essential convenience function, not core import data -- must
-    // never be allowed to take down the whole import on a bug (see the
-    // identical guard in AirspaceLoader::createQueryFunctions(), added
-    // after exactly that happened to airspace_at_point() 7+ hours into a
-    // run, via an uncaught pqxx exception -> std::terminate()).
-    try {
-        pqxx::work txn(conn_);
-        txn.exec(
-            "CREATE OR REPLACE FUNCTION public.nearest_airport("
-            "  p_x double precision, p_y double precision, p_srid integer DEFAULT 4326"
-            ") RETURNS TABLE(ident varchar, name varchar, type varchar, "
-            "                elevation_ft integer, dist_km double precision) "
-            "LANGUAGE sql STABLE PARALLEL SAFE AS $f$ "
-            "  SELECT a.ident, a.name, a.type, a.elevation_ft, "
-            "         ST_Distance(a.geog, pt.g) / 1000.0 "
-            "  FROM public.airports a, "
-            "       (SELECT ST_Transform(ST_SetSRID(ST_MakePoint(p_x, p_y), p_srid), 3857) AS g) pt "
-            "  ORDER BY a.geog <-> pt.g "
-            "  LIMIT 1 "
-            "$f$");
-        txn.commit();
-    } catch (const std::exception& e) {
-        std::cerr << "[AirportsLoader] nearest_airport() function creation failed (non-fatal): "
-                  << e.what() << "\n";
-    }
+    // Shared with regional_install.cpp -- see ConvenienceFunctions.h.
+    createNearestAirportFunction(conn_);
 
     cleanupTempFiles();
     if (verbose) std::cout << "Airports data loaded.\n";

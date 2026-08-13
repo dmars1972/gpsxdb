@@ -755,6 +755,8 @@ During the node phase, coordinates are written to **per-thread LZ4-compressed sh
 
 For a full planet import, `nodes.dat` is sized at `max_node_id × 16 bytes` (a sparse file — actual disk usage reflects only written node IDs). With `-n 20000000000`, the logical size is ~298 GB but actual usage is ~200 GB for a 2026 planet dump.
 
+In `-m delta`/`-m poll` mode, `nodes.dat` auto-grows in place if OSM assigns a node ID beyond the file's current capacity (25%+ growth per grow event, still sparse — cheap). This is durable across restarts: reopening the file with the original `-n` will not lose the extra capacity, since the actual on-disk file size is always used as a floor. Passing a larger `-n` explicitly still works too; it's just no longer strictly required to keep bumping it by hand to avoid silently dropping new nodes.
+
 ---
 
 ## Performance

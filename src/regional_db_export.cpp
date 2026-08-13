@@ -104,6 +104,7 @@
 #include <memory>
 #include <type_traits>
 #include <unordered_map>
+#include <functional>
 
 // GeoUtils.h declares this extern — defined once per executable.
 int g_srid = 3857;
@@ -288,6 +289,59 @@ int64_t copyOut(const std::string& host, const std::string& user, const std::str
     } catch (...) {
         return 0;
     }
+}
+
+// terrain is the one table in kTables large enough to be worth splitting
+// across multiple connections -- confirmed live during the 2026-08 bundle
+// rebuild, it's routinely the last table still running in a region's
+// --parallel-tables pool, alone on a single core, because every other
+// table here is orders of magnitude smaller. Unlike the big table pairs
+// above (which partition a real B-tree id range), terrain's query is
+// driven by the GiST index on ST_ConvexHull(rast), not by `rid` at all --
+// so `rid % nthreads = k` isn't shortcutting an index range scan, it's
+// just a cheap residual filter splitting the (already region-narrowed)
+// result set evenly across N independent connections/backends. Each
+// connection redoes the same cheap GiST probe (negligible) but only pays
+// for 1/N of the actual cost that matters here: hex-encoding and
+// transferring raster tile blobs, which is genuinely per-connection
+// serial work. raster2pgsql tiles are fixed-size, so modulo alone
+// load-balances evenly without needing dynamic work-stealing. Output is
+// plain COPY text (no header/footer), so the N part-files concatenate
+// directly into the final file.
+int64_t copyOutTerrainParallel(const std::string& host, const std::string& user,
+                                const std::string& db, const std::string& select_sql,
+                                const std::string& out_path, int nthreads) {
+    if (nthreads < 1) nthreads = 1;
+    std::vector<int64_t> counts(static_cast<size_t>(nthreads), 0);
+    std::vector<std::string> part_paths(static_cast<size_t>(nthreads));
+    std::vector<std::thread> pool;
+    pool.reserve(static_cast<size_t>(nthreads));
+    for (int k = 0; k < nthreads; ++k) {
+        part_paths[static_cast<size_t>(k)] = out_path + ".part" + std::to_string(k);
+        pool.emplace_back([&, k]() {
+            std::string sql = select_sql + " AND rid % " + std::to_string(nthreads) + " = " + std::to_string(k);
+            counts[static_cast<size_t>(k)] = copyOut(host, user, db, sql, part_paths[static_cast<size_t>(k)], "text");
+        });
+    }
+    for (auto& th : pool) th.join();
+
+    bool failed = false;
+    int64_t total = 0;
+    for (auto c : counts) {
+        if (c < 0) failed = true;
+        else total += c;
+    }
+
+    {
+        std::ofstream out(out_path, std::ios::binary | std::ios::trunc);
+        for (int k = 0; k < nthreads; ++k) {
+            std::ifstream in(part_paths[static_cast<size_t>(k)], std::ios::binary);
+            out << in.rdbuf();
+        }
+    }
+    for (const auto& p : part_paths) std::remove(p.c_str());
+
+    return failed ? -1 : total;
 }
 
 // ---- category 1 helpers (5 big parent+child table pairs, single pass) ----
@@ -517,48 +571,70 @@ void processPair(const TablePair& pair, const std::string& conninfo, const std::
 
     int nthreads = std::max(1, threads);
     int64_t span = max_id - min_id + 1;
-    int64_t chunk = (span + nthreads - 1) / nthreads;
 
-    std::vector<LocalMap> local_maps(static_cast<size_t>(nthreads));
-    std::vector<std::vector<std::string>> parent_temp(static_cast<size_t>(nthreads),
+    // Partition into many more small chunks than there are threads, pulled
+    // dynamically from a shared counter, rather than nthreads big static
+    // ranges. Row density isn't uniform across an id range (observed
+    // 2026-08-12: 9 of 12 threads finished a `ways` pair quickly while 3
+    // stragglers covering denser low-id ranges did most of the real work,
+    // even though MIN/MAX(id) is the real range, not a configured ceiling
+    // like the regional_export bug this superficially resembles) -- with
+    // static one-chunk-per-thread assignment, an unlucky thread just sits
+    // there carrying a disproportionate share while lucky ones idle. Many
+    // small chunks fixes this the same way TerrainLoader's batch pool and
+    // OSMMMap's ranged scan already do elsewhere in this codebase: a thread
+    // that lands on a sparse chunk simply pulls another one instead of
+    // being stuck, so imbalance averages out instead of concentrating.
+    // kChunksPerThread trades finer-grained balancing against more temp
+    // files (TempRowWriter/ExtraVertexWriter open one file per chunk per
+    // region up front, even for chunks that end up empty for that region) --
+    // 8 keeps that count reasonable (nthreads*8*regions*~2.5 per pair)
+    // while still smoothing out the kind of imbalance observed above.
+    constexpr int kChunksPerThread = 8;
+    int64_t nchunks64 = std::min(static_cast<int64_t>(nthreads) * kChunksPerThread, span);
+    int nchunks = static_cast<int>(std::max<int64_t>(1, nchunks64));
+    int64_t chunk = (span + nchunks - 1) / nchunks;
+
+    std::vector<LocalMap> local_maps(static_cast<size_t>(nchunks));
+    std::vector<std::vector<std::string>> parent_temp(static_cast<size_t>(nchunks),
                                                         std::vector<std::string>(regions.size()));
-    std::vector<std::vector<std::string>> child_temp(static_cast<size_t>(nthreads),
+    std::vector<std::vector<std::string>> child_temp(static_cast<size_t>(nchunks),
                                                        std::vector<std::string>(regions.size()));
-    std::vector<std::vector<std::string>> extra_vertex_temp(static_cast<size_t>(nthreads),
+    std::vector<std::vector<std::string>> extra_vertex_temp(static_cast<size_t>(nchunks),
                                                               std::vector<std::string>(regions.size()));
-    for (int ti = 0; ti < nthreads; ++ti) {
+    for (int ci = 0; ci < nchunks; ++ci) {
         for (size_t ri = 0; ri < regions.size(); ++ri) {
-            std::string base = out_dir + "/tmp_" + regions[ri].name + "_" + std::to_string(ti) + "_";
-            parent_temp[static_cast<size_t>(ti)][ri] = base + pair.parent + ".raw";
-            child_temp[static_cast<size_t>(ti)][ri] = base + pair.child + ".raw";
+            std::string base = out_dir + "/tmp_" + regions[ri].name + "_" + std::to_string(ci) + "_";
+            parent_temp[static_cast<size_t>(ci)][ri] = base + pair.parent + ".raw";
+            child_temp[static_cast<size_t>(ci)][ri] = base + pair.child + ".raw";
             if (emit_extra_vertices)
-                extra_vertex_temp[static_cast<size_t>(ti)][ri] = base + "extra_vertices.raw";
+                extra_vertex_temp[static_cast<size_t>(ci)][ri] = base + "extra_vertices.raw";
         }
     }
 
-    auto windowFor = [&](int ti) -> std::pair<int64_t, int64_t> {
-        int64_t lo = min_id + static_cast<int64_t>(ti) * chunk;
+    auto windowFor = [&](int ci) -> std::pair<int64_t, int64_t> {
+        int64_t lo = min_id + static_cast<int64_t>(ci) * chunk;
         int64_t hi = std::min(lo + chunk - 1, max_id);
         return {lo, hi};
     };
 
     // ---- Parent pass: classify every row against every region, write
     // matches, record (id, bitmask) for the child pass. ----
-    auto parentWorker = [&](int ti) {
-        auto [lo, hi] = windowFor(ti);
+    auto parentWorkForChunk = [&](int ci) {
+        auto [lo, hi] = windowFor(ci);
         if (lo > hi) return;
 
         std::vector<std::unique_ptr<TempRowWriter>> writers;
         if (!extra_vertices_only) {
             writers.reserve(regions.size());
             for (size_t ri = 0; ri < regions.size(); ++ri)
-                writers.push_back(std::make_unique<TempRowWriter>(parent_temp[static_cast<size_t>(ti)][ri]));
+                writers.push_back(std::make_unique<TempRowWriter>(parent_temp[static_cast<size_t>(ci)][ri]));
         }
         std::vector<std::unique_ptr<ExtraVertexWriter>> vwriters;
         if (emit_extra_vertices) {
             vwriters.reserve(regions.size());
             for (size_t ri = 0; ri < regions.size(); ++ri)
-                vwriters.push_back(std::make_unique<ExtraVertexWriter>(extra_vertex_temp[static_cast<size_t>(ti)][ri]));
+                vwriters.push_back(std::make_unique<ExtraVertexWriter>(extra_vertex_temp[static_cast<size_t>(ci)][ri]));
         }
 
         std::string sql = "SELECT * FROM public." + std::string(pair.parent) +
@@ -566,7 +642,7 @@ void processPair(const TablePair& pair, const std::string& conninfo, const std::
         PgCopyBinary::Reader reader(conninfo, sql);
         std::vector<std::pair<RegionIndex::Box, size_t>> scratch;
         std::vector<RegionIndex::Point> verts;
-        auto& map = local_maps[static_cast<size_t>(ti)].entries;
+        auto& map = local_maps[static_cast<size_t>(ci)].entries;
 
         while (auto row = reader.next()) {
             int64_t id = PgCopyBinary::readBigintBE(row->fields[0]);
@@ -607,30 +683,45 @@ void processPair(const TablePair& pair, const std::string& conninfo, const std::
         }
     };
 
-    {
+    // Dynamic work-stealing: nthreads workers pull the next unclaimed
+    // chunk off a shared atomic counter instead of owning one fixed chunk
+    // each, so a thread that finishes a sparse chunk immediately picks up
+    // another rather than sitting idle while a sibling is still working
+    // through a dense one.
+    auto runPool = [&](const std::function<void(int)>& work) {
+        std::atomic<int> next_chunk{0};
         std::vector<std::thread> pool;
         pool.reserve(static_cast<size_t>(nthreads));
-        for (int ti = 0; ti < nthreads; ++ti) pool.emplace_back(parentWorker, ti);
-        for (auto& t : pool) t.join();
-    }
+        for (int t = 0; t < nthreads; ++t)
+            pool.emplace_back([&]() {
+                for (;;) {
+                    int ci = next_chunk.fetch_add(1, std::memory_order_relaxed);
+                    if (ci >= nchunks) break;
+                    work(ci);
+                }
+            });
+        for (auto& th : pool) th.join();
+    };
+
+    runPool(parentWorkForChunk);
     for (auto& m : local_maps) std::sort(m.entries.begin(), m.entries.end());
 
     // ---- Child pass: reuses the identical id-range partition, each
-    // worker classifying against only its own local map from the parent
+    // chunk classifying against only its own local map from the parent
     // pass (see top-of-file comment for why that's safe). ----
-    auto childWorker = [&](int ti) {
-        auto [lo, hi] = windowFor(ti);
+    auto childWorkForChunk = [&](int ci) {
+        auto [lo, hi] = windowFor(ci);
         if (lo > hi) return;
 
         std::vector<std::unique_ptr<TempRowWriter>> writers;
         writers.reserve(regions.size());
         for (size_t ri = 0; ri < regions.size(); ++ri)
-            writers.push_back(std::make_unique<TempRowWriter>(child_temp[static_cast<size_t>(ti)][ri]));
+            writers.push_back(std::make_unique<TempRowWriter>(child_temp[static_cast<size_t>(ci)][ri]));
 
         std::string sql = "SELECT * FROM public." + std::string(pair.child) +
                            " WHERE id BETWEEN " + std::to_string(lo) + " AND " + std::to_string(hi);
         PgCopyBinary::Reader reader(conninfo, sql);
-        const auto& map = local_maps[static_cast<size_t>(ti)];
+        const auto& map = local_maps[static_cast<size_t>(ci)];
 
         while (auto row = reader.next()) {
             int64_t id = PgCopyBinary::readBigintBE(row->fields[0]);
@@ -643,12 +734,7 @@ void processPair(const TablePair& pair, const std::string& conninfo, const std::
 
     // --extra-vertices-only has no use for the child table at all (tags
     // never affect geometry/vertices) -- skip that whole scan.
-    if (!extra_vertices_only) {
-        std::vector<std::thread> pool;
-        pool.reserve(static_cast<size_t>(nthreads));
-        for (int ti = 0; ti < nthreads; ++ti) pool.emplace_back(childWorker, ti);
-        for (auto& t : pool) t.join();
-    }
+    if (!extra_vertices_only) runPool(childWorkForChunk);
 
     // ---- Merge + manifest ----
     for (size_t ri = 0; ri < regions.size(); ++ri) {
@@ -656,11 +742,11 @@ void processPair(const TablePair& pair, const std::string& conninfo, const std::
 
         if (!extra_vertices_only) {
             std::vector<std::string> p_paths, c_paths;
-            p_paths.reserve(static_cast<size_t>(nthreads));
-            c_paths.reserve(static_cast<size_t>(nthreads));
-            for (int ti = 0; ti < nthreads; ++ti) {
-                p_paths.push_back(parent_temp[static_cast<size_t>(ti)][ri]);
-                c_paths.push_back(child_temp[static_cast<size_t>(ti)][ri]);
+            p_paths.reserve(static_cast<size_t>(nchunks));
+            c_paths.reserve(static_cast<size_t>(nchunks));
+            for (int ci = 0; ci < nchunks; ++ci) {
+                p_paths.push_back(parent_temp[static_cast<size_t>(ci)][ri]);
+                c_paths.push_back(child_temp[static_cast<size_t>(ci)][ri]);
             }
             int64_t prows = mergeTempFiles(region_dir + "/" + pair.parent + ".bin", p_paths);
             int64_t crows = mergeTempFiles(region_dir + "/" + pair.child + ".bin", c_paths);
@@ -678,9 +764,9 @@ void processPair(const TablePair& pair, const std::string& conninfo, const std::
 
         if (emit_extra_vertices) {
             std::vector<std::string> v_paths;
-            v_paths.reserve(static_cast<size_t>(nthreads));
-            for (int ti = 0; ti < nthreads; ++ti)
-                v_paths.push_back(extra_vertex_temp[static_cast<size_t>(ti)][ri]);
+            v_paths.reserve(static_cast<size_t>(nchunks));
+            for (int ci = 0; ci < nchunks; ++ci)
+                v_paths.push_back(extra_vertex_temp[static_cast<size_t>(ci)][ri]);
             appendExtraVertices(extra_vertices_mutex, region_dir, v_paths);
         }
     }
@@ -986,7 +1072,9 @@ int main(int argc, char** argv) {
                 // at most.
                 std::string format = (t.name == "terrain" || t.name == "wmm") ? "text" : "binary";
                 std::string out_path = region_dir + "/" + t.name + ".bin";
-                int64_t n = copyOut(host, user, db, sql, out_path, format);
+                int64_t n = (t.name == "terrain")
+                    ? copyOutTerrainParallel(host, user, db, sql, out_path, threads)
+                    : copyOut(host, user, db, sql, out_path, format);
 
                 // appendManifestLines locks manifest_mu itself -- do NOT
                 // also hold it here across that call (a prior version did,

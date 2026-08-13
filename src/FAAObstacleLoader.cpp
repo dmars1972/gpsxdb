@@ -1,5 +1,6 @@
 #include "FAAObstacleLoader.h"
 #include "GeoUtils.h"
+#include "ConvenienceFunctions.h"
 #include <pqxx/pqxx>
 #include <iostream>
 #include <fstream>
@@ -290,32 +291,8 @@ bool FAAObstacleLoader::load(bool verbose) {
     // US + territories only -- there's no global obstacle dataset, so a
     // point outside FAA coverage just gets zero rows back, not an error.
     //
-    // Non-essential convenience function, not core import data -- must
-    // never be allowed to take down the whole import on a bug (see the
-    // identical guard in AirspaceLoader::createQueryFunctions(), added
-    // after exactly that happened to airspace_at_point() 7+ hours into a
-    // run, via an uncaught pqxx exception -> std::terminate()).
-    try {
-        pqxx::work txn2(conn_);
-        txn2.exec(
-            "CREATE OR REPLACE FUNCTION public.obstacles_nearby("
-            "  p_x double precision, p_y double precision, "
-            "  p_radius_m double precision DEFAULT 9260, p_srid integer DEFAULT 4326"
-            ") RETURNS TABLE(id integer, obstacle_type varchar, agl_ht integer, "
-            "                amsl_ht integer, lighting varchar, dist_m double precision) "
-            "LANGUAGE sql STABLE PARALLEL SAFE AS $f$ "
-            "  SELECT o.id, o.obstacle_type, o.agl_ht, o.amsl_ht, o.lighting, "
-            "         ST_Distance(o.geog, pt.g) "
-            "  FROM public.faa_obstacles o, "
-            "       (SELECT ST_Transform(ST_SetSRID(ST_MakePoint(p_x, p_y), p_srid), 3857) AS g) pt "
-            "  WHERE ST_DWithin(o.geog, pt.g, p_radius_m) "
-            "  ORDER BY o.geog <-> pt.g "
-            "$f$");
-        txn2.commit();
-    } catch (const std::exception& e) {
-        std::cerr << "[FAAObstacleLoader] obstacles_nearby() function creation failed (non-fatal): "
-                  << e.what() << "\n";
-    }
+    // Shared with regional_install.cpp -- see ConvenienceFunctions.h.
+    createObstaclesNearbyFunction(conn_);
 
     // Cleanup temp files
     system(("rm -rf " + zip_path + " " + csv_dir).c_str());

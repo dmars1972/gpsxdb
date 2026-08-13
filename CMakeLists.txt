@@ -75,6 +75,7 @@ if(WIN32)
         src/regional_install.cpp
         src/NavDB.cpp
         src/RegionalNodeMap.cpp
+        src/ConvenienceFunctions.cpp
     )
     target_include_directories(regional_install PRIVATE
         ${CMAKE_SOURCE_DIR}/include
@@ -184,6 +185,7 @@ add_executable(osm_import
     src/RegionPolygons.cpp
     src/RegionIndex.cpp
     src/WkbDecode.cpp
+    src/ConvenienceFunctions.cpp
     proto/fileformat.proto
     proto/osmformat.proto
 )
@@ -239,6 +241,7 @@ endif()
 add_executable(airports_load
     src/airports_load.cpp
     src/AirportsLoader.cpp
+    src/ConvenienceFunctions.cpp
 )
 
 target_include_directories(airports_load PRIVATE
@@ -264,6 +267,7 @@ add_executable(faa_obstacles_load
     src/faa_obstacles_load.cpp
     src/FAAObstacleLoader.cpp
     src/GeoUtils.cpp
+    src/ConvenienceFunctions.cpp
 )
 
 target_include_directories(faa_obstacles_load PRIVATE
@@ -290,6 +294,7 @@ target_compile_features(faa_obstacles_load PRIVATE cxx_std_20)
 add_executable(terrain_load
     src/terrain_load.cpp
     src/TerrainLoader.cpp
+    src/ConvenienceFunctions.cpp
 )
 
 target_include_directories(terrain_load PRIVATE
@@ -382,6 +387,7 @@ add_executable(regional_install
     src/regional_install.cpp
     src/NavDB.cpp
     src/RegionalNodeMap.cpp
+    src/ConvenienceFunctions.cpp
 )
 
 target_include_directories(regional_install PRIVATE
@@ -406,6 +412,7 @@ target_compile_features(regional_install PRIVATE cxx_std_20)
 add_executable(wmm_load
     src/wmm_load.cpp
     src/WMMLoader.cpp
+    src/ConvenienceFunctions.cpp
 )
 
 target_include_directories(wmm_load PRIVATE
@@ -430,6 +437,7 @@ add_executable(airspace_load
     src/airspace_load.cpp
     src/AirspaceLoader.cpp
     src/GeoUtils.cpp
+    src/ConvenienceFunctions.cpp
 )
 
 target_include_directories(airspace_load PRIVATE

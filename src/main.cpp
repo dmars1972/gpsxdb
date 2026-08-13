@@ -370,13 +370,19 @@ static Args parseArgs(int argc, char** argv) {
                 "  Delta mode (-m delta):\n"
                 "    -o <file.osc.gz>   OSC file to apply\n"
                 "    -f nodes_file      Existing nodes.dat from initial import\n"
-                "    -n max_node_id     Must match initial import\n"
+                "    -n max_node_id     At least the initial import's value (nodes.dat now\n"
+                "                       auto-grows past this on demand and remembers it\n"
+                "                       across restarts, so this is a floor, not a hard\n"
+                "                       requirement to keep updating by hand)\n"
                 "  Poll mode (-m poll):\n"
                 "    -r minute|hour|day Replication granularity (default minute)\n"
                 "    -Q sequence        Starting sequence (default: from DB)\n"
                 "    -p poll_interval   Seconds between checks (default 60)\n"
                 "    -f nodes_file      Existing nodes.dat from initial import\n"
-                "    -n max_node_id     Must match initial import\n"
+                "    -n max_node_id     At least the initial import's value (nodes.dat now\n"
+                "                       auto-grows past this on demand and remembers it\n"
+                "                       across restarts, so this is a floor, not a hard\n"
+                "                       requirement to keep updating by hand)\n"
                 "  Region-aware delta/poll (-m delta or -m poll):\n"
                 "    Auto-detected -- no flag needed. If -d/--database has any rows in\n"
                 "    public.installed_regions (populated by regional_install.cpp), -f/\n"
@@ -1090,12 +1096,20 @@ int main(int argc, char** argv) {
             {
                 bool ok = AirportsLoader(args.server, args.user, args.database).load(false);
                 LOGI(-1, ok ? "airports data loaded" : "airports data load FAILED — see stderr above");
+                if (ok) {
+                    NavDB db(0, args.server, args.user, args.database, db_flush_mu_early);
+                    seedExternalDataTimestamp(db, "airports");
+                }
             }
         }
         if (args.resume_phase == Phase::FAALoading || args.resume_phase == Phase::Vacuuming) {
             LOGI(-1, "resume: loading FAA obstacle data");
             bool ok = FAAObstacleLoader(args.server, args.user, args.database).load(false);
             LOGI(-1, ok ? "FAA obstacle data loaded" : "FAA obstacle data load FAILED — see stderr above");
+            if (ok) {
+                NavDB db(0, args.server, args.user, args.database, db_flush_mu_early);
+                seedExternalDataTimestamp(db, "faa_obstacles");
+            }
         }
         if (args.resume_phase == Phase::FAALoading || args.resume_phase == Phase::WMMLoading
             || args.resume_phase == Phase::Vacuuming) {
@@ -1103,6 +1117,10 @@ int main(int argc, char** argv) {
             bool ok = WMMLoader(args.server, args.user, args.database).load(currentDecimalYear(),
                     -180, -90, 180, 90, 0.25, 3857, 0.25, 50.0, 4, false);
             LOGI(-1, ok ? "WMM declination data loaded" : "WMM declination data load FAILED — see stderr above");
+            if (ok) {
+                NavDB db(0, args.server, args.user, args.database, db_flush_mu_early);
+                seedWMMTimestamp(db);
+            }
         }
         if (args.resume_phase == Phase::WMMLoading || args.resume_phase == Phase::AirspaceLoading
             || args.resume_phase == Phase::Vacuuming) {
@@ -1120,9 +1138,14 @@ int main(int argc, char** argv) {
                 mtr_ok = airspace.loadMilitaryTrainingRoutes(false);
                 tfr_ok = airspace.loadNationalDefenseTFRs(false);
             }
-            LOGI(-1, (class_ok && sua_ok && intl_ok && mtr_ok && tfr_ok)
+            bool all_ok = class_ok && sua_ok && intl_ok && mtr_ok && tfr_ok;
+            LOGI(-1, all_ok
                      ? "airspace data loaded"
                      : "airspace data load FAILED for one or more sources — see stderr above");
+            if (all_ok) {
+                NavDB db(0, args.server, args.user, args.database, db_flush_mu_early);
+                seedAirspaceTimestamp(db);
+            }
         }
         if (args.resume_phase == Phase::AirspaceLoading || args.resume_phase == Phase::TerrainLoading
             || args.resume_phase == Phase::Vacuuming) {
@@ -1412,6 +1435,10 @@ int main(int argc, char** argv) {
         loader.setProgressCallback(reportProgress);
         bool ok = loader.load(false);
         LOGI(-1, ok ? "airports data loaded" : "airports data load FAILED — see stderr above");
+        if (ok) {
+            NavDB db(0, args.server, args.user, args.database, db_flush_mu);
+            seedExternalDataTimestamp(db, "airports");
+        }
     }
 
     status.advancePhase(Phase::AirportsLoading, Phase::FAALoading);
@@ -1421,6 +1448,10 @@ int main(int argc, char** argv) {
         loader.setProgressCallback(reportProgress);
         bool ok = loader.load(false);
         LOGI(-1, ok ? "FAA obstacle data loaded" : "FAA obstacle data load FAILED — see stderr above");
+        if (ok) {
+            NavDB db(0, args.server, args.user, args.database, db_flush_mu);
+            seedExternalDataTimestamp(db, "faa_obstacles");
+        }
     }
 
     status.advancePhase(Phase::FAALoading, Phase::WMMLoading);
@@ -1430,6 +1461,10 @@ int main(int argc, char** argv) {
         loader.setProgressCallback(reportProgress);
         bool ok = loader.load(currentDecimalYear(), -180, -90, 180, 90, 0.25, 3857, 0.25, 50.0, 4, false);
         LOGI(-1, ok ? "WMM declination data loaded" : "WMM declination data load FAILED — see stderr above");
+        if (ok) {
+            NavDB db(0, args.server, args.user, args.database, db_flush_mu);
+            seedWMMTimestamp(db);
+        }
     }
 
     status.advancePhase(Phase::WMMLoading, Phase::AirspaceLoading);
@@ -1447,9 +1482,18 @@ int main(int argc, char** argv) {
             LOGI(-1, "no OpenAIP API key found (~/.openaip_api_key) — skipping international airspace");
         bool mtr_ok = airspace.loadMilitaryTrainingRoutes(false);
         bool tfr_ok = airspace.loadNationalDefenseTFRs(false);
-        LOGI(-1, (class_ok && sua_ok && intl_ok && mtr_ok && tfr_ok)
+        bool all_ok = class_ok && sua_ok && intl_ok && mtr_ok && tfr_ok;
+        LOGI(-1, all_ok
                  ? "airspace data loaded"
                  : "airspace data load FAILED for one or more sources — see stderr above");
+        // Only seed the checkpoint on full success, matching
+        // checkAirspaceRefresh()'s own all-or-nothing condition for
+        // writing it -- a partial failure here should still be picked up
+        // by poll's next periodic check rather than being masked.
+        if (all_ok) {
+            NavDB db(0, args.server, args.user, args.database, db_flush_mu);
+            seedAirspaceTimestamp(db);
+        }
     }
 
     status.advancePhase(Phase::AirspaceLoading, Phase::TerrainLoading);

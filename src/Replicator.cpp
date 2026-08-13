@@ -268,6 +268,30 @@ void Replicator::checkAirspaceRefresh() {
     }
 }
 
+void seedExternalDataTimestamp(NavDB& db, const std::string& source_name) {
+    for (const auto& src : kExternalSources) {
+        if (source_name != src.name) continue;
+        long remote_mtime = remoteLastModified(src.url);
+        if (remote_mtime < 0) {
+            std::cerr << "[Replicator] could not seed " << source_name
+                      << " timestamp (no Last-Modified from server) -- "
+                         "next poll startup will do one redundant reload\n";
+            return;
+        }
+        db.setExternalDataTimestamp(source_name, remote_mtime);
+        return;
+    }
+    std::cerr << "[Replicator] seedExternalDataTimestamp: unknown source \"" << source_name << "\"\n";
+}
+
+void seedWMMTimestamp(NavDB& db) {
+    db.setExternalDataTimestamp("wmm", std::time(nullptr));
+}
+
+void seedAirspaceTimestamp(NavDB& db) {
+    db.setExternalDataTimestamp("airspace", std::time(nullptr));
+}
+
 void Replicator::poll(int interval_seconds) {
     signal(SIGINT, sigintHandler);
     signal(SIGTERM, sigintHandler);

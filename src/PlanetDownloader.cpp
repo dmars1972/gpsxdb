@@ -7,6 +7,7 @@
 #include <cctype>
 #include <ctime>
 #include <sys/statvfs.h>
+#include <sys/stat.h>
 #include <filesystem>
 #include <curl/curl.h>
 
@@ -119,6 +120,31 @@ bool downloadLatestPlanet(const std::string& dest_path, bool verbose) {
 
     std::error_code ec;
     long long existing = fs::exists(dest, ec) ? static_cast<long long>(fs::file_size(dest, ec)) : 0;
+
+    // planet-latest.osm.pbf is regenerated from scratch weekly, not
+    // appended to -- a local file left over from a previous week shares no
+    // byte-for-byte prefix with the current remote file. Resuming against
+    // it with curl -C - would splice old-generation bytes with new-
+    // generation bytes into a corrupted file: the checksum check below
+    // would eventually catch it, but only after re-downloading the
+    // (small) remainder and hashing the whole ~100GB result for nothing.
+    // A local file only represents a safe resume point if it predates the
+    // remote file's last modification, i.e. it's a genuinely-interrupted
+    // download of the same generation currently live on the server.
+    if (existing > 0) {
+        long remote_mtime = remoteLastModifiedEpoch(kPlanetUrl);
+        struct stat st{};
+        if (remote_mtime > 0 && stat(dest_path.c_str(), &st) == 0 &&
+            static_cast<long>(st.st_mtime) < remote_mtime) {
+            if (verbose)
+                std::cout << "[Planet] local file at " << dest_path
+                          << " predates the current remote planet-latest.osm.pbf "
+                             "-- discarding it and starting a fresh download "
+                             "instead of a resume that would corrupt the result\n";
+            std::remove(dest_path.c_str());
+            existing = 0;
+        }
+    }
 
     struct statvfs vfs;
     if (statvfs(dir.string().c_str(), &vfs) == 0) {

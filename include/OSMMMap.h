@@ -72,12 +72,27 @@ public:
     void forEachPopulatedRange(size_t byte_start, size_t byte_end,
                                const std::function<void(int64_t id, double lon_m, double lat_m)>& fn) const;
 
+    // Highest id with its bitmap bit set, or -1 if nothing is populated.
+    // Scans the bitmap from the end backward -- cheap in practice, since
+    // max_id is provisioned well above the real data (headroom for future
+    // growth), so the scan only touches the unpopulated tail's worth of
+    // zero bytes before hitting the real data, not the full bitmap. Callers
+    // that need to bound work to the actually-populated id range (e.g.
+    // splitting a scan into --threads chunks) should use this instead of
+    // max_id, which only reflects configured headroom, not real content.
+    int64_t highestPopulatedId() const;
+
     // Zero out a node entry (used by delta deletes)
     void remove(int64_t id);
 
     // Write node coordinates directly to the merged flat file — used by
     // delta mode where shards are unavailable. Bypasses shard buffering.
     void update(int64_t id, double lon_m, double lat_m);
+
+    // Grow the merged file + bitmap in place if `id` exceeds current
+    // capacity (single-threaded delta/poll use only -- see .cpp for why).
+    // No-op if already large enough. Called internally by update().
+    void growMergedIfNeeded(int64_t id);
 
     // Call once, after merge() completes and before the ways/relations phase
     // begins, to hint the kernel that subsequent access to the merged node

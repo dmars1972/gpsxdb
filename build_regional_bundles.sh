@@ -35,7 +35,30 @@
 # Usage: ./build_regional_bundles.sh -s <host> -d <db> -u <user> \
 #            -f <master nodes.dat path> -n <max_id> --out-dir <dir> \
 #            [--regions name1,name2,...] [--region-batch-size N] \
-#            [--small-staging-dir <dir>] [-v]
+#            [--staging-dir <dir>] [--small-staging-dir <dir>] \
+#            [--skip-big-tables] [--skip-node-export] [-v]
+#
+# --skip-big-tables: resume after an interrupted run whose --big-tables-only
+# phase already completed -- skips straight to the regional_export pass and
+# the per-region small-tables-only+bundle loop, reusing whatever's already
+# in --staging-dir (every requested region needs ways/way_tags/areas/
+# area_tags/roads/road_tags/relations/relation_tags/nodes/node_tags.bin +
+# extra_vertices.bin already present there, or those steps will fail).
+# --big-tables-only is by far the most expensive phase (a client-side pass
+# over the full ways/areas/roads/relations/nodes tables), so this avoids
+# redoing hours of real work over a failure in a later, cheaper step.
+#
+# --skip-node-export: same idea, one phase further along -- resume after an
+# interrupted run whose regional_export (nodes.dat slicing) pass already
+# completed too, skipping straight to the per-region small-tables-only+
+# bundle loop. Pair with --regions to scope that loop to only the region(s)
+# that hadn't been bundled yet (any region whose bundle already exists from
+# before the interruption doesn't need reprocessing -- and re-including an
+# already-bundled region here would fail anyway, since its <region>.nodes.dat
+# was already consumed/moved by that earlier successful run). The
+# regional_export scan is itself a many-hours single pass over the full
+# node store, so this avoids redoing it over a failure in the (much
+# cheaper, per-region) bundling step that follows.
 #
 # Requires ~/.pgpass for authentication. Output: <out-dir>/<region>.gpsxdb.tar.gz
 # per region. Per-region staging data is deleted right after each bundle is
@@ -44,23 +67,34 @@
 # --region-batch-size) not-yet-bundled batches' big-table dumps remain
 # under <out-dir>/staging while the run is in progress.
 #
-# --small-staging-dir: point --small-tables-only's own staging (dominated
-# by the terrain export) at a different, faster disk than --out-dir/staging.
-# Measured on this project's own hardware: <out-dir>/staging lived on a
-# single slow spinning disk, which iostat showed pinned at ~97% util /
-# 100-200ms average I/O wait during a region's bundling step -- moving
-# --small-tables-only's output to the same NVMe Postgres itself runs on
-# (plenty of headroom there; the DB's own read/write during these queries
-# never exceeded a few percent of that disk's throughput) dropped that
-# disk to 0% util and made the step CPU-bound instead of I/O-bound.
-# Verified end-to-end on a real region (south_america, ~85GB bundle):
-# no correctness difference, meaningfully faster wall-clock. Defaults to
-# the same as --out-dir/staging (i.e. a no-op) since not every deployment
-# has a second, faster disk available -- set this only if you do.
+# --staging-dir: point ALL staging (both --big-tables-only's 5 big table
+# pairs -- ways/areas/roads/relations/nodes + tags, by far the largest
+# volume of any step here -- and regional_export's nodes.dat slicing) at a
+# different, faster disk than --out-dir/staging. Defaults to
+# <out-dir>/staging (i.e. a no-op) since not every deployment has a
+# second, faster disk available -- set this only if you do.
+#
+# --small-staging-dir: same idea, but only for --small-tables-only's own
+# staging (dominated by the terrain export). Defaults to whatever
+# --staging-dir resolves to. Measured on this project's own hardware:
+# <out-dir>/staging lived on a single slow spinning disk, which iostat
+# showed pinned at ~97% util / 100-200ms average I/O wait during a
+# region's bundling step -- moving --small-tables-only's output to the
+# same NVMe Postgres itself runs on (plenty of headroom there; the DB's
+# own read/write during these queries never exceeded a few percent of
+# that disk's throughput) dropped that disk to 0% util and made the step
+# CPU-bound instead of I/O-bound. Verified end-to-end on a real region
+# (south_america, ~85GB bundle): no correctness difference, meaningfully
+# faster wall-clock. --staging-dir was added after that measurement --
+# the same slow-disk exposure applies just as much to --big-tables-only's
+# output, which is actually the larger of the two by volume; pass both
+# flags pointed at the same faster disk unless you have a specific reason
+# to split them (e.g. two separate fast disks).
 set -euo pipefail
 
 HOST=""; DB=""; USER_=""; NODES_FILE=""; MAX_ID="20000000000"
-OUT_DIR="."; REGIONS=""; VERBOSE=""; REGION_BATCH_SIZE=""; SMALL_STAGING_DIR=""
+OUT_DIR="."; REGIONS=""; VERBOSE=""; REGION_BATCH_SIZE=""
+STAGING_DIR_OVERRIDE=""; SMALL_STAGING_DIR=""; SKIP_BIG_TABLES=""; SKIP_NODE_EXPORT=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -72,10 +106,13 @@ while [[ $# -gt 0 ]]; do
         --out-dir) OUT_DIR="$2"; shift 2 ;;
         --regions) REGIONS="$2"; shift 2 ;;
         --region-batch-size) REGION_BATCH_SIZE="$2"; shift 2 ;;
+        --staging-dir) STAGING_DIR_OVERRIDE="$2"; shift 2 ;;
         --small-staging-dir) SMALL_STAGING_DIR="$2"; shift 2 ;;
+        --skip-big-tables) SKIP_BIG_TABLES="1"; shift ;;
+        --skip-node-export) SKIP_NODE_EXPORT="1"; shift ;;
         -v|--verbose) VERBOSE="-v"; shift ;;
         -h|--help)
-            echo "Usage: $0 -s <host> -d <db> -u <user> -f <nodes.dat> -n <max_id> --out-dir <dir> [--regions n1,n2,...] [--region-batch-size N] [--small-staging-dir <dir>] [-v]"
+            echo "Usage: $0 -s <host> -d <db> -u <user> -f <nodes.dat> -n <max_id> --out-dir <dir> [--regions n1,n2,...] [--region-batch-size N] [--staging-dir <dir>] [--small-staging-dir <dir>] [--skip-big-tables] [--skip-node-export] [-v]"
             exit 0 ;;
         *) echo "Unknown argument: $1" >&2; exit 1 ;;
     esac
@@ -87,7 +124,7 @@ if [[ -z "$HOST" || -z "$DB" || -z "$USER_" || -z "$NODES_FILE" ]]; then
 fi
 
 BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/build"
-STAGING_DIR="$OUT_DIR/staging"
+STAGING_DIR="${STAGING_DIR_OVERRIDE:-$OUT_DIR/staging}"
 mkdir -p "$STAGING_DIR"
 [[ -z "$SMALL_STAGING_DIR" ]] && SMALL_STAGING_DIR="$STAGING_DIR"
 mkdir -p "$SMALL_STAGING_DIR"
@@ -111,24 +148,28 @@ else
     shopt -u nullglob
 fi
 
-echo "[build_regional_bundles] running regional_db_export --big-tables-only (5 big table pairs + extra_vertices.bin, single pass)..."
-if [[ -z "$REGION_BATCH_SIZE" ]]; then
-    "$BIN_DIR/regional_db_export" -s "$HOST" -d "$DB" -u "$USER_" --out-dir "$STAGING_DIR" --big-tables-only $VERBOSE "${REGION_ARGS[@]}"
+if [[ -n "$SKIP_BIG_TABLES" ]]; then
+    echo "[build_regional_bundles] --skip-big-tables given -- assuming $STAGING_DIR already has valid --big-tables-only output (ways/areas/roads/relations/nodes + tags + extra_vertices.bin) for every requested region, e.g. from an earlier run of this script that got interrupted after that phase"
 else
-    batch=()
-    for region in "${region_list[@]}"; do
-        batch+=("$region")
-        if [[ ${#batch[@]} -ge $REGION_BATCH_SIZE ]]; then
+    echo "[build_regional_bundles] running regional_db_export --big-tables-only (5 big table pairs + extra_vertices.bin, single pass)..."
+    if [[ -z "$REGION_BATCH_SIZE" ]]; then
+        "$BIN_DIR/regional_db_export" -s "$HOST" -d "$DB" -u "$USER_" --out-dir "$STAGING_DIR" --big-tables-only $VERBOSE "${REGION_ARGS[@]}"
+    else
+        batch=()
+        for region in "${region_list[@]}"; do
+            batch+=("$region")
+            if [[ ${#batch[@]} -ge $REGION_BATCH_SIZE ]]; then
+                batch_csv="$(IFS=,; echo "${batch[*]}")"
+                echo "[build_regional_bundles] regional_db_export --big-tables-only batch: $batch_csv"
+                "$BIN_DIR/regional_db_export" -s "$HOST" -d "$DB" -u "$USER_" --out-dir "$STAGING_DIR" --big-tables-only $VERBOSE --regions "$batch_csv"
+                batch=()
+            fi
+        done
+        if [[ ${#batch[@]} -gt 0 ]]; then
             batch_csv="$(IFS=,; echo "${batch[*]}")"
             echo "[build_regional_bundles] regional_db_export --big-tables-only batch: $batch_csv"
             "$BIN_DIR/regional_db_export" -s "$HOST" -d "$DB" -u "$USER_" --out-dir "$STAGING_DIR" --big-tables-only $VERBOSE --regions "$batch_csv"
-            batch=()
         fi
-    done
-    if [[ ${#batch[@]} -gt 0 ]]; then
-        batch_csv="$(IFS=,; echo "${batch[*]}")"
-        echo "[build_regional_bundles] regional_db_export --big-tables-only batch: $batch_csv"
-        "$BIN_DIR/regional_db_export" -s "$HOST" -d "$DB" -u "$USER_" --out-dir "$STAGING_DIR" --big-tables-only $VERBOSE --regions "$batch_csv"
     fi
 fi
 
@@ -136,8 +177,12 @@ fi
 # fold border-crossing way/area/road vertices into each region's node file.
 # One pass over nodes.dat still covers every requested region regardless of
 # how the --big-tables-only pass above was batched.
-echo "[build_regional_bundles] running regional_export (nodes.dat slices, one pass for all regions)..."
-"$BIN_DIR/regional_export" -f "$NODES_FILE" -n "$MAX_ID" --out-dir "$STAGING_DIR" --extra-vertices-dir "$STAGING_DIR" $VERBOSE "${REGION_ARGS[@]}"
+if [[ -n "$SKIP_NODE_EXPORT" ]]; then
+    echo "[build_regional_bundles] --skip-node-export given -- assuming $STAGING_DIR/<region>.nodes.dat already exists (or is already merged into <region>/ for a region-in-progress) for every requested region, e.g. from an earlier run of this script that got interrupted after this phase"
+else
+    echo "[build_regional_bundles] running regional_export (nodes.dat slices, one pass for all regions)..."
+    "$BIN_DIR/regional_export" -f "$NODES_FILE" -n "$MAX_ID" --out-dir "$STAGING_DIR" --extra-vertices-dir "$STAGING_DIR" $VERBOSE "${REGION_ARGS[@]}"
+fi
 
 echo "[build_regional_bundles] processing ${#region_list[@]} region(s) one at a time..."
 for region in "${region_list[@]}"; do

@@ -1,4 +1,5 @@
 #include "WMMLoader.h"
+#include "ConvenienceFunctions.h"
 #include <pqxx/pqxx>
 #include <iostream>
 #include <sstream>
@@ -465,29 +466,8 @@ bool WMMLoader::load(double year,
     // terrain/airports (native SRID 3857), wmm is always stored in 4326
     // (see ST_MakeEmptyRaster(...,4326) above) -- transform target is 4326
     // here, not 3857.
-    // Non-essential convenience function, not core import data -- must
-    // never be allowed to take down the whole import on a bug (see the
-    // identical guard in AirspaceLoader::createQueryFunctions(), added
-    // after exactly that happened to airspace_at_point() 7+ hours into a
-    // run, via an uncaught pqxx exception -> std::terminate()).
-    try {
-        pqxx::work txn(conn_);
-        txn.exec(
-            "CREATE OR REPLACE FUNCTION public.declination_at_point("
-            "  p_x double precision, p_y double precision, p_srid integer DEFAULT 4326"
-            ") RETURNS double precision "
-            "LANGUAGE sql STABLE PARALLEL SAFE AS $f$ "
-            "  SELECT ST_Value(w.rast, 1, pt.g) "
-            "  FROM public.wmm w, "
-            "       (SELECT ST_Transform(ST_SetSRID(ST_MakePoint(p_x, p_y), p_srid), 4326) AS g) pt "
-            "  WHERE w.rast && pt.g AND ST_Value(w.rast, 1, pt.g) IS NOT NULL "
-            "  LIMIT 1 "
-            "$f$");
-        txn.commit();
-    } catch (const std::exception& e) {
-        std::cerr << "[WMMLoader] declination_at_point() function creation failed (non-fatal): "
-                  << e.what() << "\n";
-    }
+    // Shared with regional_install.cpp -- see ConvenienceFunctions.h.
+    createDeclinationFunction(conn_);
 
     if (band_deg > 0)
         buildBands(band_deg, dest_srid, simplify_m, threads, verbose);

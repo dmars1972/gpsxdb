@@ -261,25 +261,58 @@ int main(int argc, char** argv) {
     std::atomic<uint64_t> extra_added{0};
     auto start = std::chrono::steady_clock::now();
 
-    // Per-thread temp raw-record files, one per (thread, region).
-    std::vector<std::vector<std::string>> thread_region_paths(
-        threads, std::vector<std::string>(regions.size()));
-    for (int ti = 0; ti < threads; ++ti)
-        for (size_t ri = 0; ri < regions.size(); ++ri)
-            thread_region_paths[ti][ri] =
-                out_dir + "/tmp_" + regions[ri].name + "_" + std::to_string(ti) + ".raw";
-
+    // max_id (and so merged_bm_size_) reflects configured headroom for
+    // future growth, not real content -- chunking the full bitmap range
+    // evenly across --threads starves threads assigned to the unpopulated
+    // tail (e.g. only ~40% of a 35B max_id was actually populated as of
+    // 2026-08-11, leaving 7 of 12 threads with an empty range that
+    // finishes instantly while the other 5 do all the real work). Bound
+    // the chunked range to the real highest populated id instead.
     size_t total_bytes = osmmap.merged_bm_size_;
-    size_t chunk = (total_bytes + threads - 1) / static_cast<size_t>(threads);
+    int64_t highest_id = osmmap.highestPopulatedId();
+    size_t real_data_bytes = highest_id < 0
+        ? total_bytes
+        : std::min(total_bytes, static_cast<size_t>(highest_id / 8) + 1);
+    if (verbose && real_data_bytes < total_bytes)
+        std::cout << "[regional_export] highest populated id=" << highest_id
+                  << " -- scanning " << real_data_bytes << " of " << total_bytes
+                  << " bitmap bytes (rest is unpopulated headroom)\n";
 
-    auto worker = [&](int ti) {
-        size_t byte_start = static_cast<size_t>(ti) * chunk;
-        size_t byte_end = std::min(byte_start + chunk, total_bytes);
+    // Even within the real populated range, node density is uneven (e.g.
+    // dense urban OSM coverage vs. sparse ocean/desert stretches) -- static
+    // equal-width chunks left as few as 3 of 12 threads still active 6.5h
+    // into a live scan while the rest sat idle, confirmed 2026-08-12. Same
+    // fix as regional_db_export.cpp's processPair(): split into many more,
+    // smaller chunks than threads and hand them out from a shared atomic
+    // counter, so a thread that finishes a sparse chunk immediately picks
+    // up the next unclaimed one instead of sitting idle. Chunks are
+    // processed out of arrival order but merged back in ascending index
+    // order below, which is still ascending id order (chunk byte ranges
+    // are disjoint and increasing) -- RegionalNodeMap::Writer requires ids
+    // appended in ascending order.
+    constexpr int kChunksPerThread = 8;
+    int64_t nchunks64 = std::min(static_cast<int64_t>(threads) * kChunksPerThread,
+                                  static_cast<int64_t>(real_data_bytes));
+    int nchunks = static_cast<int>(std::max<int64_t>(1, nchunks64));
+    size_t chunk = (real_data_bytes + static_cast<size_t>(nchunks) - 1) / static_cast<size_t>(nchunks);
+    if (verbose) std::cout << "[regional_export] " << nchunks << " chunk(s) across " << threads << " thread(s)\n";
+
+    // Per-chunk temp raw-record files, one per (chunk, region).
+    std::vector<std::vector<std::string>> chunk_region_paths(
+        static_cast<size_t>(nchunks), std::vector<std::string>(regions.size()));
+    for (int ci = 0; ci < nchunks; ++ci)
+        for (size_t ri = 0; ri < regions.size(); ++ri)
+            chunk_region_paths[static_cast<size_t>(ci)][ri] =
+                out_dir + "/tmp_" + regions[ri].name + "_" + std::to_string(ci) + ".raw";
+
+    auto chunkWorker = [&](int ci) {
+        size_t byte_start = static_cast<size_t>(ci) * chunk;
+        size_t byte_end = std::min(byte_start + chunk, real_data_bytes);
         if (byte_start >= byte_end) return;
 
         std::vector<FILE*> out(regions.size());
         for (size_t ri = 0; ri < regions.size(); ++ri)
-            out[ri] = fopen(thread_region_paths[ti][ri].c_str(), "wb");
+            out[ri] = fopen(chunk_region_paths[static_cast<size_t>(ci)][ri].c_str(), "wb");
 
         std::vector<std::pair<RegionIndex::Box, size_t>> candidates;  // reused scratch
         uint64_t local_scanned = 0;
@@ -333,21 +366,30 @@ int main(int argc, char** argv) {
         for (auto* f : out) if (f) fclose(f);
     };
 
+    std::atomic<int> next_chunk{0};
     std::vector<std::thread> pool;
-    pool.reserve(threads);
-    for (int ti = 0; ti < threads; ++ti) pool.emplace_back(worker, ti);
+    pool.reserve(static_cast<size_t>(threads));
+    for (int t = 0; t < threads; ++t)
+        pool.emplace_back([&]() {
+            for (;;) {
+                int ci = next_chunk.fetch_add(1, std::memory_order_relaxed);
+                if (ci >= nchunks) break;
+                chunkWorker(ci);
+            }
+        });
     for (auto& t : pool) t.join();
 
-    // Merge: for each region, stream all N threads' temp files (in thread
-    // order, which is also ascending id order since thread byte ranges are
-    // disjoint and increasing) into the final RegionalNodeMap file.
+    // Merge: for each region, stream all chunks' temp files in ascending
+    // chunk-index order (which is also ascending id order -- chunk byte
+    // ranges are disjoint and increasing regardless of the order they were
+    // actually processed in) into the final RegionalNodeMap file.
     for (size_t ri = 0; ri < regions.size(); ++ri) {
         const auto& g = regions[ri];
         std::string path = out_dir + "/" + g.name + ".nodes.dat";
         RegionalNodeMap::Writer writer(path, g.name, wgs84_bboxes[ri]);
         uint64_t matched = 0;
-        for (int ti = 0; ti < threads; ++ti) {
-            const std::string& tmp_path = thread_region_paths[ti][ri];
+        for (int ci = 0; ci < nchunks; ++ci) {
+            const std::string& tmp_path = chunk_region_paths[static_cast<size_t>(ci)][ri];
             FILE* f = fopen(tmp_path.c_str(), "rb");
             if (f) {
                 RawRecord rec;

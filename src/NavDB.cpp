@@ -618,19 +618,28 @@ static void diffTags(pqxx::work& txn, int64_t id,
         // any leftover row from before this filter existed gets swept up by
         // the DELETE loop below — replication updates progressively clean
         // up excluded tags on any entity they happen to touch.
+        //
+        // This filter set must stay identical to hasSurvivingTag()'s, since
+        // the callers below decide whether to keep or delete the parent row
+        // based on hasSurvivingTag() but call diffTags() unconditionally --
+        // any tag hasSurvivingTag() would drop must be dropped here too, or
+        // a deleted parent leaves an orphaned tag row behind.
         if (isExcludedTagKey(k)) continue;
+        if (k == "building" && !isAviationRelevantBuildingValue(v)) continue;
         if (is_node && isSignOrBarrierValue(k, v)) continue;
         if (is_node && isDroppableNatureValue(k, v) && !has_elevation) continue;
-        auto it = existing.find(k);
+        std::string ck = sanitizeTag(k), cv = sanitizeTag(v);
+        if (ck.empty() || cv.empty()) continue;
+        auto it = existing.find(ck);
         if (it == existing.end())
         {
             std::string ins_q = "INSERT INTO " + tag_table + "(id,key_name,key_value) VALUES($1,$2,$3)";
-            txn.exec(ins_q, pqxx::params{id, k, v});
-        } else if (it->second != v) {
+            txn.exec(ins_q, pqxx::params{id, ck, cv});
+        } else if (it->second != cv) {
             std::string upd_q = "UPDATE " + tag_table + " SET key_value=$3 WHERE id=$1 AND key_name=$2";
-            txn.exec(upd_q, pqxx::params{id, k, v});
+            txn.exec(upd_q, pqxx::params{id, ck, cv});
         }
-        existing.erase(k);
+        existing.erase(ck);
     }
     std::string del_q = "DELETE FROM " + tag_table + " WHERE id=$1 AND key_name=$2";
     for (auto& [k, _] : existing)

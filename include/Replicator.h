@@ -70,3 +70,19 @@ private:
     // the FAA ArcGIS export API doesn't reliably expose one either.
     void checkAirspaceRefresh();
 };
+
+// Seeds fresh external_data_state checkpoints right after -I's own phase
+// loaders (AirportsLoader/FAAObstacleLoader/WMMLoader/AirspaceLoader) have
+// freshly loaded their data. Without these, external_data_state has no
+// record of any of them at all -- only checkExternalData()/
+// checkWMMRefresh()/checkAirspaceRefresh() themselves ever write these
+// keys -- so poll's first startup after any -I treats "no record" as
+// "definitely stale" and redundantly reloads all four sources before it
+// ever reaches real OSM replication catch-up. Safe to call even after a
+// partial load failure: worst case is one extra redundant reload on the
+// next poll startup, not a correctness issue. Free functions rather than
+// Replicator methods since they don't need an IDeltaApplier/poll context,
+// just a DB handle -- callable directly from osm_import's -I path.
+void seedExternalDataTimestamp(NavDB& db, const std::string& source_name); // "airports" or "faa_obstacles"
+void seedWMMTimestamp(NavDB& db);
+void seedAirspaceTimestamp(NavDB& db);

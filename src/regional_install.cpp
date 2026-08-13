@@ -33,6 +33,7 @@
 // wrapped in one transaction so a region's install is all-or-nothing.
 #include "NavDB.h"
 #include "RegionalNodeMap.h"
+#include "ConvenienceFunctions.h"
 #include <pqxx/pqxx>
 #include <iostream>
 #include <fstream>
@@ -520,6 +521,26 @@ int main(int argc, char** argv) {
         db_client.createGistIndexes();
     }
     std::cout << "[regional_install] GiST indexes rebuilt\n";
+
+    // ---- 4b. Query convenience functions (nearest_airport, obstacles_nearby,
+    // declination_at_point, elevation_at_point_ft/elevation_along_bearing_ft,
+    // airspace_at_point/military_routes_nearby) ----
+    // The master DB gets these from AirportsLoader/FAAObstacleLoader/
+    // WMMLoader/TerrainLoader/AirspaceLoader after each of them freshly
+    // loads its own data; regional_install has no such loader object (the
+    // data arrives pre-populated from the bundle instead), so it must
+    // create them itself or a region-only database ends up with all the
+    // underlying data but none of the query conveniences on top of it.
+    // Each is independently non-fatal on error -- see ConvenienceFunctions.h.
+    {
+        pqxx::connection conn("host=" + host + " dbname=" + db + " user=" + user);
+        createNearestAirportFunction(conn);
+        createObstaclesNearbyFunction(conn);
+        createDeclinationFunction(conn);
+        createAirspaceQueryFunctions(conn);
+        if (tableExists(conn, "terrain")) createElevationFunctions(conn);
+    }
+    std::cout << "[regional_install] query convenience functions created\n";
 
     // ---- 5. Merge/install the region's node coordinates ----
     std::string region_nodes_path = region_dir + "/" + region_name + ".nodes.dat";

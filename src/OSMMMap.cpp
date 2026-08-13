@@ -16,6 +16,14 @@ static constexpr size_t REC_SIZE    = 16;       // id not stored — offset IS t
 static constexpr size_t CHUNK_SIZE  = 1 << 22;  // 4 MB input chunks for LZ4 (reduced from 16MB
                                                  // to bound dirty-page buildup during node phase)
 
+// Reject grows past this id outright. OSM node ids are monotonically
+// assigned and, as of 2026, are roughly an order of magnitude below this —
+// a request past it almost certainly indicates a corrupt/malformed OSC
+// changeset, not a legitimate new id. An unattended poll process should
+// log and drop the record rather than ftruncate to an implausible size.
+// Revisit upward periodically as real OSM node ids approach it.
+static constexpr int64_t kMaxSaneNodeId = 100'000'000'000LL; // 100B
+
 // ---- bitmap helpers ----
 
 static inline void bitmapSet(void* bm, size_t bm_size, int64_t id) {
@@ -60,7 +68,16 @@ static void* openAndMap(const std::string& path, size_t sz, int& fd_out,
 // content (the file is extended with a sparse hole). No-op if the file is
 // already >= sz. Used when resuming with a larger -n than the original run —
 // the merged file and its bitmap must be large enough for the new max_id.
-static void growFileIfNeeded(const std::string& path, size_t sz) {
+//
+// Returns the file's actual size after this call: either the pre-existing
+// on-disk size (if already >= sz — e.g. previously live-grown by
+// growMergedIfNeeded() during an earlier process's poll run) or the newly
+// grown size (if sz was larger). Callers must map this returned size, not
+// their own `sz` argument — that's what makes a live grow durable across
+// process restarts even with a stale/smaller -n: without this, a restarted
+// process would mmap only the smaller `sz` it was told about, leaving an
+// already-grown tail of the file physically present but unreachable.
+static size_t growFileIfNeeded(const std::string& path, size_t sz) {
     int fd = open(path.c_str(), O_RDWR);
     if (fd < 0)
         throw std::runtime_error("OSMMMap: cannot open " + path + " for growth check");
@@ -69,16 +86,18 @@ static void growFileIfNeeded(const std::string& path, size_t sz) {
         close(fd);
         throw std::runtime_error("OSMMMap: fstat failed for " + path);
     }
-    if (static_cast<size_t>(st.st_size) < sz) {
-        if (ftruncate(fd, static_cast<off_t>(sz)) != 0) {
+    size_t final_sz = std::max(sz, static_cast<size_t>(st.st_size));
+    if (static_cast<size_t>(st.st_size) < final_sz) {
+        if (ftruncate(fd, static_cast<off_t>(final_sz)) != 0) {
             close(fd);
             throw std::runtime_error(std::string("OSMMMap: ftruncate failed for ")
                                      + path + ": " + std::strerror(errno));
         }
         std::cerr << "[OSMMMap] grew " << path << " from "
-                  << st.st_size << " to " << sz << " bytes\n";
+                  << st.st_size << " to " << final_sz << " bytes\n";
     }
     close(fd);
+    return final_sz;
 }
 
 static void createBlank(const std::string& path, size_t sz) {
@@ -165,10 +184,14 @@ OSMMMap::OSMMMap(const std::string& base_path, int64_t max_id,
 
     // On resume, -n may be larger than the value used to create the file
     // originally. Grow the merged file and bitmap to fit, preserving
-    // existing data (the extension is a sparse hole).
+    // existing data (the extension is a sparse hole). growFileIfNeeded()
+    // returns the file's true resulting size (which may exceed data_sz/
+    // bm_sz if a previous poll run already live-grew it past this
+    // process's -n via growMergedIfNeeded() — see that function) so a
+    // restart never forgets capacity a prior run already earned.
     if (!open_shards_for_write) {
-        growFileIfNeeded(base_path, data_sz);
-        growFileIfNeeded(base_path + ".bmp", bm_sz);
+        data_sz = growFileIfNeeded(base_path, data_sz);
+        bm_sz   = growFileIfNeeded(base_path + ".bmp", bm_sz);
     }
 
     merged_map_    = openAndMap(base_path, data_sz, merged_fd_, -1);
@@ -479,10 +502,85 @@ void OSMMMap::forEachPopulatedRange(size_t byte_start, size_t byte_end,
     }
 }
 
+int64_t OSMMMap::highestPopulatedId() const {
+    const uint8_t* bm = static_cast<const uint8_t*>(merged_bm_map_);
+    for (size_t byte = merged_bm_size_; byte-- > 0; ) {
+        uint8_t b = bm[byte];
+        if (b == 0) continue;
+        for (int bit = 7; bit >= 0; --bit) {
+            if ((b >> bit) & 1u)
+                return static_cast<int64_t>(byte) * 8 + bit;
+        }
+    }
+    return -1;
+}
+
 void OSMMMap::flush() {
     for (auto& s : shards_)
         if (s.bm_map) msync(s.bm_map, s.bm_size, MS_ASYNC);
     if (merged_map_) msync(merged_map_, merged_size_, MS_ASYNC);
+}
+
+// Grow the merged .dat/.bmp in place if `id` is beyond current capacity.
+// Single-threaded delta/poll use only -- see OSMMMap.h's class comment
+// ("select() and merge() require no locking") and update()'s caller
+// (Replicator::poll()/DeltaApplier are single-threaded). Unsafe to call
+// with any concurrent reader of merged_map_/merged_bm_map_: a select() mid-
+// flight during a grow would dereference a pointer that just got munmap'd.
+void OSMMMap::growMergedIfNeeded(int64_t id) {
+    if (id > kMaxSaneNodeId) {
+        std::cerr << "[OSMMMap] refusing to grow nodes.dat for implausible node id "
+                  << id << " (exceeds sanity ceiling of " << kMaxSaneNodeId
+                  << ") -- dropping this record\n";
+        return;
+    }
+
+    size_t needed_data = (static_cast<size_t>(id) + 1) * REC_SIZE;
+    if (needed_data <= merged_size_) return;  // fast path -- true for the
+                                               // overwhelming majority of calls
+
+    // Grow by >=25% (matches growBitmap()'s convention above) or to the
+    // needed size, whichever is larger, with a small floor for near-empty
+    // stores. The file is sparse (ftruncate, not real disk usage for the
+    // unpopulated hole), so being generous here is cheap and keeps this
+    // path from triggering more than a handful of times over the file's
+    // lifetime at realistic (20-35B id) scale.
+    size_t new_data_sz = std::max({needed_data,
+                                    merged_size_ + merged_size_ / 4,
+                                    merged_size_ + static_cast<size_t>(1'000'000) * REC_SIZE});
+    size_t new_bm_sz = (new_data_sz / REC_SIZE + 7) / 8;
+    size_t old_data_sz = merged_size_;
+
+    // Grow .dat before .bmp: if the process crashes between the two
+    // ftruncates, the bitmap can never claim a bit for an id the .dat mmap
+    // doesn't cover yet. The constructor's growFileIfNeeded() picks up
+    // whatever's actually on disk (via fstat) on the next restart either
+    // way, so no cross-file atomicity beyond this ordering is needed.
+    msync(merged_map_, merged_size_, MS_SYNC);
+    munmap(merged_map_, merged_size_);
+    merged_map_ = nullptr;
+    if (ftruncate(merged_fd_, static_cast<off_t>(new_data_sz)) != 0)
+        throw std::runtime_error(std::string("OSMMMap: merged file ftruncate failed: ") + std::strerror(errno));
+    merged_map_ = mmap(nullptr, new_data_sz, PROT_READ | PROT_WRITE, MAP_SHARED, merged_fd_, 0);
+    if (merged_map_ == MAP_FAILED)
+        throw std::runtime_error("OSMMMap: merged file mmap failed after grow");
+    merged_size_ = new_data_sz;
+
+    msync(merged_bm_map_, merged_bm_size_, MS_SYNC);
+    munmap(merged_bm_map_, merged_bm_size_);
+    merged_bm_map_ = nullptr;
+    if (ftruncate(merged_bm_fd_, static_cast<off_t>(new_bm_sz)) != 0)
+        throw std::runtime_error(std::string("OSMMMap: merged bitmap ftruncate failed: ") + std::strerror(errno));
+    merged_bm_map_ = mmap(nullptr, new_bm_sz, PROT_READ | PROT_WRITE, MAP_SHARED, merged_bm_fd_, 0);
+    if (merged_bm_map_ == MAP_FAILED)
+        throw std::runtime_error("OSMMMap: merged bitmap mmap failed after grow");
+    merged_bm_size_ = new_bm_sz;
+
+    max_id_ = std::max(max_id_, id);
+
+    std::cerr << "[OSMMMap] auto-grew nodes.dat/nodes.dat.bmp to accommodate node id "
+              << id << " (capacity now " << (new_data_sz / REC_SIZE) << " ids, "
+              << new_data_sz << " bytes; was " << old_data_sz << " bytes)\n";
 }
 
 // Direct write to the merged flat file — used by delta mode where shards
@@ -490,8 +588,11 @@ void OSMMMap::flush() {
 // and writes the coordinate directly into the merged mmap.
 void OSMMMap::update(int64_t id, double lon_m, double lat_m) {
     if (id < 0) return;
+    growMergedIfNeeded(id);
     size_t offset = static_cast<size_t>(id) * REC_SIZE;
-    if (offset + REC_SIZE > merged_size_) return;
+    if (offset + REC_SIZE > merged_size_) return;  // normally unreachable now;
+                                                     // the actual drop mechanism
+                                                     // for the sanity-ceiling case
     double* dst = reinterpret_cast<double*>(
         static_cast<uint8_t*>(merged_map_) + offset);
     dst[0] = lon_m;

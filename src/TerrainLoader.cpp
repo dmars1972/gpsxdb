@@ -1,5 +1,6 @@
 #include "TerrainLoader.h"
 #include "Regions.h"
+#include "ConvenienceFunctions.h"
 #include <pqxx/pqxx>
 #include <iostream>
 #include <fstream>
@@ -168,74 +169,16 @@ bool TerrainLoader::load(double min_lon, double min_lat, double max_lon, double 
     // classified elevation-band polygons (terrain_bands and its band-rebuild
     // machinery were removed — point/corridor lookups are the only need).
     // CREATE OR REPLACE so these stay current on every terrain_load run.
-    // Feet is the unit convention throughout this codebase (kFeetPerMeter),
-    // so results are converted from the raster's native meters.
     //
-    // Deferred to a lambda instead of running unconditionally up front:
-    // these are LANGUAGE sql functions, and Postgres parses/analyzes a SQL
-    // function's body — including resolving public.terrain — at CREATE
-    // FUNCTION time (unlike plpgsql, which defers). On a fresh -I reload
-    // the terrain table doesn't exist yet at this point in load(), so
-    // creating these before the table exists throws pqxx::undefined_table
-    // and takes down the whole process. Only call this once table_exists
-    // is actually true.
-    auto createElevationFunctions = [&]() {
-        pqxx::work txn(conn_);
-        // p_srid defaults to 4326 (lon/lat) but accepts 3857 (Web Mercator,
-        // the raster's native SRID) directly too — ST_Transform is a no-op
-        // when source and target SRID already match, so passing 3857 costs
-        // nothing extra. DROP first: adding a parameter changes the
-        // signature, so CREATE OR REPLACE alone would leave the old 2-arg
-        // overload in place instead of replacing it.
-        txn.exec("DROP FUNCTION IF EXISTS public.elevation_at_point_ft(double precision, double precision)");
-        txn.exec(
-            "CREATE OR REPLACE FUNCTION public.elevation_at_point_ft("
-            "  p_x double precision, p_y double precision, p_srid integer DEFAULT 4326"
-            ") RETURNS double precision "
-            "LANGUAGE sql STABLE PARALLEL SAFE AS $f$ "
-            "  SELECT ST_Value(t.rast, 1, pt.g) * 3.28084 "
-            "  FROM public.terrain t, "
-            "       (SELECT ST_Transform(ST_SetSRID(ST_MakePoint(p_x, p_y), p_srid), 3857) AS g) pt "
-            "  WHERE t.rast && pt.g AND ST_Value(t.rast, 1, pt.g) IS NOT NULL "
-            "  LIMIT 1 "
-            "$f$");
-        // Samples elevation every p_interval_m meters along a geodesic
-        // bearing out to p_distance_km, for terrain-ahead lookahead
-        // profiles. ST_Project does the geodesic (spheroid) point
-        // projection so bearing/distance stay accurate at any latitude —
-        // it requires geography (always lon/lat internally), so a
-        // non-4326 origin is transformed to 4326 once up front.
-        txn.exec(
-            "DROP FUNCTION IF EXISTS public.elevation_along_bearing_ft("
-            "double precision, double precision, double precision, double precision, double precision)");
-        txn.exec(
-            "CREATE OR REPLACE FUNCTION public.elevation_along_bearing_ft("
-            "  p_x double precision, p_y double precision, "
-            "  p_bearing_deg double precision, p_distance_km double precision, "
-            "  p_interval_m double precision DEFAULT 500, "
-            "  p_srid integer DEFAULT 4326"
-            ") RETURNS TABLE(distance_m double precision, lon double precision, "
-            "                lat double precision, elevation_ft double precision) "
-            "LANGUAGE sql STABLE PARALLEL SAFE AS $f$ "
-            "  WITH origin AS ("
-            "    SELECT ST_Transform(ST_SetSRID(ST_MakePoint(p_x, p_y), p_srid), 4326)::geography AS g"
-            "  ), pts AS ("
-            "    SELECT gs::double precision AS distance_m, "
-            "           ST_Project(origin.g, gs, radians(p_bearing_deg)) AS geog "
-            "    FROM origin, generate_series(0::bigint, (p_distance_km * 1000)::bigint, "
-            "                         greatest(p_interval_m, 1)::bigint) AS gs"
-            "  ) "
-            "  SELECT pts.distance_m, "
-            "         ST_X(pts.geog::geometry) AS lon, "
-            "         ST_Y(pts.geog::geometry) AS lat, "
-            "         public.elevation_at_point_ft(ST_X(pts.geog::geometry), ST_Y(pts.geog::geometry)) AS elevation_ft "
-            "  FROM pts "
-            "  ORDER BY pts.distance_m "
-            "$f$");
-        txn.commit();
-    };
-
-    if (table_exists) createElevationFunctions();
+    // Deferred instead of running unconditionally up front: these are
+    // LANGUAGE sql functions, and Postgres parses/analyzes a SQL function's
+    // body — including resolving public.terrain — at CREATE FUNCTION time
+    // (unlike plpgsql, which defers). On a fresh -I reload the terrain
+    // table doesn't exist yet at this point in load(), so creating these
+    // before the table exists throws pqxx::undefined_table and takes down
+    // the whole process. Only call this once table_exists is actually true.
+    // Shared with regional_install.cpp -- see ConvenienceFunctions.h.
+    if (table_exists) createElevationFunctions(conn_);
 
     std::vector<Tile> to_load;
     for (auto& t : tiles) {
@@ -249,7 +192,7 @@ bool TerrainLoader::load(double min_lon, double min_lat, double max_lon, double 
 
     if (to_load.empty()) {
         if (verbose) std::cout << "All requested tiles already loaded.\n";
-        if (table_exists) createElevationFunctions();
+        if (table_exists) createElevationFunctions(conn_);
         return true;
     }
 
@@ -283,18 +226,21 @@ bool TerrainLoader::load(double min_lon, double min_lat, double max_lon, double 
     constexpr size_t kBatchSize = 25;
     size_t n_batches = (to_load.size() + kBatchSize - 1) / kBatchSize;
     std::atomic<long long> total_loaded{0};
-    std::atomic<long long> total_failed_batches{0};
+    std::atomic<long long> total_retried_batches{0};
     std::mutex io_mu;      // guards stdout/stderr so per-tile/batch lines don't interleave
-    std::mutex raster_mu;  // serializes raster2pgsql/psql invocation — see below
+    std::mutex raster_mu;  // serializes raster2pgsql invocation only — see below
 
-    // Downloads+loads a single batch. use_append selects -a (append to an
-    // existing terrain table) vs -I -M (create it) — the caller is
-    // responsible for only passing false when the table doesn't exist yet.
-    // db is the caller's own connection (each parallel worker owns one, so
-    // this can run concurrently across batches with no shared DB state
-    // besides the terrain/terrain_tiles tables themselves, which tolerate
-    // concurrent appends fine).
-    auto runBatch = [&](size_t batch_idx, pqxx::connection& db, bool use_append) -> bool {
+    enum class BatchResult { Success, NoTiles, Failed };
+
+    // Downloads+loads a single batch, exactly once (no retry -- see
+    // runBatch below, which wraps this with the retry-then-abort policy).
+    // use_append selects -a (append to an existing terrain table) vs -I -M
+    // (create it) — the caller is responsible for only passing false when
+    // the table doesn't exist yet. db is the caller's own connection (each
+    // parallel worker owns one, so this can run concurrently across
+    // batches with no shared DB state besides the terrain/terrain_tiles
+    // tables themselves, which tolerate concurrent appends fine).
+    auto runBatchOnce = [&](size_t batch_idx, pqxx::connection& db, bool use_append) -> BatchResult {
         size_t start = batch_idx * kBatchSize;
         size_t end = std::min(start + kBatchSize, to_load.size());
 
@@ -320,7 +266,7 @@ bool TerrainLoader::load(double min_lon, double min_lat, double max_lon, double 
             downloaded_tiles.push_back(t);
         }
 
-        if (downloaded_paths.empty()) return false;  // whole batch unavailable, not an error
+        if (downloaded_paths.empty()) return BatchResult::NoTiles;  // whole batch unavailable, not an error
 
         // raster2pgsql generates SQL to a file, then psql loads that file, as
         // two separate steps with independently-checked exit codes — piping
@@ -363,13 +309,18 @@ bool TerrainLoader::load(double min_lon, double min_lat, double max_lon, double 
                       << ": loading " << downloaded_paths.size() << " tile(s)...\n";
         }
 
-        // Serialize the actual raster2pgsql/psql invocation (downloads above
-        // stay concurrent — only this part is locked). Running many
+        // Serialize only the raster2pgsql invocation (downloads above stay
+        // concurrent, and so does the psql load below). Running many
         // raster2pgsql instances at once was observed to intermittently
         // produce corrupted/truncated SQL output (parse errors like
         // "unterminated quoted string" on otherwise-valid tiles) — a race
         // in raster2pgsql/GDAL under concurrent invocation, not something
-        // this loader can fix, so avoid triggering it instead.
+        // this loader can fix, so avoid triggering it instead. psql loading
+        // the already-generated SQL file has no GDAL involvement at all —
+        // it's pure I/O against Postgres, which handles concurrent COPY/
+        // INSERT sessions fine, so it doesn't need to share that lock and
+        // was only ever serialized as a side effect of both steps sharing
+        // one system() sequence.
         //
         // No password handling here (or anywhere in this codebase) —
         // auth relies on ~/.pgpass, which psql honors automatically for
@@ -378,12 +329,12 @@ bool TerrainLoader::load(double min_lon, double min_lat, double max_lon, double 
         {
             std::lock_guard lk(raster_mu);
             gen_rc = system(gen_cmd.str().c_str());
-            if (gen_rc == 0) {
-                std::ostringstream load_cmd;
-                load_cmd << "psql -h " << host_ << " -U " << user_ << " -d " << database_
-                          << " -q -v ON_ERROR_STOP=1 -f " << sql_file << " 2>>" << batch_log;
-                load_rc = system(load_cmd.str().c_str());
-            }
+        }
+        if (gen_rc == 0) {
+            std::ostringstream load_cmd;
+            load_cmd << "psql -h " << host_ << " -U " << user_ << " -d " << database_
+                      << " -q -v ON_ERROR_STOP=1 -f " << sql_file << " 2>>" << batch_log;
+            load_rc = system(load_cmd.str().c_str());
         }
 
         for (auto& p : downloaded_paths) std::remove(p.c_str());
@@ -395,13 +346,12 @@ bool TerrainLoader::load(double min_lon, double min_lat, double max_lon, double 
                       << " load failed (raster2pgsql rc=" << gen_rc
                       << ", psql rc=" << load_rc << ") for tiles:";
             for (auto& t : downloaded_tiles) std::cerr << " " << t.name;
-            std::cerr << " — not marked as loaded, will retry on next run\n";
+            std::cerr << "\n";
             std::ifstream log_in(batch_log);
             std::string line;
             while (std::getline(log_in, line)) std::cerr << "    " << line << "\n";
-            total_failed_batches.fetch_add(1, std::memory_order_relaxed);
             std::remove(batch_log.c_str());
-            return false;  // leave these tiles unmarked so a future run retries them
+            return BatchResult::Failed;
         }
         std::remove(batch_log.c_str());
 
@@ -415,7 +365,40 @@ bool TerrainLoader::load(double min_lon, double min_lat, double max_lon, double 
         long long done = total_loaded.fetch_add(static_cast<long long>(downloaded_tiles.size()),
                                std::memory_order_relaxed) + static_cast<long long>(downloaded_tiles.size());
         progress_cb_(done, static_cast<int64_t>(to_load.size()));
-        return true;
+        return BatchResult::Success;
+    };
+
+    // Wraps runBatchOnce with a retry-then-abort policy: a batch that
+    // fails (raster2pgsql/psql error, not "no tiles available") gets one
+    // immediate retry; if the retry also fails, that's treated as a hard
+    // failure for the whole import rather than a tile silently left
+    // unloaded for a human to notice and rerun later. _exit(1) here is
+    // safe even though runBatch executes inside worker threads (below) --
+    // it's the same "we're aborting, nothing needs C++ cleanup, the OS
+    // reclaims everything" reasoning already used for other fatal
+    // conditions in main.cpp (e.g. planet download failure).
+    auto runBatch = [&](size_t batch_idx, pqxx::connection& db, bool use_append) -> bool {
+        BatchResult r = runBatchOnce(batch_idx, db, use_append);
+        if (r == BatchResult::Success) return true;
+        if (r == BatchResult::NoTiles) return false;  // legitimate no-op, not an error
+
+        {
+            std::lock_guard lk(io_mu);
+            std::cerr << "[Terrain] batch " << (batch_idx + 1) << "/" << n_batches
+                      << " failed, retrying once...\n";
+        }
+        total_retried_batches.fetch_add(1, std::memory_order_relaxed);
+        r = runBatchOnce(batch_idx, db, use_append);
+        if (r == BatchResult::Success) return true;
+        if (r == BatchResult::NoTiles) return false;
+
+        std::lock_guard lk(io_mu);
+        std::cerr << "[Terrain] batch " << (batch_idx + 1) << "/" << n_batches
+                  << " failed again after retry -- aborting the import "
+                     "(fix the underlying issue, then re-run with -R terrain "
+                     "to resume; already-loaded tiles are unaffected)\n";
+        std::cerr.flush();
+        _exit(1);
     };
 
     // Bootstrap: if `terrain` doesn't exist yet, the batch that creates it
@@ -476,12 +459,15 @@ bool TerrainLoader::load(double min_lon, double min_lat, double max_lon, double 
     // total_loaded > 0 guarantees at least one batch's raster2pgsql call
     // succeeded, which means public.terrain now exists (either it already
     // did, or the bootstrap batch's -I -M just created it).
-    createElevationFunctions();
+    createElevationFunctions(conn_);
 
     if (verbose) {
         std::cout << "Terrain data loaded (" << total_loaded.load() << " new tile(s)";
-        if (total_failed_batches.load() > 0)
-            std::cout << ", " << total_failed_batches.load() << " batch(es) failed and will retry next run";
+        // Any batch that failed and stayed failed after its retry already
+        // aborted the whole process (see runBatch) -- reaching here means
+        // every batch either succeeded outright or recovered on retry.
+        if (total_retried_batches.load() > 0)
+            std::cout << ", " << total_retried_batches.load() << " batch(es) needed a retry";
         std::cout << ").\n";
     }
 
