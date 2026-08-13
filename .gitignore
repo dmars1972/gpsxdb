@@ -40,5 +40,9 @@ tools/data_raw/
 *.zip
 *.csv
 *.sh
+# setup_regional_server.sh is a real, reusable deliverable (end-user
+# regional DB host setup) -- unlike the personal run/operational scripts
+# the blanket *.sh rule above is meant to exclude.
+!setup_regional_server.sh
 *.py
 *.sql
