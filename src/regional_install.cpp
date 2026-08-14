@@ -436,8 +436,20 @@ int main(int argc, char** argv) {
         _exit(1);
     }
 
-    if (verbose) std::cout << "[regional_install] extracting " << bundle_path << " to " << tmp_dir << "\n";
-    if (runProcess({"tar", "xzf", bundle_path, "-C", tmp_dir}).exit_code != 0) {
+    // pigz decompresses gzip streams using multiple threads (I/O and CRC
+    // checking overlapped with decode -- DEFLATE decoding itself is
+    // inherently sequential, so the speedup is more like 2-4x rather than
+    // near-linear with core count, but still meaningful for a multi-GB
+    // bundle). Falls back to plain tar/gzip if pigz isn't installed, since
+    // this runs on end-user machines that may not have it.
+    bool have_pigz = runProcess({"pigz", "--version"}).exit_code == 0;
+    std::vector<std::string> tar_argv = have_pigz
+        ? std::vector<std::string>{"tar", "--use-compress-program=pigz", "-xf", bundle_path, "-C", tmp_dir}
+        : std::vector<std::string>{"tar", "xzf", bundle_path, "-C", tmp_dir};
+
+    if (verbose) std::cout << "[regional_install] extracting " << bundle_path << " to " << tmp_dir
+                            << (have_pigz ? " (via pigz)\n" : " (pigz not found, using plain gzip)\n");
+    if (runProcess(tar_argv).exit_code != 0) {
         std::cerr << "Error: failed to extract " << bundle_path << "\n";
         _exit(1);
     }

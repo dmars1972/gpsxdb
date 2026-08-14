@@ -32,6 +32,13 @@ DB_NAME="${DB_NAME:-}"
 DB_ROLE="${DB_ROLE:-gpsxdb_svc}"
 DB_HOST="${DB_HOST:-localhost}"
 DB_PASSWORD="${DB_PASSWORD:-}"
+# Fixed, predictable path -- both the poll systemd unit (below) and the
+# `regional_install --nodes-file` invocation printed in the final
+# instructions point at this same path, so there's no manual edit step
+# to keep in sync by hand. RegionalNodeMap::merge() already supports
+# installing more than one region into the same target file, so a single
+# fixed path also covers multi-region installs on one host.
+NODES_FILE="${NODES_FILE:-$INSTALL_DIR/region.nodes.dat}"
 
 log() { echo "[setup_regional_server] $*"; }
 
@@ -67,7 +74,8 @@ install_packages() {
         libpqxx-dev libpq-dev libproj-dev \
         protobuf-compiler libprotobuf-dev \
         liblz4-dev libcurl4-openssl-dev \
-        postgresql postgresql-contrib postgis
+        postgresql postgresql-contrib postgis \
+        pigz
 }
 
 # ---- Phase 3: service account ----
@@ -108,13 +116,21 @@ clone_and_build() {
     sudo -u "$SERVICE_USER" bash -c "cd '$INSTALL_DIR' && cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j\$(nproc)"
 }
 
-# ---- Phase 5: database + postgis extension + role ----
-# postgis_raster and every table are self-provisioned by regional_install's
-# NavDB::ensureSchema() the first time it runs -- deliberately not
-# duplicated here. No custom data_directory, no tuning: target hardware is
-# unknown (anywhere from a Raspberry Pi 5 to a desktop), so apt defaults
-# are the safe choice. See README.md's tuning table for optional manual
-# follow-up if you want to optimize for your specific box.
+# ---- Phase 5: database + postgis/postgis_raster extensions + role ----
+# Every table is self-provisioned by regional_install's NavDB::ensureSchema()
+# the first time it runs -- deliberately not duplicated here. postgis_raster
+# is NOT left to ensureSchema() though, despite using CREATE EXTENSION IF
+# NOT EXISTS there too: confirmed live (2026-08-13) that neither postgis
+# nor postgis_raster can be created by a plain LOGIN role like $DB_ROLE --
+# both require superuser (or a role explicitly granted CREATEDB-adjacent
+# privilege), so ensureSchema()'s attempt fails with "permission denied to
+# create extension" and the whole install aborts partway through. Create
+# both here as the postgres superuser, up front, so regional_install's own
+# IF NOT EXISTS is just a harmless no-op. No custom data_directory, no
+# tuning: target hardware is unknown (anywhere from a Raspberry Pi 5 to a
+# desktop), so apt defaults are the safe choice. See README.md's tuning
+# table for optional manual follow-up if you want to optimize for your
+# specific box.
 setup_database() {
     if [ -z "$DB_PASSWORD" ]; then
         DB_PASSWORD="$(openssl rand -base64 24)"
@@ -132,8 +148,8 @@ setup_database() {
     log "creating database $DB_NAME (if not already present)..."
     sudo -u postgres createdb -O "$DB_ROLE" "$DB_NAME" 2>/dev/null || log "database $DB_NAME already exists, skipping"
 
-    log "enabling postgis extension..."
-    sudo -u postgres psql -v ON_ERROR_STOP=1 -d "$DB_NAME" -c "CREATE EXTENSION IF NOT EXISTS postgis;"
+    log "enabling postgis and postgis_raster extensions..."
+    sudo -u postgres psql -v ON_ERROR_STOP=1 -d "$DB_NAME" -c "CREATE EXTENSION IF NOT EXISTS postgis; CREATE EXTENSION IF NOT EXISTS postgis_raster;"
 }
 
 # ---- Phase 6: pg_hba.conf + .pgpass ----
@@ -188,10 +204,7 @@ User=$SERVICE_USER
 Group=$SERVICE_USER
 Environment=HOME=/home/$SERVICE_USER
 WorkingDirectory=$INSTALL_DIR
-# EDIT THIS PATH before enabling -- it must exactly match whatever
-# --nodes-file path you pass to \`regional_install\` when you install your
-# region bundle. This placeholder will not work as-is.
-ExecStart=$INSTALL_DIR/build/osm_import -m poll -r minute -s $DB_HOST -d $DB_NAME -u $DB_ROLE -f $INSTALL_DIR/CHANGE_ME_region.nodes.dat
+ExecStart=$INSTALL_DIR/build/osm_import -m poll -r minute -s $DB_HOST -d $DB_NAME -u $DB_ROLE -f $NODES_FILE
 Restart=always
 RestartSec=30
 StandardOutput=journal
@@ -223,17 +236,19 @@ Setup complete.
 
 Remaining steps (manual, once you have a region bundle):
 
-  1. Install the bundle:
+  1. Install the bundle -- IMPORTANT: --nodes-file must be exactly this
+     path, since it's already what the poll service (below) expects:
 
        sudo -u $SERVICE_USER $INSTALL_DIR/build/regional_install \\
          <region>.gpsxdb.tar.gz -s $DB_HOST -d $DB_NAME -u $DB_ROLE \\
-         --nodes-file $INSTALL_DIR/<region>.nodes.dat
+         --nodes-file $NODES_FILE
 
-  2. Edit /etc/systemd/system/gpsxdb-regional-poll.service's ExecStart --
-     replace CHANGE_ME_region.nodes.dat with the exact --nodes-file path
-     you used above.
+     (Installing a second region later? Reuse the same --nodes-file path
+     above -- regional_install merges it into the same file rather than
+     overwriting, so one poll service still covers every region you've
+     installed on this host.)
 
-  3. Enable and start the poll service:
+  2. Enable and start the poll service:
 
        sudo systemctl enable --now gpsxdb-regional-poll
 ============================================================

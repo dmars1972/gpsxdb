@@ -32,11 +32,19 @@
  * Writing: use Writer to append records in ascending-id order (the natural
  * output order of OSMMMap::forEachPopulated + a bbox test) and finalize()
  * to backfill the header. Reading: construct RegionalNodeMap to read an
- * existing file into memory and call select(id) -- a single region's file
- * is a few GB at most (nowhere near OSMMMap's 320GB global store, which is
- * what actually justifies mmap there), so a plain owned buffer is simpler
- * and just as fast in practice, and keeps this class free of any
- * platform-specific I/O API.
+ * existing file and call select(id).
+ *
+ * On POSIX, the read path is mmap-backed (same technique as OSMMMap),
+ * letting the OS page in only what's touched -- confirmed necessary, not
+ * just theoretical: north_america's regional file is 66GB, which crashed
+ * with std::bad_alloc on a 15GB-RAM Raspberry Pi 5 under the previous
+ * plain-owned-buffer design (the original assumption here was "a few GB at
+ * most," which held for smaller regions but not continent-scale ones on
+ * RAM-constrained target hardware -- exactly the Pi deployment this
+ * project targets). Windows keeps the original owned-buffer/ifstream
+ * approach (no mmap implementation added there yet -- CreateFileMapping/
+ * MapViewOfFile would be needed; large-region installs on Windows remain
+ * an open follow-up, not fixed by this change).
  */
 class RegionalNodeMap {
 public:
@@ -69,9 +77,10 @@ public:
         bool finalized_ = false;
     };
 
-    // Opens an existing regional file and reads it into memory.
+    // Opens an existing regional file (mmap on POSIX, read into memory on
+    // Windows -- see class comment).
     explicit RegionalNodeMap(const std::string& path);
-    ~RegionalNodeMap() = default;
+    ~RegionalNodeMap();
 
     RegionalNodeMap(const RegionalNodeMap&) = delete;
     RegionalNodeMap& operator=(const RegionalNodeMap&) = delete;
@@ -91,7 +100,19 @@ public:
                        const std::string& output_path);
 
 private:
+    // Parses the 64-byte header at `base` (magic/version/count/name/bbox),
+    // validates it against `total_size`, and sets region_name_/bbox_/
+    // record_count_. Shared by both platform branches of the constructor.
+    void parseHeader(const std::string& path, const uint8_t* base, size_t total_size);
+    const uint8_t* data() const;
+
+#ifdef _WIN32
     std::vector<uint8_t> buf_;
+#else
+    void* mapped_ = nullptr;
+    size_t mapped_size_ = 0;
+    int fd_ = -1;
+#endif
     std::string region_name_;
     Bbox bbox_{};
     uint64_t record_count_ = 0;

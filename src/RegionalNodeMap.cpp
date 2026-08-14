@@ -7,6 +7,13 @@
 #include <stdexcept>
 #include <algorithm>
 
+#ifndef _WIN32
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#endif
+
 // ---- header field byte offsets (see RegionalNodeMap.h for the layout) ----
 static constexpr size_t OFF_MAGIC      = 0;   // char[8]
 static constexpr size_t OFF_VERSION    = 8;   // uint32_t
@@ -69,20 +76,7 @@ void RegionalNodeMap::Writer::finalize() {
 
 // ---- reader ----
 
-RegionalNodeMap::RegionalNodeMap(const std::string& path) {
-    std::ifstream f(path, std::ios::binary | std::ios::ate);
-    if (!f) throw std::runtime_error("RegionalNodeMap: cannot open " + path);
-
-    std::streamoff size = f.tellg();
-    if (size < 0 || static_cast<size_t>(size) < kHeaderSize)
-        throw std::runtime_error("RegionalNodeMap: " + path + " too small or unreadable");
-    buf_.resize(static_cast<size_t>(size));
-
-    f.seekg(0);
-    if (!f.read(reinterpret_cast<char*>(buf_.data()), static_cast<std::streamsize>(buf_.size())))
-        throw std::runtime_error("RegionalNodeMap: read failed for " + path);
-
-    const uint8_t* base = buf_.data();
+void RegionalNodeMap::parseHeader(const std::string& path, const uint8_t* base, size_t total_size) {
     if (memcmp(base + OFF_MAGIC, kMagic, 8) != 0)
         throw std::runtime_error("RegionalNodeMap: bad magic in " + path);
     uint32_t version;
@@ -99,12 +93,74 @@ RegionalNodeMap::RegionalNodeMap(const std::string& path) {
     memcpy(bbox_f, base + OFF_BBOX, sizeof(bbox_f));
     bbox_ = {bbox_f[0], bbox_f[1], bbox_f[2], bbox_f[3]};
 
-    if (kHeaderSize + record_count_ * kRecordSize > buf_.size())
+    if (kHeaderSize + record_count_ * kRecordSize > total_size)
         throw std::runtime_error("RegionalNodeMap: truncated record data in " + path);
 }
 
+const uint8_t* RegionalNodeMap::data() const {
+#ifdef _WIN32
+    return buf_.data();
+#else
+    return static_cast<const uint8_t*>(mapped_);
+#endif
+}
+
+RegionalNodeMap::RegionalNodeMap(const std::string& path) {
+#ifdef _WIN32
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) throw std::runtime_error("RegionalNodeMap: cannot open " + path);
+
+    std::streamoff size = f.tellg();
+    if (size < 0 || static_cast<size_t>(size) < kHeaderSize)
+        throw std::runtime_error("RegionalNodeMap: " + path + " too small or unreadable");
+    buf_.resize(static_cast<size_t>(size));
+
+    f.seekg(0);
+    if (!f.read(reinterpret_cast<char*>(buf_.data()), static_cast<std::streamsize>(buf_.size())))
+        throw std::runtime_error("RegionalNodeMap: read failed for " + path);
+
+    parseHeader(path, buf_.data(), buf_.size());
+#else
+    // mmap-backed, not a full read into an owned buffer -- see class
+    // comment for why (a 66GB real-world regional file crashed a 15GB-RAM
+    // Pi under the previous owned-buffer design). Cleanup on any
+    // exception path is handled by the try/catch below, since a
+    // constructor that throws does NOT run its own destructor (the
+    // object was never considered fully constructed) -- fd_/mapped_ would
+    // otherwise leak on a malformed/truncated file.
+    fd_ = open(path.c_str(), O_RDONLY);
+    if (fd_ < 0) throw std::runtime_error("RegionalNodeMap: cannot open " + path);
+    try {
+        struct stat st;
+        if (fstat(fd_, &st) != 0)
+            throw std::runtime_error("RegionalNodeMap: fstat failed for " + path);
+        if (static_cast<size_t>(st.st_size) < kHeaderSize)
+            throw std::runtime_error("RegionalNodeMap: " + path + " too small or unreadable");
+        mapped_size_ = static_cast<size_t>(st.st_size);
+        mapped_ = mmap(nullptr, mapped_size_, PROT_READ, MAP_PRIVATE, fd_, 0);
+        if (mapped_ == MAP_FAILED) {
+            mapped_ = nullptr;
+            throw std::runtime_error("RegionalNodeMap: mmap failed for " + path);
+        }
+        parseHeader(path, static_cast<const uint8_t*>(mapped_), mapped_size_);
+    } catch (...) {
+        if (mapped_) { munmap(mapped_, mapped_size_); mapped_ = nullptr; }
+        close(fd_);
+        fd_ = -1;
+        throw;
+    }
+#endif
+}
+
+RegionalNodeMap::~RegionalNodeMap() {
+#ifndef _WIN32
+    if (mapped_) munmap(mapped_, mapped_size_);
+    if (fd_ >= 0) close(fd_);
+#endif
+}
+
 std::optional<std::pair<double,double>> RegionalNodeMap::select(int64_t id) const {
-    const uint8_t* records = buf_.data() + kHeaderSize;
+    const uint8_t* records = data() + kHeaderSize;
     size_t lo = 0, hi = record_count_;
     while (lo < hi) {
         size_t mid = lo + (hi - lo) / 2;
@@ -140,8 +196,8 @@ bool RegionalNodeMap::merge(const std::string& path_a, const std::string& path_b
     RegionalNodeMap a(path_a);
     RegionalNodeMap b(path_b);
 
-    const uint8_t* ra = a.buf_.data() + kHeaderSize;
-    const uint8_t* rb = b.buf_.data() + kHeaderSize;
+    const uint8_t* ra = a.data() + kHeaderSize;
+    const uint8_t* rb = b.data() + kHeaderSize;
 
     Writer w(output_path, a.region_name_, a.bbox_);
 
