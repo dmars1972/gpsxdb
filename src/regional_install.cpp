@@ -45,6 +45,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <random>
+#include <ctime>
 #include <unistd.h>  // _exit -- MinGW-w64 provides this natively too
 
 namespace fs = std::filesystem;
@@ -191,6 +192,82 @@ std::string readManifestField(const std::string& manifest_path, const std::strin
         if (line.rfind(key + "=", 0) == 0) return line.substr(key.size() + 1);
     }
     return "";
+}
+
+// Downloads and parses a replication state.txt (osmosis .properties
+// format: "sequenceNumber=N" and "timestamp=2026-07-14T23\:02\:22Z", ':'
+// escaped as '\:' since it's the .properties key/value separator).
+// Mirrors PlanetDownloader.cpp's fetchReplicationState() -- duplicated
+// rather than shared, since that file pulls in a direct libcurl link this
+// tool deliberately doesn't have (see this file's own top-of-file comment
+// on regional_install's minimal-dependency design, which the Windows port
+// specifically relies on). Uses runProcess()/the `curl` binary the same
+// way every other external-tool call in this file does, so no new build
+// dependency is introduced -- just an assumption that `curl` is on PATH,
+// already true project-wide.
+bool fetchReplicationState(const std::string& url, int64_t& seq_out, time_t& time_out) {
+    ProcessResult r = runProcess({"curl", "-fsL", url});
+    if (r.exit_code != 0) return false;
+
+    std::istringstream f(r.output);
+    std::string line, timestamp_raw;
+    int64_t seq = -1;
+    while (std::getline(f, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.rfind("sequenceNumber=", 0) == 0) {
+            try { seq = std::stoll(line.substr(15)); } catch (...) { return false; }
+        } else if (line.rfind("timestamp=", 0) == 0) {
+            timestamp_raw = line.substr(10);
+        }
+    }
+    if (seq < 0 || timestamp_raw.empty()) return false;
+
+    std::string ts;
+    for (size_t i = 0; i < timestamp_raw.size(); ++i) {
+        if (timestamp_raw[i] == '\\' && i + 1 < timestamp_raw.size() && timestamp_raw[i + 1] == ':') {
+            ts += ':'; ++i;
+        } else {
+            ts += timestamp_raw[i];
+        }
+    }
+
+    struct tm tmv{};
+    if (!strptime(ts.c_str(), "%Y-%m-%dT%H:%M:%SZ", &tmv)) return false;
+    time_out = timegm(&tmv);
+    seq_out = seq;
+    return true;
+}
+
+// Estimates the OSM minute-replication sequence that was current when this
+// bundle was exported, from manifest.txt's "exported_at" epoch timestamp
+// (written by regional_db_export.cpp). Same math as PlanetDownloader.cpp's
+// estimatePlanetReplicationSequence(): interpolate backward from the
+// current replication tip using minute granularity, plus a 3-day safety
+// margin -- deliberately erring early (redundant diff reprocessing, safe)
+// rather than late (a real gap in the region's data, unsafe). Returns -1
+// if exported_at is missing (bundle predates this field) or the
+// replication state can't be fetched (e.g. no network at install time) --
+// callers should treat that as "couldn't auto-seed," not a fatal error,
+// same tone as the -I --download-planet path's own fallback message.
+int64_t estimateBundleReplicationSequence(const std::string& manifest_path) {
+    std::string exported_at_str = readManifestField(manifest_path, "exported_at");
+    if (exported_at_str.empty()) return -1;
+    int64_t exported_at;
+    try { exported_at = std::stoll(exported_at_str); } catch (...) { return -1; }
+
+    int64_t tip_seq;
+    time_t tip_time;
+    if (!fetchReplicationState("https://planet.openstreetmap.org/replication/minute/state.txt", tip_seq, tip_time))
+        return -1;
+
+    constexpr int64_t kSecondsPerSequence = 60;              // minute granularity
+    constexpr int64_t kSafetyMarginSeconds = 3LL * 24 * 3600; // 3 days, err early not late
+
+    int64_t seconds_back = (static_cast<int64_t>(tip_time) - exported_at) + kSafetyMarginSeconds;
+    if (seconds_back < 0) seconds_back = 0;
+    int64_t seq_back = seconds_back / kSecondsPerSequence;
+    int64_t estimated = tip_seq - seq_back;
+    return estimated > 0 ? estimated : 0;
 }
 
 // regional_db_export records "table.<name>.format=binary|text" per table
@@ -615,6 +692,28 @@ int main(int argc, char** argv) {
             NavDB db_client(0, host, user, db, dummy_mu);
             db_client.registerInstalledRegion(region_name, wkt_ss.str(), min_lon, min_lat, max_lon, max_lat);
             std::cout << "[regional_install] registered '" << region_name << "' in installed_regions\n";
+        }
+    }
+
+    // ---- 7. Auto-seed replication sequence ----
+    // Without this, `-m poll` afterward has no starting point at all (see
+    // Replicator.cpp's "No local sequence number" message) -- unlike the
+    // master -I --download-planet path, which already auto-seeds this from
+    // the planet file's own cutoff. Non-fatal on failure (missing
+    // exported_at on an older bundle, or no network at install time): logs
+    // and moves on, matching that same path's own fallback tone -- an
+    // operator can still set one manually with -Q before running poll.
+    {
+        int64_t seed = estimateBundleReplicationSequence(region_dir + "/manifest.txt");
+        if (seed >= 0) {
+            std::mutex dummy_mu;
+            NavDB db_client(0, host, user, db, dummy_mu);
+            db_client.setReplicationSequence(seed);
+            std::cout << "[regional_install] auto-seeded replication sequence=" << seed
+                      << " from bundle export time\n";
+        } else {
+            std::cerr << "[regional_install] could not auto-seed replication sequence -- "
+                         "set one manually with -Q before running poll mode\n";
         }
     }
 
